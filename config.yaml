@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
-description: "Smart energy management: solar battery, heat pump, pool pump and dishwasher with ML + tariff rules."
-version: "2.0.0"
+description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
+version: "2.1.0"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -29,11 +29,13 @@ options:
   summer_start_month: 6
   summer_end_month: 9
 
-  # ── Thresholds ─────────────────────────────────────────────────────────────
+  # ── Battery thresholds ─────────────────────────────────────────────────────
   solar_tomorrow_irrisoria_kwh: 2.0
   battery_emergency_threshold: 10
   battery_low_threshold: 30
   battery_medium_threshold: 50
+  battery_storm_threshold: 80
+  battery_capacity_kwh: 10.0
 
   # ── Electrical sensors ─────────────────────────────────────────────────────
   sensor_battery_soc: "sensor.battery_state_of_capacity"
@@ -55,6 +57,9 @@ options:
   sensor_pool_hours_week: "sensor.depuradora_encendida_semana"
   switch_pool: "switch.depuradora"
 
+  # ── Pool cleaner (limpiafondos) — runs first 15 min with pool pump ─────────
+  switch_pool_cleaner: "switch.limpiafondos"
+
   # ── Heat pump actuators ────────────────────────────────────────────────────
   number_hvac_cool: "number.ebusd_ctls2_z1coolingtemp_tempv"
   number_hvac_heat: "number.ebusd_ctls2_z1manualtemp_tempv"
@@ -70,6 +75,9 @@ options:
   sensor_dishwasher_state: "sensor.lavavajillas_operation_state"
   switch_dishwasher: ""
 
+  # ── Weather (AEMET OpenData) for storm protection ──────────────────────────
+  sensor_weather: "weather.aemet"
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -80,6 +88,8 @@ schema:
   battery_emergency_threshold: int(1,30)
   battery_low_threshold: int(10,50)
   battery_medium_threshold: int(30,80)
+  battery_storm_threshold: int(50,100)
+  battery_capacity_kwh: float
   sensor_battery_soc: str
   sensor_battery_power: str
   sensor_grid_power: str
@@ -92,6 +102,7 @@ schema:
   sensor_pool_hours_day: str
   sensor_pool_hours_week: str
   switch_pool: str
+  switch_pool_cleaner: str
   number_hvac_cool: str
   number_hvac_heat: str
   number_battery_charge_cutoff: str
@@ -101,3 +112,4 @@ schema:
   select_battery_mode: str
   sensor_dishwasher_state: str
   switch_dishwasher: str
+  sensor_weather: str

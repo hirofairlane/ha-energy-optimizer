@@ -734,6 +734,7 @@ th{color:var(--m);font-weight:500}
 <div class="actions">
   <button id="btn-run" class="btn" onclick="runCycle()">▶ Run cycle now</button>
   <button id="btn-retrain" class="btn btn-y" onclick="retrain()">🔁 Retrain model</button>
+  <button id="btn-summary" class="btn" style="background:#8b5cf6" onclick="sendSummary()">📧 Send daily summary</button>
 </div>
 
 <!-- Charts -->
@@ -977,6 +978,16 @@ async function chargeToTarget(soc) {
   load();
 }
 
+async function sendSummary() {
+  const btn = document.getElementById('btn-summary');
+  btn.disabled = true; btn.textContent = '⏳ Sending…';
+  try {
+    const r = await fetch('/api/send-summary', {method:'POST'}).then(r => r.json());
+    notify(`✓ Summary sent — ${r.cycles} cycles, €${(r.savings_eur||0).toFixed(2)} saved`, 'ok', 5000);
+  } catch(e) { notify('✗ Error sending summary', 'err'); }
+  finally { btn.disabled=false; btn.textContent='📧 Send daily summary'; }
+}
+
 async function selfConsumption() {
   if (!confirm('Switch to self-consumption mode?')) return;
   const r = await fetch('/api/battery/self-consumption', {method:'POST'}).then(r => r.json());
@@ -1094,9 +1105,188 @@ def api_battery_charge():
 def api_battery_self_consumption():
     return jsonify({"ok": set_battery_self_consumption()})
 
+@app.route("/api/send-summary", methods=["POST"])
+def api_send_summary():
+    result = send_daily_summary()
+    return jsonify({"ok": True, **result})
+
 @app.route("/api/options")
 def api_options():
     return jsonify({k: v for k, v in OPT.items() if "token" not in k.lower()})
+
+# ── Daily summary notification ───────────────────────────────────────────────
+def send_daily_summary():
+    """
+    Build a daily report from today's decisions and send it via email (HTML)
+    and/or Telegram. Configured via notify_email_service / notify_telegram_service.
+    """
+    today = datetime.now().date().isoformat()
+    log.info(f"═══ Daily summary for {today} ═══")
+
+    # Collect today's decisions
+    today_decisions = []
+    if DECISIONS_FILE.exists():
+        try:
+            all_dec = json.loads(DECISIONS_FILE.read_text())
+            today_decisions = [d for d in all_dec if d.get("timestamp", "")[:10] == today]
+        except Exception as e:
+            log.warning(f"Could not load decisions for summary: {e}")
+
+    savings = _load_savings()
+    sensors_now = read_sensors()
+
+    # ── Build action summary ──────────────────────────────────────────────────
+    action_counts: dict = {}
+    action_details: list = []
+    for dec in today_decisions:
+        ts = dec.get("timestamp", "")[:16].replace("T", " ")
+        tariff_period = dec.get("tariff", {}).get("period", "?")
+        soc = dec.get("sensors", {}).get("battery_soc", 0)
+        for a in dec.get("actions", []):
+            key = a["type"]
+            action_counts[key] = action_counts.get(key, 0) + 1
+            action_details.append({
+                "time": ts, "type": key, "reason": a.get("reason", ""),
+                "ok": a.get("ok", True), "period": tariff_period, "soc": soc,
+            })
+
+    n_cycles   = len(today_decisions)
+    solar_peak = max((d.get("sensors", {}).get("solar_today", 0) for d in today_decisions), default=0)
+    eur_saved  = savings.get("total_eur_saved", 0)
+    kwh_peak   = savings.get("total_kwh_avoided_peak", 0)
+    since      = savings.get("since", today)
+
+    # ── Telegram message ──────────────────────────────────────────────────────
+    tg_lines = [
+        f"⚡ *Energy Optimizer — Daily Report*",
+        f"📅 {today}",
+        f"",
+        f"🔋 Battery SOC now: *{sensors_now['battery_soc']:.0f}%*",
+        f"☀️ Solar production today: *{solar_peak:.1f} kWh*",
+        f"🔄 Decision cycles: *{n_cycles}*",
+        f"",
+        f"*Actions today:*",
+    ]
+    if action_details:
+        # Group by type for Telegram (concise)
+        for atype, count in action_counts.items():
+            tg_lines.append(f"  • {atype}: {count}x")
+        tg_lines.append("")
+        tg_lines.append("*Last 5 actions:*")
+        for a in action_details[-5:]:
+            icon = "✅" if a["ok"] else "❌"
+            tg_lines.append(f"  {icon} `{a['time'][-5:]}` [{a['type']}] {a['reason'][:60]}")
+    else:
+        tg_lines.append("  — No actions taken today")
+
+    tg_lines += [
+        f"",
+        f"💰 Savings (since {since}): *€{eur_saved:.2f}* ({kwh_peak:.1f} kWh at peak avoided)",
+    ]
+    telegram_msg = "\n".join(tg_lines)
+
+    # ── HTML email ────────────────────────────────────────────────────────────
+    rows_html = ""
+    for a in action_details:
+        color   = "#4ade80" if a["ok"] else "#f87171"
+        p_badge = {"peak":"#f87171","valley":"#4ade80","mid":"#fbbf24"}.get(a["period"], "#94a3b8")
+        rows_html += (
+            f"<tr>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #334155;color:#94a3b8'>{a['time'][-8:]}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #334155'>"
+            f"  <span style='background:rgba(56,189,248,.15);color:#38bdf8;padding:2px 7px;"
+            f"  border-radius:4px;font-size:12px'>{a['type']}</span>"
+            f"</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #334155'>"
+            f"  <span style='background:{p_badge}33;color:{p_badge};padding:1px 5px;"
+            f"  border-radius:3px;font-size:11px'>{a['period']}</span>"
+            f"</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #334155;font-size:12px;"
+            f"  color:#e2e8f0'>{a['reason']}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #334155;"
+            f"  color:{color};font-weight:700'>{'✓' if a['ok'] else '✗'}</td>"
+            f"</tr>"
+        )
+    if not rows_html:
+        rows_html = "<tr><td colspan='5' style='padding:12px;color:#94a3b8;text-align:center'>No actions today</td></tr>"
+
+    kpi_style = "display:inline-block;background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px 20px;margin:6px;text-align:center;min-width:120px"
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;padding:24px;margin:0">
+  <h1 style="color:#38bdf8;font-size:20px;margin-bottom:4px">⚡ Energy Optimizer — Daily Report</h1>
+  <p style="color:#94a3b8;margin-bottom:20px">{today}</p>
+
+  <div style="margin-bottom:20px">
+    <span style="{kpi_style}">
+      <div style="font-size:28px;font-weight:700;color:#38bdf8">{sensors_now['battery_soc']:.0f}%</div>
+      <div style="font-size:11px;color:#94a3b8">Battery SOC</div>
+    </span>
+    <span style="{kpi_style}">
+      <div style="font-size:28px;font-weight:700;color:#4ade80">{solar_peak:.1f}</div>
+      <div style="font-size:11px;color:#94a3b8">Solar today (kWh)</div>
+    </span>
+    <span style="{kpi_style}">
+      <div style="font-size:28px;font-weight:700;color:#fbbf24">{n_cycles}</div>
+      <div style="font-size:11px;color:#94a3b8">Cycles run</div>
+    </span>
+    <span style="{kpi_style}">
+      <div style="font-size:28px;font-weight:700;color:#4ade80">€{eur_saved:.2f}</div>
+      <div style="font-size:11px;color:#94a3b8">Total savings</div>
+    </span>
+  </div>
+
+  <h2 style="color:#94a3b8;font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">
+    Actions taken today
+  </h2>
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead>
+      <tr style="background:#1e293b">
+        <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Time</th>
+        <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Type</th>
+        <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Period</th>
+        <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Reason</th>
+        <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">OK</th>
+      </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+
+  <p style="margin-top:20px;font-size:12px;color:#475569">
+    Savings tracked since {since}: {kwh_peak:.1f} kWh covered at peak tariff → €{eur_saved:.2f} saved
+  </p>
+</body></html>"""
+
+    # ── Send notifications ────────────────────────────────────────────────────
+    email_svc = OPT.get("notify_email_service", "")
+    email_to  = OPT.get("notify_email_target", "")
+    tg_svc    = OPT.get("notify_telegram_service", "")
+
+    sent_any = False
+    if email_svc and email_to:
+        ok = ha_service("notify", email_svc, {
+            "title": f"⚡ Energy Optimizer — {today}",
+            "message": f"Daily report for {today}. See HTML for details.",
+            "target": [email_to],
+            "data": {"html": html_body},
+        })
+        log.info(f"  Email ({email_svc} → {email_to}): {'OK' if ok else 'ERROR'}")
+        sent_any = True
+
+    if tg_svc:
+        ok = ha_service("notify", tg_svc, {
+            "message": telegram_msg,
+            "data": {"parse_mode": "markdown"},
+        })
+        log.info(f"  Telegram ({tg_svc}): {'OK' if ok else 'ERROR'}")
+        sent_any = True
+
+    if not sent_any:
+        log.info("  No notification services configured (notify_email_service / notify_telegram_service)")
+
+    return {"date": today, "cycles": n_cycles, "actions": len(action_details),
+            "solar_kwh": solar_peak, "savings_eur": eur_saved}
+
 
 # ── Startup ──────────────────────────────────────────────────────────────────
 def main():
@@ -1125,6 +1315,16 @@ def main():
         scheduler.add_job(train_model, "cron",
                           minute=cron[0], hour=cron[1], day=cron[2],
                           month=cron[3], day_of_week=cron[4], id="retrain")
+
+    # Daily summary notification
+    summary_time = OPT.get("notify_daily_time", "23:00").split(":")
+    if len(summary_time) == 2:
+        scheduler.add_job(send_daily_summary, "cron",
+                          hour=int(summary_time[0]), minute=int(summary_time[1]),
+                          id="daily_summary")
+        log.info(f"  Daily summary: {OPT.get('notify_daily_time','23:00')} → "
+                 f"email={OPT.get('notify_email_service','—')} "
+                 f"telegram={OPT.get('notify_telegram_service','—')}")
 
     scheduler.start()
     log.info(f"  Cycle every {interval} min · Retrain: {OPT.get('retrain_cron','0 3 * * *')}")

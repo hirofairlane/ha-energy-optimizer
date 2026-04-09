@@ -78,6 +78,12 @@ options:
   # ── Weather (AEMET OpenData) for storm protection ──────────────────────────
   sensor_weather: "weather.aemet"
 
+  # ── Daily summary notifications ────────────────────────────────────────────
+  notify_daily_time: "23:00"
+  notify_email_service: "correo_gmail_com"
+  notify_email_target: "scamposgarci@gmail.com"
+  notify_telegram_service: "telegramsergio"
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -113,3 +119,7 @@ schema:
   sensor_dishwasher_state: str
   switch_dishwasher: str
   sensor_weather: str
+  notify_daily_time: str
+  notify_email_service: str
+  notify_email_target: str
+  notify_telegram_service: str

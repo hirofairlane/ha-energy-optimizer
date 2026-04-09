@@ -1,0 +1,13 @@
+# Claude Code settings (local)
+.claude/
+
+# Zip de distribución local
+*.zip
+
+# Datos generados en runtime (no van al repo)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

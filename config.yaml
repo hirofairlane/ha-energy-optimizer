@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
-description: "Gestión energética inteligente: batería solar, aerotermia y depuradora con scikit-learn + reglas de tarifa."
-version: "1.0.0"
+description: "Smart energy management: solar battery, heat pump, pool pump and dishwasher with ML + tariff rules."
+version: "2.0.0"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -15,56 +15,60 @@ ingress_port: 8765
 panel_icon: "mdi:solar-power-variant"
 panel_title: "Energy Optimizer"
 
-# Acceso a /homeassistant (config de HA) para leer datos
 map:
   - type: homeassistant_config
     read_only: true
 
 options:
-  # ── Operación general ──────────────────────────────────────
+  # ── General ────────────────────────────────────────────────────────────────
   decision_interval_minutes: 15
   retrain_cron: "0 3 * * *"
   log_level: "info"
 
-  # ── Temporadas ────────────────────────────────────────────
+  # ── Seasons ────────────────────────────────────────────────────────────────
   summer_start_month: 6
   summer_end_month: 9
 
-  # ── Umbrales de lógica ────────────────────────────────────
+  # ── Thresholds ─────────────────────────────────────────────────────────────
   solar_tomorrow_irrisoria_kwh: 2.0
   battery_emergency_threshold: 10
   battery_low_threshold: 30
   battery_medium_threshold: 50
 
-  # ── Sensores eléctricos ───────────────────────────────────
+  # ── Electrical sensors ─────────────────────────────────────────────────────
   sensor_battery_soc: "sensor.battery_state_of_capacity"
   sensor_battery_power: "sensor.battery_charge_discharge_power"
   sensor_grid_power: "sensor.acometida_general_power"
 
-  # ── Sensores solar forecast ───────────────────────────────
+  # ── Solar forecast sensors ─────────────────────────────────────────────────
   sensor_solar_current_hour: "sensor.energy_current_hour"
   sensor_solar_next_hour: "sensor.energy_next_hour"
   sensor_solar_today: "sensor.energy_production_today"
   sensor_solar_tomorrow: "sensor.energy_production_tomorrow"
 
-  # ── Sensores temperatura ──────────────────────────────────
+  # ── Temperature sensors ────────────────────────────────────────────────────
   sensor_temp_outdoor: "sensor.ebusd_broadcast_outsidetemp_temp2"
   sensor_temp_salon: "sensor.media_salon"
 
-  # ── Sensores depuradora ───────────────────────────────────
+  # ── Pool pump ──────────────────────────────────────────────────────────────
   sensor_pool_hours_day: "sensor.depuradora_encendida_24h"
   sensor_pool_hours_week: "sensor.depuradora_encendida_semana"
   switch_pool: "switch.depuradora"
 
-  # ── Actuadores aerotermia ─────────────────────────────────
+  # ── Heat pump actuators ────────────────────────────────────────────────────
   number_hvac_cool: "number.ebusd_ctls2_z1coolingtemp_tempv"
   number_hvac_heat: "number.ebusd_ctls2_z1manualtemp_tempv"
 
-  # ── Scripts de carga de batería ───────────────────────────
-  script_charge_30: "script.1700687735587"
-  script_charge_50: "script.1700687757430"
-  script_charge_80: "script.cargar_bateria_80"
-  script_charge_99: "script.cargar_bateria_99"
+  # ── Battery direct control (Huawei Luna2000) ───────────────────────────────
+  number_battery_charge_cutoff: "number.battery_grid_charge_cutoff_soc"
+  number_battery_charge_power: "a186f9599e9cad7127bca381f7a8bfb2"
+  number_battery_backup_soc: "de4a2bf18222f354228cdb112b65e882"
+  switch_battery_force_charge: "02db00e10018b01211507db92819a25a"
+  select_battery_mode: "select.battery_working_mode"
+
+  # ── Dishwasher ─────────────────────────────────────────────────────────────
+  sensor_dishwasher_state: "sensor.lavavajillas_operation_state"
+  switch_dishwasher: ""
 
 schema:
   decision_interval_minutes: int(5,60)
@@ -90,7 +94,10 @@ schema:
   switch_pool: str
   number_hvac_cool: str
   number_hvac_heat: str
-  script_charge_30: str
-  script_charge_50: str
-  script_charge_80: str
-  script_charge_99: str
+  number_battery_charge_cutoff: str
+  number_battery_charge_power: str
+  number_battery_backup_soc: str
+  switch_battery_force_charge: str
+  select_battery_mode: str
+  sensor_dishwasher_state: str
+  switch_dishwasher: str

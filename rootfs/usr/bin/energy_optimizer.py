@@ -214,7 +214,10 @@ def ha_history_influx(entity_id: str, days: int = 60) -> tuple:
     password = cfg("influxdb_password", "")
     if not url:
         return [], "not_configured"
-    q = (f'SELECT "value" FROM /.*/ WHERE "entity_id" = \'{entity_id}\' '
+    # Old HA InfluxDB integration stores measurements as units (%, W, A…)
+    # and entity_id as a tag WITHOUT the domain prefix.
+    entity_short = entity_id.split(".")[-1] if "." in entity_id else entity_id
+    q = (f'SELECT "value" FROM /.*/ WHERE "entity_id" = \'{entity_short}\' '
          f'AND time >= now() - {days}d ORDER BY time ASC')
     resp, err, _mode = _influx_query(url, db, q, user, password)
     if err:
@@ -1072,7 +1075,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.4</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.5</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1858,20 +1861,39 @@ def api_influx_debug():
                 except Exception:
                     pass
 
-        # 3. Sample entity_id tag values
+        # 3. Find entity_id tags in the % measurement (where SOC lives)
+        # and do a direct probe for the configured entity
         if ping_ok:
+            # All entity_ids in the % measurement (SOC unit)
             r_e, _, _ = _influx_query(
                 influx_u, influx_db,
-                'SHOW TAG VALUES FROM /.*/ WITH KEY = "entity_id" LIMIT 20',
+                'SHOW TAG VALUES FROM "%" WITH KEY = "entity_id"',
                 user, password)
             if r_e:
                 try:
                     for series in r_e.json()["results"][0].get("series", []):
                         for v in series.get("values", []):
-                            if "battery" in str(v).lower():
-                                sample_entities.append(v[1] if len(v) > 1 else v[0])
+                            tag_val = v[1] if len(v) > 1 else v[0]
+                            if "battery" in tag_val.lower() or "soc" in tag_val.lower() or "capacit" in tag_val.lower():
+                                sample_entities.append(tag_val)
                 except Exception:
                     pass
+
+            # Direct probe: try the entity_id with and without domain prefix
+            entity_short = entity.split(".")[-1] if "." in entity else entity
+            for probe_id in [entity_short, entity]:
+                r_probe, _, _ = _influx_query(
+                    influx_u, influx_db,
+                    f'SELECT "value" FROM "%" WHERE "entity_id" = \'{probe_id}\' ORDER BY time DESC LIMIT 1',
+                    user, password)
+                if r_probe:
+                    try:
+                        s = r_probe.json()["results"][0].get("series", [])
+                        if s:
+                            sample_entities.insert(0, f"✓ FOUND as '{probe_id}'")
+                            break
+                    except Exception:
+                        pass
 
     rows_i, err_i = (ha_history_influx(entity, days=7) if influx_u
                      else ([], "not_configured"))

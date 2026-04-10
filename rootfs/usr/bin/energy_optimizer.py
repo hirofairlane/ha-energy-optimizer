@@ -170,13 +170,42 @@ def ha_history(entity_id: str, days: int = 14) -> list:
     return []
 
 # ── InfluxDB history (primary source for ML training) ────────────────────────
+def _influx_query(url: str, db: str, q: str, user: str, password: str) -> tuple:
+    """Run an InfluxQL query. Auto-detects whether auth is needed.
+
+    Returns (response_or_None, error_str, auth_mode_used).
+    Tries with credentials first; if InfluxDB returns 401 (auth disabled and
+    rejecting credentials, which happens in some 1.x configs), retries without.
+    """
+    endpoint = f"{url.rstrip('/')}/query"
+    params   = {"db": db, "q": q, "epoch": "ms"}
+    # Attempt 1: with credentials (if provided)
+    try:
+        auth = (user, password) if user else None
+        r = requests.get(endpoint, params=params, auth=auth, timeout=30)
+        if r.status_code == 200:
+            return r, None, "auth" if auth else "no_auth"
+        if r.status_code == 401 and auth:
+            # InfluxDB 1.x returns 401 when auth is DISABLED and credentials
+            # are sent — retry without credentials
+            log.info("  InfluxDB: 401 with credentials — retrying without auth")
+            r2 = requests.get(endpoint, params=params, auth=None, timeout=30)
+            if r2.status_code == 200:
+                log.info("  InfluxDB: connected without auth (auth disabled on server)")
+                return r2, None, "no_auth"
+            return None, f"http_{r2.status_code}", "no_auth"
+        return None, f"http_{r.status_code}", "auth" if auth else "no_auth"
+    except requests.Timeout:
+        return None, "timeout", "unknown"
+    except Exception as e:
+        return None, str(e)[:80], "unknown"
+
 def ha_history_influx(entity_id: str, days: int = 60) -> tuple:
     """Fetch entity history from InfluxDB.
 
     Uses InfluxQL with epoch=ms so timestamps come back as integers.
-    Returns (rows, error_str) where rows is a list of
-    {"last_changed": iso_str, "state": str} dicts and error_str is None on
-    success or a short description of the failure for the debug panel.
+    Returns (rows, error_str) — rows is a list of
+    {"last_changed": iso_str, "state": str} dicts, error_str is None on success.
     """
     from datetime import timezone as _tz
     url      = cfg("influxdb_url", "")
@@ -187,47 +216,32 @@ def ha_history_influx(entity_id: str, days: int = 60) -> tuple:
         return [], "not_configured"
     q = (f'SELECT "value" FROM /.*/ WHERE "entity_id" = \'{entity_id}\' '
          f'AND time >= now() - {days}d ORDER BY time ASC')
-    try:
-        r = requests.get(
-            f"{url.rstrip('/')}/query",
-            params={"db": db, "q": q, "epoch": "ms"},
-            auth=(user, password) if user else None,
-            timeout=30,
-        )
-        if r.status_code == 401:
-            log.warning(f"  InfluxDB {entity_id} HTTP 401: authentication failed")
-            return [], "auth_failed"
-        if r.status_code != 200:
-            log.warning(f"  InfluxDB {entity_id} HTTP {r.status_code}: {r.text[:120]}")
-            return [], f"http_{r.status_code}"
-        data    = r.json()
-        results = data.get("results", [])
-        if not results or "series" not in results[0]:
-            log.warning(f"  InfluxDB {entity_id}: no series in response")
-            return [], "no_series"
-        series = results[0]["series"][0]
-        cols   = series.get("columns", [])
-        time_i = cols.index("time")  if "time"  in cols else 0
-        val_i  = cols.index("value") if "value" in cols else 1
-        rows = []
-        for point in series.get("values", []):
-            try:
-                ms  = int(point[time_i])
-                ts  = datetime.fromtimestamp(ms / 1000, tz=_tz.utc).isoformat()
-                val = point[val_i]
-                if val is None:
-                    continue
-                rows.append({"last_changed": ts, "state": str(val)})
-            except (IndexError, TypeError, ValueError):
+    resp, err, _mode = _influx_query(url, db, q, user, password)
+    if err:
+        log.warning(f"  InfluxDB {entity_id}: {err}")
+        return [], err
+    data    = resp.json()
+    results = data.get("results", [])
+    if not results or "series" not in results[0]:
+        log.warning(f"  InfluxDB {entity_id}: no series in response")
+        return [], "no_series"
+    series = results[0]["series"][0]
+    cols   = series.get("columns", [])
+    time_i = cols.index("time")  if "time"  in cols else 0
+    val_i  = cols.index("value") if "value" in cols else 1
+    rows = []
+    for point in series.get("values", []):
+        try:
+            ms  = int(point[time_i])
+            ts  = datetime.fromtimestamp(ms / 1000, tz=_tz.utc).isoformat()
+            val = point[val_i]
+            if val is None:
                 continue
-        log.info(f"  InfluxDB {entity_id}: {len(rows)} records ({days}d)")
-        return rows, None
-    except requests.Timeout:
-        log.error(f"  InfluxDB {entity_id}: timed out")
-        return [], "timeout"
-    except Exception as e:
-        log.error(f"  InfluxDB {entity_id}: {e}")
-        return [], str(e)[:80]
+            rows.append({"last_changed": ts, "state": str(val)})
+        except (IndexError, TypeError, ValueError):
+            continue
+    log.info(f"  InfluxDB {entity_id}: {len(rows)} records ({days}d)")
+    return rows, None
 
 # ── Tariff management ────────────────────────────────────────────────────────
 DEFAULT_TARIFF = {
@@ -1058,7 +1072,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.1</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.3</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1521,19 +1535,27 @@ async function testDataSources(){
     let influxLine;
     const errLabels={
       not_configured:'add influxdb_url in add-on options',
-      auth_failed:'authentication failed — check influxdb_user / influxdb_password in add-on options',
-      no_series:'connected but no data for this entity',
-      timeout:'connection timed out',
+      no_series:'connected but no data for entity — check entity_id and DB name',
+      timeout:'connection timed out — check influxdb_url',
     };
     if(!r.configured){
       influxLine=`<span style="color:var(--m)">InfluxDB — not configured</span> `
         +`<span style="color:var(--m);font-size:.68rem">(add influxdb_url in add-on options)</span>`;
     } else if(r.ok){
-      influxLine=`<span style="color:var(--g)">✓ InfluxDB OK</span>`
+      const authNote=r.auth_mode==='no_auth'
+        ?` <span style="color:var(--y);font-size:.68rem">(no auth)</span>`:'';
+      influxLine=`<span style="color:var(--g)">✓ InfluxDB OK${authNote}</span>`
         +` — <b>${r.records_7d}</b> records (7d) · ${r.first_ts} → ${r.last_ts}`
         +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db}</span>`;
+    } else if(r.ping_ok){
+      // Can reach InfluxDB but can't get data
+      influxLine=`<span style="color:var(--y)">⚠ InfluxDB reachable but no data</span>`
+        +` <span style="color:var(--m);font-size:.68rem">`
+        +(errLabels[r.error]||r.error||'')
+        +` · ${r.url} / ${r.db}</span>`;
     } else {
-      const errMsg=errLabels[r.error]||r.error||'unknown error';
+      // Can't reach at all
+      const errMsg=errLabels[r.error]||r.error||'unreachable';
       influxLine=`<span style="color:var(--r)">✗ InfluxDB — ${errMsg}</span>`
         +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db}</span>`;
     }
@@ -1801,20 +1823,32 @@ def api_options():
 def api_influx_debug():
     entity   = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
     influx_u = cfg("influxdb_url", "")
+    influx_db= cfg("influxdb_db", "homeassistant")
+    user     = cfg("influxdb_user", "")
+    password = cfg("influxdb_password", "")
+
+    # Ping first (SHOW DATABASES) to check basic connectivity independently of auth
+    ping_ok, ping_err, auth_mode = False, None, "unknown"
     if influx_u:
-        rows_i, err_i = ha_history_influx(entity, days=7)
-    else:
-        rows_i, err_i = [], "not_configured"
+        r_ping, ping_err, auth_mode = _influx_query(
+            influx_u, influx_db, "SHOW DATABASES", user, password)
+        ping_ok = r_ping is not None
+
+    rows_i, err_i = (ha_history_influx(entity, days=7) if influx_u
+                     else ([], "not_configured"))
     rows_r = ha_history(entity, days=1)
+
     result = {
         "configured":  bool(influx_u),
         "url":         influx_u,
-        "db":          cfg("influxdb_db", "homeassistant"),
+        "db":          influx_db,
+        "ping_ok":     ping_ok,
+        "auth_mode":   auth_mode,
         "records_7d":  len(rows_i),
         "first_ts":    rows_i[0]["last_changed"][:16]  if rows_i else None,
         "last_ts":     rows_i[-1]["last_changed"][:16] if rows_i else None,
         "ok":          len(rows_i) > 0,
-        "error":       err_i,
+        "error":       err_i or ping_err,
         "recorder_7d": len(rows_r),
     }
     return jsonify(result)

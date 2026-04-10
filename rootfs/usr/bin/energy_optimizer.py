@@ -1058,7 +1058,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.1</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1141,7 +1141,10 @@ th{color:var(--m);font-weight:500}
       <div class="price-field"><label>Valley (€/kWh)</label><input id="p-valley" type="number" step="0.01" min="0"></div>
       <div class="price-field"><label>Export (€/kWh)</label><input id="p-export" type="number" step="0.01" min="0"></div>
     </div>
-    <button class="btn btn-g btn-sm" onclick="saveTariff()">💾 Save tariff</button>
+    <div style="display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap">
+      <button class="btn btn-g btn-sm" onclick="saveTariff()">💾 Save tariff</button>
+      <button class="btn btn-sm" style="background:var(--b);color:var(--m)" onclick="resetTariff()">↩ Reset to defaults</button>
+    </div>
   </div>
 </div>
 
@@ -1301,6 +1304,13 @@ function toggleHour(h){
     tariffCfg.valley_hours=[...valley_hours,h].sort((a,b)=>a-b);
   }
   renderTariffTimeline();
+}
+
+async function resetTariff(){
+  if(!confirm('Reset tariff to built-in defaults? This will overwrite your current prices and schedule.')) return;
+  const r=await fetch(BASE+'/api/tariff/reset',{method:'POST'}).then(r=>r.json());
+  if(r.ok){ notify('✓ Tariff reset to defaults'); loadTariff(); }
+  else notify('✗ Error resetting tariff','err');
 }
 
 async function saveTariff(){
@@ -1638,6 +1648,12 @@ def api_tariff_post():
     if not data:
         return jsonify({"ok": False, "error": "No data"}), 400
     save_tariff(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/tariff/reset", methods=["POST"])
+def api_tariff_reset():
+    save_tariff(dict(DEFAULT_TARIFF))
+    log.info("Tariff reset to built-in defaults")
     return jsonify({"ok": True})
 
 @app.route("/api/setup", methods=["GET"])

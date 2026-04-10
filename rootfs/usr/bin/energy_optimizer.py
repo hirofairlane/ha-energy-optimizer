@@ -171,13 +171,13 @@ def ha_history(entity_id: str, days: int = 14) -> list:
 
 # ── Tariff management ────────────────────────────────────────────────────────
 DEFAULT_TARIFF = {
-    # Real all-in prices for 2.0TD (Spain) including electricity tax + 21% IVA
-    # Source: Energia Nufri invoice Feb-2026
-    #   P1 = 0.223434 × 1.0511 × 1.21 ≈ 0.284 €/kWh  (peak weekdays 10-14h, 18-22h)
-    #   P2 = 0.148270 × 1.0511 × 1.21 ≈ 0.189 €/kWh  (shoulder)
-    #   P3 = 0.114663 × 1.0511 × 1.21 ≈ 0.146 €/kWh  (valley / weekends)
-    #   Export (excedentes) = 0.040 €/kWh (fixed, no IVA applied to credit)
-    "prices":       {"peak": 0.284, "mid": 0.189, "valley": 0.146, "export": 0.040},
+    # All-in prorated prices for 2.0TD (Spain) — all costs included (taxes, tolls, charges)
+    # Source: Energia Nufri invoice, Apr-2026 update
+    #   P1 (Punta)  = 0.2234 €/kWh  (peak weekdays 10-14h, 18-22h)
+    #   P2 (Llano)  = 0.1483 €/kWh  (shoulder)
+    #   P3 (Valle)  = 0.1147 €/kWh  (valley 00-08h / weekends)
+    #   Export (excedentes) = 0.040 €/kWh (fixed)
+    "prices":       {"peak": 0.2234, "mid": 0.1483, "valley": 0.1147, "export": 0.040},
     "peak_hours":   [10, 11, 12, 13, 18, 19, 20, 21],
     "valley_hours": [0, 1, 2, 3, 4, 5, 6, 7],
     "weekend_days": [5, 6],   # 0=Mon … 6=Sun; these days use valley tariff all day
@@ -385,10 +385,17 @@ def train_model() -> bool:
     import numpy as np
 
     log.info("═══ ML Training started ═══")
-    rows = ha_history(cfg("sensor_battery_soc", "sensor.battery_state_of_capacity"), days=60)
+    entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
+    rows = []
+    for days in [60, 30, 14, 7]:
+        rows = ha_history(entity, days=days)
+        if rows:
+            log.info(f"  History window used: {days}d ({len(rows)} records)")
+            break
+        log.warning(f"  History {days}d returned empty — trying shorter window")
     df   = _history_to_df(rows)
     if df is None:
-        log.warning(f"Insufficient history ({len(rows)} samples). Rules-only mode.")
+        log.warning(f"Insufficient history ({len(rows)} samples after fallback). Rules-only mode.")
         return False
 
     X, y = df[FEATURES], df["value"]

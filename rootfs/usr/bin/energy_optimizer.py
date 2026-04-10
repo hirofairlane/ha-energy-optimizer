@@ -170,12 +170,13 @@ def ha_history(entity_id: str, days: int = 14) -> list:
     return []
 
 # ── InfluxDB history (primary source for ML training) ────────────────────────
-def ha_history_influx(entity_id: str, days: int = 60) -> list:
+def ha_history_influx(entity_id: str, days: int = 60) -> tuple:
     """Fetch entity history from InfluxDB.
 
-    Uses InfluxQL with epoch=ms so timestamps come back as integers —
-    no nanosecond-precision parsing issues.  Returns rows in the same
-    {"last_changed": iso_str, "state": str} format as ha_history().
+    Uses InfluxQL with epoch=ms so timestamps come back as integers.
+    Returns (rows, error_str) where rows is a list of
+    {"last_changed": iso_str, "state": str} dicts and error_str is None on
+    success or a short description of the failure for the debug panel.
     """
     from datetime import timezone as _tz
     url      = cfg("influxdb_url", "")
@@ -183,8 +184,7 @@ def ha_history_influx(entity_id: str, days: int = 60) -> list:
     user     = cfg("influxdb_user", "")
     password = cfg("influxdb_password", "")
     if not url:
-        return []
-    # /.*/ matches all measurements; entity_id is a tag in the HA integration
+        return [], "not_configured"
     q = (f'SELECT "value" FROM /.*/ WHERE "entity_id" = \'{entity_id}\' '
          f'AND time >= now() - {days}d ORDER BY time ASC')
     try:
@@ -194,14 +194,17 @@ def ha_history_influx(entity_id: str, days: int = 60) -> list:
             auth=(user, password) if user else None,
             timeout=30,
         )
+        if r.status_code == 401:
+            log.warning(f"  InfluxDB {entity_id} HTTP 401: authentication failed")
+            return [], "auth_failed"
         if r.status_code != 200:
             log.warning(f"  InfluxDB {entity_id} HTTP {r.status_code}: {r.text[:120]}")
-            return []
+            return [], f"http_{r.status_code}"
         data    = r.json()
         results = data.get("results", [])
         if not results or "series" not in results[0]:
             log.warning(f"  InfluxDB {entity_id}: no series in response")
-            return []
+            return [], "no_series"
         series = results[0]["series"][0]
         cols   = series.get("columns", [])
         time_i = cols.index("time")  if "time"  in cols else 0
@@ -218,12 +221,13 @@ def ha_history_influx(entity_id: str, days: int = 60) -> list:
             except (IndexError, TypeError, ValueError):
                 continue
         log.info(f"  InfluxDB {entity_id}: {len(rows)} records ({days}d)")
-        return rows
+        return rows, None
     except requests.Timeout:
         log.error(f"  InfluxDB {entity_id}: timed out")
+        return [], "timeout"
     except Exception as e:
         log.error(f"  InfluxDB {entity_id}: {e}")
-    return []
+        return [], str(e)[:80]
 
 # ── Tariff management ────────────────────────────────────────────────────────
 DEFAULT_TARIFF = {
@@ -446,7 +450,7 @@ def train_model() -> bool:
 
     # Primary: InfluxDB (years of retention — far better for ML)
     if cfg("influxdb_url", ""):
-        rows = ha_history_influx(entity, days=365)
+        rows, _err = ha_history_influx(entity, days=365)
         if rows:
             log.info(f"  Source: InfluxDB — {len(rows)} records / 365d")
 
@@ -1505,6 +1509,12 @@ async function testDataSources(){
   try{
     const r=await fetch(BASE+'/api/influx-debug').then(r=>r.json());
     let influxLine;
+    const errLabels={
+      not_configured:'add influxdb_url in add-on options',
+      auth_failed:'authentication failed — check influxdb_user / influxdb_password in add-on options',
+      no_series:'connected but no data for this entity',
+      timeout:'connection timed out',
+    };
     if(!r.configured){
       influxLine=`<span style="color:var(--m)">InfluxDB — not configured</span> `
         +`<span style="color:var(--m);font-size:.68rem">(add influxdb_url in add-on options)</span>`;
@@ -1513,8 +1523,9 @@ async function testDataSources(){
         +` — <b>${r.records_7d}</b> records (7d) · ${r.first_ts} → ${r.last_ts}`
         +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db}</span>`;
     } else {
-      influxLine=`<span style="color:var(--r)">✗ InfluxDB reachable but no data</span>`
-        +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db} — ${r.error||''}</span>`;
+      const errMsg=errLabels[r.error]||r.error||'unknown error';
+      influxLine=`<span style="color:var(--r)">✗ InfluxDB — ${errMsg}</span>`
+        +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db}</span>`;
     }
     out.innerHTML=`<div>${influxLine}</div>`
       +`<div style="margin-top:.3rem"><span style="color:var(--a)">HA recorder</span>`
@@ -1774,17 +1785,21 @@ def api_options():
 def api_influx_debug():
     entity   = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
     influx_u = cfg("influxdb_url", "")
-    rows_i   = ha_history_influx(entity, days=7) if influx_u else []
-    rows_r   = ha_history(entity, days=1)
-    result   = {
-        "configured":   bool(influx_u),
-        "url":          influx_u,
-        "db":           cfg("influxdb_db", "homeassistant"),
-        "records_7d":   len(rows_i),
-        "first_ts":     rows_i[0]["last_changed"][:16]  if rows_i else None,
-        "last_ts":      rows_i[-1]["last_changed"][:16] if rows_i else None,
-        "ok":           len(rows_i) > 0,
-        "recorder_7d":  len(rows_r),
+    if influx_u:
+        rows_i, err_i = ha_history_influx(entity, days=7)
+    else:
+        rows_i, err_i = [], "not_configured"
+    rows_r = ha_history(entity, days=1)
+    result = {
+        "configured":  bool(influx_u),
+        "url":         influx_u,
+        "db":          cfg("influxdb_db", "homeassistant"),
+        "records_7d":  len(rows_i),
+        "first_ts":    rows_i[0]["last_changed"][:16]  if rows_i else None,
+        "last_ts":     rows_i[-1]["last_changed"][:16] if rows_i else None,
+        "ok":          len(rows_i) > 0,
+        "error":       err_i,
+        "recorder_7d": len(rows_r),
     }
     return jsonify(result)
 

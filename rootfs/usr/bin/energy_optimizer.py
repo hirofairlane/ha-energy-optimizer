@@ -1075,7 +1075,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.5</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.6</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1397,18 +1397,39 @@ function mkChart(id,type,labels,datasets,yExtra={},maxH=null){
   return new Chart(el.getContext('2d'),{type,data:{labels,datasets},
     options:{responsive:true,maintainAspectRatio:true,
       plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-      scales:{x:{ticks:{color:'#94a3b8',maxTicksLimit:8,font:{size:10}},grid:{color:'#334155'}},
+      scales:{x:{ticks:{color:'#94a3b8',maxTicksLimit:10,font:{size:10}},grid:{color:'#334155'}},
               y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'},...yExtra}}}});
 }
 
 async function loadCharts(){
   try {
     const cd=await fetch(BASE+'/api/chart-data').then(r=>r.json());
+    // Combine past + future labels for x-axis
+    const futureLabels=cd.soc.future_labels||[];
+    const futurePred=cd.soc.future_predicted||[];
+    const nPast=cd.soc.labels.length;
+    const allLabels=[...cd.soc.labels,...futureLabels];
+    // Pad arrays: actual and past-predicted are null in the future segment
+    const actualData=[...cd.soc.actual,...Array(futureLabels.length).fill(null)];
+    const pastPredData=[...(cd.soc.predicted||[]),...Array(futureLabels.length).fill(null)];
+    // Future forecast: null for past segment, values for future
+    const futureData=[...Array(nPast).fill(null),...futurePred];
     if(socInst) socInst.destroy();
-    socInst=mkChart('socChart','line',cd.soc.labels,[
-      {label:'Actual SOC %',data:cd.soc.actual,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.08)',fill:true,tension:.3,pointRadius:0},
-      {label:'Predicted %',data:cd.soc.predicted,borderColor:'#a78bfa',backgroundColor:'transparent',fill:false,tension:.3,pointRadius:0,borderDash:[4,3]},
-    ],{min:0,max:100});
+    socInst=new Chart(document.getElementById('socChart').getContext('2d'),{
+      type:'line',
+      data:{labels:allLabels,datasets:[
+        {label:'Actual SOC %',data:actualData,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.08)',fill:true,tension:.3,pointRadius:0},
+        {label:'Predicted (past) %',data:pastPredData,borderColor:'#a78bfa',backgroundColor:'transparent',fill:false,tension:.3,pointRadius:0,borderDash:[4,3]},
+        {label:'Forecast (next 8h) %',data:futureData,borderColor:'#4ade80',backgroundColor:'rgba(74,222,128,.06)',fill:true,tension:.3,pointRadius:0,borderDash:[6,3]},
+      ]},
+      options:{responsive:true,maintainAspectRatio:true,
+        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
+        scales:{
+          x:{ticks:{color:'#94a3b8',maxTicksLimit:10,font:{size:10}},grid:{color:'#334155'}},
+          y:{min:0,max:100,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}
+        }
+      }
+    });
     if(solInst) solInst.destroy();
     solInst=mkChart('solarChart','bar',['Yesterday','Today','Tomorrow'],[
       {label:'kWh',data:[cd.solar.yesterday,cd.solar.today,cd.solar.tomorrow],
@@ -1720,8 +1741,16 @@ def api_setup_post():
 
 @app.route("/api/chart-data")
 def api_chart_data():
+    from datetime import timezone as _tz
     soc_entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
-    rows       = ha_history(soc_entity, days=1)
+    influx_u   = cfg("influxdb_url", "").strip()
+
+    # ── SOC actual (past 24h) — prefer InfluxDB, fallback HA recorder ─────────
+    if influx_u:
+        rows, _ = ha_history_influx(soc_entity, days=1)
+    if not influx_u or not rows:
+        rows = ha_history(soc_entity, days=1)
+
     soc_labels, soc_actual = [], []
     for r in rows:
         try:
@@ -1732,7 +1761,8 @@ def api_chart_data():
         except (KeyError, ValueError, TypeError):
             continue
 
-    soc_predicted = []
+    # ── SOC predicted (past) — from decisions.json ────────────────────────────
+    soc_predicted = [None] * len(soc_labels)
     if DECISIONS_FILE.exists():
         try:
             cutoff  = (datetime.now() - timedelta(days=1)).isoformat()
@@ -1746,15 +1776,64 @@ def api_chart_data():
                         pred_by_time[ts_str] = pred
             soc_predicted = [pred_by_time.get(lbl) for lbl in soc_labels]
         except Exception:
-            soc_predicted = [None] * len(soc_labels)
-    else:
-        soc_predicted = [None] * len(soc_labels)
+            pass
 
-    sensors        = read_sensors()
-    solar_today    = sensors.get("solar_today", 0)
-    solar_tomorrow = sensors.get("solar_tomorrow", 0)
+    # ── SOC forecast (future 8h) — chained ML predictions ────────────────────
+    future_labels, future_predicted = [], []
+    sensors = read_sensors()
+    if MODEL_FILE.exists():
+        try:
+            art   = joblib.load(MODEL_FILE)
+            now   = datetime.now()
+            soc_f = sensors["battery_soc"]
+            for h in range(1, 9):
+                ft    = now + timedelta(hours=h)
+                is_day_f = 7 <= ft.hour <= 20   # simple heuristic for future hours
+                X = pd.DataFrame([{
+                    "hour":        ft.hour,
+                    "weekday":     ft.weekday(),
+                    "month":       ft.month,
+                    "lag1":        soc_f,
+                    "lag4":        soc_f,
+                    "roll4":       soc_f,
+                    "solar_proxy": 1 if is_day_f else 0,
+                }])
+                pred  = float(art["pipeline"].predict(X[FEATURES])[0])
+                soc_f = round(max(0.0, min(100.0, pred)), 1)
+                future_labels.append(ft.strftime("%H:%M"))
+                future_predicted.append(soc_f)
+        except Exception as e:
+            log.warning(f"Future SOC forecast: {e}")
+
+    # ── Solar yesterday — InfluxDB MAX, fallback decisions.json ──────────────
+    solar_today     = sensors.get("solar_today", 0)
+    solar_tomorrow  = sensors.get("solar_tomorrow", 0)
     solar_yesterday = 0.0
-    if DECISIONS_FILE.exists():
+    solar_entity_id = cfg("sensor_solar_today", "sensor.energy_production_today").split(".")[-1]
+
+    if influx_u:
+        now_local   = datetime.now()
+        yest_date   = (now_local - timedelta(days=1)).date()
+        yest_start  = datetime(yest_date.year, yest_date.month, yest_date.day,
+                               tzinfo=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        today_start = datetime(now_local.year, now_local.month, now_local.day,
+                               tzinfo=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q_sol = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{solar_entity_id}\' '
+                 f'AND time >= \'{yest_start}\' AND time < \'{today_start}\'')
+        r_sol, _, _ = _influx_query(
+            influx_u, cfg("influxdb_db", "homeassistant").strip(), q_sol,
+            cfg("influxdb_user", "").strip(), cfg("influxdb_password", ""))
+        if r_sol:
+            try:
+                s = r_sol.json()["results"][0].get("series", [])
+                if s and s[0].get("values"):
+                    v = s[0]["values"][0][1]
+                    if v is not None:
+                        solar_yesterday = float(v)
+            except Exception:
+                pass
+
+    if not solar_yesterday and DECISIONS_FILE.exists():
         try:
             history   = json.loads(DECISIONS_FILE.read_text())
             yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
@@ -1765,6 +1844,7 @@ def api_chart_data():
         except Exception:
             pass
 
+    # ── Daily savings ─────────────────────────────────────────────────────────
     savings_labels, savings_values = [], []
     if DECISIONS_FILE.exists():
         try:
@@ -1790,7 +1870,13 @@ def api_chart_data():
             pass
 
     return jsonify({
-        "soc":           {"labels": soc_labels, "actual": soc_actual, "predicted": soc_predicted},
+        "soc": {
+            "labels":           soc_labels,
+            "actual":           soc_actual,
+            "predicted":        soc_predicted,
+            "future_labels":    future_labels,
+            "future_predicted": future_predicted,
+        },
         "solar":         {"yesterday": round(solar_yesterday, 1),
                           "today": round(solar_today, 1), "tomorrow": round(solar_tomorrow, 1)},
         "savings_daily": {"labels": savings_labels, "values": savings_values},

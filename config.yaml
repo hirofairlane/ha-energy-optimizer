@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "2.1.0"
+version: "2.2.0"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -57,7 +57,7 @@ options:
   sensor_pool_hours_week: "sensor.depuradora_encendida_semana"
   switch_pool: "switch.depuradora"
 
-  # ── Pool cleaner (limpiafondos) — runs first 15 min with pool pump ─────────
+  # ── Pool cleaner (limpiafondos, ~1.5 kWh) — auto-runs first 15 min with pump
   switch_pool_cleaner: "switch.limpiafondos"
 
   # ── Heat pump actuators ────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ options:
   switch_battery_force_charge: "02db00e10018b01211507db92819a25a"
   select_battery_mode: "select.battery_working_mode"
 
-  # ── Dishwasher ─────────────────────────────────────────────────────────────
+  # ── Dishwasher (monitored, included in consumption predictions) ────────────
   sensor_dishwasher_state: "sensor.lavavajillas_operation_state"
   switch_dishwasher: ""
 
@@ -83,6 +83,11 @@ options:
   notify_email_service: "correo_gmail_com"
   notify_email_target: "scamposgarci@gmail.com"
   notify_telegram_service: "telegramsergio"
+
+  # ── Notification toggles (can also be set from the GUI Setup panel) ────────
+  notify_email_enabled: true
+  notify_telegram_daily_enabled: true
+  notify_telegram_alerts_enabled: true
 
 schema:
   decision_interval_minutes: int(5,60)
@@ -123,3 +128,6 @@ schema:
   notify_email_service: str
   notify_email_target: str
   notify_telegram_service: str
+  notify_email_enabled: bool
+  notify_telegram_daily_enabled: bool
+  notify_telegram_alerts_enabled: bool

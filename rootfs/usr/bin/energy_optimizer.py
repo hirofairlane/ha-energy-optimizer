@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Energy Optimizer — Home Assistant Add-on v2.3
+Energy Optimizer — Home Assistant Add-on v2.4
 Smart energy management: battery, heat pump, pool pump, pool cleaner, dishwasher
 Logic: adaptive tariff rules + scikit-learn ML model + consumption history
 
-Changes in v2.3:
-  - Fix HA ingress base-path so all GUI API calls reach the add-on correctly
-  - Tariff editor: per-day-of-week weekend configuration + improved UI
-  - All GUI errors resolved (battery %, decisions log, charts, tariff, setup)
-  - README translated to English
+Changes in v2.4:
+  - History API fix: 60s timeout + no_attributes=true (resolves "0 samples" on retrain)
+  - Minimum training samples lowered to 48 (3×15min cycles per day for 4 days)
+  - Solar proxy now uses actual sun.sun elevation from HA (correct for Guadarrama, Madrid)
+  - Real all-in tariff prices from 2.0TD bill (taxes + IVA included): P1=0.284, P2=0.189, P3=0.146
+  - Export price updated to real excedentes rate: 0.040 €/kWh
+  - Weather forecast widget in Dashboard (condition, temperature, 5-day forecast, storm alert)
+  - New /api/weather endpoint using weather.aemet
 """
 
 import os
@@ -133,19 +136,48 @@ def ha_switch(entity_id: str, turn_on: bool) -> bool:
     return ha_service("switch", "turn_on" if turn_on else "turn_off", {"entity_id": entity_id})
 
 def ha_history(entity_id: str, days: int = 14) -> list:
+    """Fetch entity history from HA recorder.
+
+    Uses no_attributes=true to cut payload size (critical for 60-day requests)
+    and a 60-second timeout so long history calls don't fail silently.
+    """
     from datetime import timezone
     start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    result = ha_get(
-        f"/api/history/period/{start}",
-        params={"filter_entity_id": entity_id, "minimal_response": "true"},
-    )
-    if result and isinstance(result, list) and len(result) > 0:
-        return result[0]
+    try:
+        r = requests.get(
+            f"{HA_BASE}/api/history/period/{start}",
+            headers=HEADERS,
+            params={
+                "filter_entity_id": entity_id,
+                "minimal_response": "true",
+                "no_attributes":    "true",
+            },
+            timeout=60,
+        )
+        if r.status_code == 200:
+            result = r.json()
+            if result and isinstance(result, list) and len(result) > 0:
+                rows = result[0]
+                log.info(f"  History {entity_id}: {len(rows)} records ({days}d)")
+                return rows
+            log.warning(f"  History {entity_id}: empty response from HA recorder")
+        else:
+            log.warning(f"  History {entity_id} HTTP {r.status_code}: {r.text[:120]}")
+    except requests.Timeout:
+        log.error(f"  History {entity_id}: timed out requesting {days}d of data")
+    except requests.RequestException as e:
+        log.error(f"  History {entity_id}: {e}")
     return []
 
 # ── Tariff management ────────────────────────────────────────────────────────
 DEFAULT_TARIFF = {
-    "prices":       {"peak": 0.30, "mid": 0.18, "valley": 0.08, "export": 0.06},
+    # Real all-in prices for 2.0TD (Spain) including electricity tax + 21% IVA
+    # Source: Energia Nufri invoice Feb-2026
+    #   P1 = 0.223434 × 1.0511 × 1.21 ≈ 0.284 €/kWh  (peak weekdays 10-14h, 18-22h)
+    #   P2 = 0.148270 × 1.0511 × 1.21 ≈ 0.189 €/kWh  (shoulder)
+    #   P3 = 0.114663 × 1.0511 × 1.21 ≈ 0.146 €/kWh  (valley / weekends)
+    #   Export (excedentes) = 0.040 €/kWh (fixed, no IVA applied to credit)
+    "prices":       {"peak": 0.284, "mid": 0.189, "valley": 0.146, "export": 0.040},
     "peak_hours":   [10, 11, 12, 13, 18, 19, 20, 21],
     "valley_hours": [0, 1, 2, 3, 4, 5, 6, 7],
     "weekend_days": [5, 6],   # 0=Mon … 6=Sun; these days use valley tariff all day
@@ -331,7 +363,7 @@ def _history_to_df(rows: list):
             records.append({"ts": ts, "value": val})
         except (KeyError, ValueError, TypeError):
             continue
-    if len(records) < 100:
+    if len(records) < 48:   # 48 = 4 readings/h × 12 hours — minimum viable dataset
         return None
     df = pd.DataFrame(records).set_index("ts").sort_index()
     df["hour"]        = df.index.hour
@@ -378,6 +410,9 @@ def predict_soc(sensors: dict) -> dict:
         try:
             art = joblib.load(MODEL_FILE)
             now = datetime.now()
+            # Use actual sun.sun elevation for solar proxy (correct for Guadarrama lat 40.67°N)
+            sun_data   = get_sun_status()
+            solar_live = 1 if sun_data.get("is_day") else 0
             X   = pd.DataFrame([{
                 "hour":        now.hour,
                 "weekday":     now.weekday(),
@@ -385,7 +420,7 @@ def predict_soc(sensors: dict) -> dict:
                 "lag1":        sensors["battery_soc"],
                 "lag4":        sensors["battery_soc"],
                 "roll4":       sensors["battery_soc"],
-                "solar_proxy": 1 if 8 <= now.hour <= 19 else 0,
+                "solar_proxy": solar_live,
             }])
             pred = float(art["pipeline"].predict(X[FEATURES])[0])
             return {"predicted_soc": round(max(0.0, min(100.0, pred)), 1),
@@ -930,10 +965,22 @@ th{color:var(--m);font-weight:500}
 .tag.hp{background:rgba(74,222,128,.12);color:var(--g)}
 .tag.pool{background:rgba(251,191,36,.12);color:var(--y)}
 .tag.dw{background:rgba(251,146,60,.12);color:var(--o)}
+/* Weather */
+.weather-card{background:var(--s);border-radius:.75rem;padding:.9rem;border:1px solid var(--b);margin-bottom:1rem}
+.weather-main{display:flex;gap:1rem;align-items:center;margin-bottom:.8rem;flex-wrap:wrap}
+.weather-icon{font-size:2.4rem;line-height:1}
+.weather-temp{font-size:2rem;font-weight:700;color:var(--a)}
+.weather-cond{font-size:.82rem;color:var(--m);text-transform:capitalize;margin-top:.1rem}
+.forecast-row{display:flex;gap:.4rem;overflow-x:auto;padding-bottom:.2rem}
+.forecast-day{background:var(--bg);border-radius:.5rem;padding:.45rem .55rem;min-width:66px;text-align:center;font-size:.72rem;flex-shrink:0}
+.forecast-day .fday{color:var(--m);margin-bottom:.15rem}
+.forecast-day .ftemp{color:var(--t);font-weight:600}
+.forecast-day .fmin{color:var(--m)}
+.storm-alert-w{background:rgba(248,113,113,.12);border:1px solid var(--r);color:var(--r);padding:.4rem .8rem;border-radius:.5rem;font-size:.78rem;font-weight:700;margin-bottom:.7rem}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.3</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.4</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -946,6 +993,7 @@ th{color:var(--m);font-weight:500}
 <div id="tab-dashboard" class="tab-content active">
   <div id="kpis" class="grid"></div>
   <div id="savings-box"></div>
+  <div id="weather-box"></div>
   <div class="batt-card">
     <h2 style="margin-top:0">🔋 Battery</h2>
     <div class="batt-header">
@@ -1367,10 +1415,59 @@ async function sendSummary(){
   finally{btn.disabled=false;btn.textContent='📧 Send daily summary';}
 }
 
+// ── Weather widget ────────────────────────────────────────────────────────────
+const WEATHER_ICONS={sunny:'☀️',clear:'🌙',partlycloudy:'⛅',cloudy:'☁️',fog:'🌫️',
+  rainy:'🌧️',snowy:'❄️','lightning-rainy':'⛈️',lightning:'🌩️',
+  windy:'💨',hail:'🌨️',pouring:'🌊',exceptional:'⚠️'};
+function weatherIcon(c){return WEATHER_ICONS[c]||'🌡️';}
+
+async function loadWeather(){
+  const box=document.getElementById('weather-box');
+  try{
+    const w=await fetch(BASE+'/api/weather').then(r=>r.json());
+    if(!w.ok){box.innerHTML='';return;}
+    const stormHtml=w.storm
+      ?'<div class="storm-alert-w">⚡ STORM FORECAST — battery will be pre-charged to storm reserve</div>':'';
+    const fcHtml=(w.forecast||[]).map(f=>{
+      const d=new Date(f.datetime);
+      const day=isNaN(d)?f.datetime.slice(0,10):d.toLocaleDateString('en',{weekday:'short',month:'short',day:'numeric'});
+      const precip=f.precipitation?`<div style="color:#38bdf8;font-size:.62rem">${f.precipitation}mm</div>`:'';
+      return `<div class="forecast-day">
+        <div class="fday">${day}</div>
+        <div style="font-size:1.1rem">${weatherIcon(f.condition)}</div>
+        <div class="ftemp">${f.temperature??'--'}°</div>
+        <div class="fmin">${f.templow??'--'}°</div>
+        ${precip}
+      </div>`;
+    }).join('');
+    const meta=w.humidity||w.wind_speed
+      ?`<div style="font-size:.72rem;color:var(--m);margin-top:.2rem">`
+        +(w.humidity?`💧 ${w.humidity}%`:'')
+        +(w.humidity&&w.wind_speed?' &nbsp;·&nbsp; ':'')
+        +(w.wind_speed?`💨 ${w.wind_speed} km/h`:'')
+       +`</div>`:'';
+    box.innerHTML=`<div class="weather-card">
+      <h2 style="margin-top:0">🌤 Weather forecast</h2>
+      ${stormHtml}
+      <div class="weather-main">
+        <div class="weather-icon">${weatherIcon(w.condition)}</div>
+        <div>
+          <div class="weather-temp">${w.temperature??'--'}°C</div>
+          <div class="weather-cond">${(w.condition||'').replace(/-/g,' ')}</div>
+          ${meta}
+        </div>
+      </div>
+      ${fcHtml?`<div class="forecast-row">${fcHtml}</div>`:''}
+    </div>`;
+  }catch(e){box.innerHTML='';}
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 load();
+loadWeather();
 loadCharts();
 setInterval(load,30000);
+setInterval(loadWeather,300000);
 setInterval(loadCharts,120000);
 </script>
 </body></html>"""
@@ -1562,13 +1659,40 @@ def api_send_summary():
 def api_options():
     return jsonify({k: v for k, v in OPT.items() if "token" not in k.lower()})
 
+@app.route("/api/weather")
+def api_weather():
+    entity = cfg("sensor_weather", "weather.aemet")
+    s = ha_state(entity)
+    if not s:
+        return jsonify({"ok": False, "error": "weather entity unavailable"})
+    attrs    = s.get("attributes", {})
+    forecast = attrs.get("forecast", [])[:5]
+    return jsonify({
+        "ok":         True,
+        "condition":  s.get("state", ""),
+        "temperature": attrs.get("temperature"),
+        "humidity":   attrs.get("humidity"),
+        "wind_speed": attrs.get("wind_speed"),
+        "forecast": [
+            {
+                "datetime":     f.get("datetime", ""),
+                "condition":    f.get("condition", ""),
+                "temperature":  f.get("temperature"),
+                "templow":      f.get("templow"),
+                "precipitation": f.get("precipitation"),
+            }
+            for f in forecast
+        ],
+        "storm": is_storm_forecast(),
+    })
+
 # ── Startup ──────────────────────────────────────────────────────────────────
 def main():
     global _scheduler_ref
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.3 — HAOS")
+    log.info("   Energy Optimizer v2.4 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

@@ -169,6 +169,62 @@ def ha_history(entity_id: str, days: int = 14) -> list:
         log.error(f"  History {entity_id}: {e}")
     return []
 
+# ── InfluxDB history (primary source for ML training) ────────────────────────
+def ha_history_influx(entity_id: str, days: int = 60) -> list:
+    """Fetch entity history from InfluxDB.
+
+    Uses InfluxQL with epoch=ms so timestamps come back as integers —
+    no nanosecond-precision parsing issues.  Returns rows in the same
+    {"last_changed": iso_str, "state": str} format as ha_history().
+    """
+    from datetime import timezone as _tz
+    url      = cfg("influxdb_url", "")
+    db       = cfg("influxdb_db", "homeassistant")
+    user     = cfg("influxdb_user", "")
+    password = cfg("influxdb_password", "")
+    if not url:
+        return []
+    # /.*/ matches all measurements; entity_id is a tag in the HA integration
+    q = (f'SELECT "value" FROM /.*/ WHERE "entity_id" = \'{entity_id}\' '
+         f'AND time >= now() - {days}d ORDER BY time ASC')
+    try:
+        r = requests.get(
+            f"{url.rstrip('/')}/query",
+            params={"db": db, "q": q, "epoch": "ms"},
+            auth=(user, password) if user else None,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            log.warning(f"  InfluxDB {entity_id} HTTP {r.status_code}: {r.text[:120]}")
+            return []
+        data    = r.json()
+        results = data.get("results", [])
+        if not results or "series" not in results[0]:
+            log.warning(f"  InfluxDB {entity_id}: no series in response")
+            return []
+        series = results[0]["series"][0]
+        cols   = series.get("columns", [])
+        time_i = cols.index("time")  if "time"  in cols else 0
+        val_i  = cols.index("value") if "value" in cols else 1
+        rows = []
+        for point in series.get("values", []):
+            try:
+                ms  = int(point[time_i])
+                ts  = datetime.fromtimestamp(ms / 1000, tz=_tz.utc).isoformat()
+                val = point[val_i]
+                if val is None:
+                    continue
+                rows.append({"last_changed": ts, "state": str(val)})
+            except (IndexError, TypeError, ValueError):
+                continue
+        log.info(f"  InfluxDB {entity_id}: {len(rows)} records ({days}d)")
+        return rows
+    except requests.Timeout:
+        log.error(f"  InfluxDB {entity_id}: timed out")
+    except Exception as e:
+        log.error(f"  InfluxDB {entity_id}: {e}")
+    return []
+
 # ── Tariff management ────────────────────────────────────────────────────────
 DEFAULT_TARIFF = {
     # All-in prorated prices for 2.0TD (Spain) — all costs included (taxes, tolls, charges)
@@ -387,15 +443,26 @@ def train_model() -> bool:
     log.info("═══ ML Training started ═══")
     entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
     rows = []
-    for days in [60, 30, 14, 7]:
-        rows = ha_history(entity, days=days)
+
+    # Primary: InfluxDB (years of retention — far better for ML)
+    if cfg("influxdb_url", ""):
+        rows = ha_history_influx(entity, days=365)
         if rows:
-            log.info(f"  History window used: {days}d ({len(rows)} records)")
-            break
-        log.warning(f"  History {days}d returned empty — trying shorter window")
-    df   = _history_to_df(rows)
+            log.info(f"  Source: InfluxDB — {len(rows)} records / 365d")
+
+    # Fallback: HA recorder with progressive window (default 10d retention)
+    if not rows:
+        log.info("  InfluxDB not configured or empty — using HA recorder")
+        for days in [60, 30, 14, 7]:
+            rows = ha_history(entity, days=days)
+            if rows:
+                log.info(f"  Source: HA recorder — {len(rows)} records / {days}d")
+                break
+            log.warning(f"  HA recorder {days}d empty — trying shorter window")
+
+    df = _history_to_df(rows)
     if df is None:
-        log.warning(f"Insufficient history ({len(rows)} samples after fallback). Rules-only mode.")
+        log.warning(f"Insufficient history ({len(rows)} samples). Rules-only mode.")
         return False
 
     X, y = df[FEATURES], df["value"]
@@ -1145,6 +1212,14 @@ th{color:var(--m);font-weight:500}
     <button class="btn btn-sm" style="background:var(--b);color:var(--t)" onclick="loadSetup()">↩ Reset</button>
     <span class="save-hint" id="setup-hint"></span>
   </div>
+  <div class="setup-section" style="margin-top:1rem">
+    <h3>🔌 Data sources</h3>
+    <div style="font-size:.72rem;color:var(--m);margin-bottom:.7rem">
+      InfluxDB URL and credentials are set in the add-on options (config). Use this to verify connectivity.
+    </div>
+    <button class="btn btn-sm" id="btn-ds-test" onclick="testDataSources()">🔍 Test connections</button>
+    <div id="ds-result" style="margin-top:.7rem;font-size:.78rem;line-height:1.7"></div>
+  </div>
 </div>
 
 <script>
@@ -1422,6 +1497,35 @@ async function sendSummary(){
   finally{btn.disabled=false;btn.textContent='📧 Send daily summary';}
 }
 
+// ── Data sources debug ───────────────────────────────────────────────────────
+async function testDataSources(){
+  const btn=document.getElementById('btn-ds-test');
+  const out=document.getElementById('ds-result');
+  btn.disabled=true; btn.textContent='⏳ Testing…'; out.innerHTML='';
+  try{
+    const r=await fetch(BASE+'/api/influx-debug').then(r=>r.json());
+    let influxLine;
+    if(!r.configured){
+      influxLine=`<span style="color:var(--m)">InfluxDB — not configured</span> `
+        +`<span style="color:var(--m);font-size:.68rem">(add influxdb_url in add-on options)</span>`;
+    } else if(r.ok){
+      influxLine=`<span style="color:var(--g)">✓ InfluxDB OK</span>`
+        +` — <b>${r.records_7d}</b> records (7d) · ${r.first_ts} → ${r.last_ts}`
+        +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db}</span>`;
+    } else {
+      influxLine=`<span style="color:var(--r)">✗ InfluxDB reachable but no data</span>`
+        +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db} — ${r.error||''}</span>`;
+    }
+    out.innerHTML=`<div>${influxLine}</div>`
+      +`<div style="margin-top:.3rem"><span style="color:var(--a)">HA recorder</span>`
+      +` — <b>${r.recorder_7d??'?'}</b> records (1d) · used as fallback when InfluxDB is empty</div>`;
+  }catch(e){
+    out.innerHTML=`<span style="color:var(--r)">✗ ${e.message}</span>`;
+  }finally{
+    btn.disabled=false; btn.textContent='🔍 Test connections';
+  }
+}
+
 // ── Weather widget ────────────────────────────────────────────────────────────
 const WEATHER_ICONS={sunny:'☀️',clear:'🌙',partlycloudy:'⛅',cloudy:'☁️',fog:'🌫️',
   rainy:'🌧️',snowy:'❄️','lightning-rainy':'⛈️',lightning:'🌩️',
@@ -1665,6 +1769,24 @@ def api_send_summary():
 @app.route("/api/options")
 def api_options():
     return jsonify({k: v for k, v in OPT.items() if "token" not in k.lower()})
+
+@app.route("/api/influx-debug")
+def api_influx_debug():
+    entity   = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
+    influx_u = cfg("influxdb_url", "")
+    rows_i   = ha_history_influx(entity, days=7) if influx_u else []
+    rows_r   = ha_history(entity, days=1)
+    result   = {
+        "configured":   bool(influx_u),
+        "url":          influx_u,
+        "db":           cfg("influxdb_db", "homeassistant"),
+        "records_7d":   len(rows_i),
+        "first_ts":     rows_i[0]["last_changed"][:16]  if rows_i else None,
+        "last_ts":      rows_i[-1]["last_changed"][:16] if rows_i else None,
+        "ok":           len(rows_i) > 0,
+        "recorder_7d":  len(rows_r),
+    }
+    return jsonify(result)
 
 @app.route("/api/weather")
 def api_weather():

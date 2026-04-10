@@ -78,6 +78,12 @@ options:
   # ── Weather (AEMET OpenData) for storm protection ──────────────────────────
   sensor_weather: "weather.aemet"
 
+  # ── InfluxDB (optional — enables years of history for ML training) ───────────
+  influxdb_url: "http://172.30.32.1:8086"
+  influxdb_db: "homeassistant"
+  influxdb_user: ""
+  influxdb_password: ""
+
   # ── Daily summary notifications ────────────────────────────────────────────
   notify_daily_time: "23:00"
   notify_email_service: "correo_gmail_com"
@@ -124,6 +130,10 @@ schema:
   sensor_dishwasher_state: str
   switch_dishwasher: str
   sensor_weather: str
+  influxdb_url: str
+  influxdb_db: str
+  influxdb_user: str
+  influxdb_password: str
   notify_daily_time: str
   notify_email_service: str
   notify_email_target: str

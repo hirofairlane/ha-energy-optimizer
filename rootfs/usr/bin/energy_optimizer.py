@@ -208,9 +208,9 @@ def ha_history_influx(entity_id: str, days: int = 60) -> tuple:
     {"last_changed": iso_str, "state": str} dicts, error_str is None on success.
     """
     from datetime import timezone as _tz
-    url      = cfg("influxdb_url", "")
-    db       = cfg("influxdb_db", "homeassistant")
-    user     = cfg("influxdb_user", "")
+    url      = cfg("influxdb_url", "").strip()
+    db       = cfg("influxdb_db", "homeassistant").strip()
+    user     = cfg("influxdb_user", "").strip()
     password = cfg("influxdb_password", "")
     if not url:
         return [], "not_configured"
@@ -1072,7 +1072,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.3</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.4</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1559,7 +1559,12 @@ async function testDataSources(){
       influxLine=`<span style="color:var(--r)">✗ InfluxDB — ${errMsg}</span>`
         +` <span style="color:var(--m);font-size:.68rem">${r.url} / ${r.db}</span>`;
     }
-    out.innerHTML=`<div>${influxLine}</div>`
+    let diag='';
+    if(r.databases?.length) diag+=`<div style="color:var(--m);font-size:.68rem;margin-top:.2rem">Databases: ${r.databases.join(', ')}</div>`;
+    if(r.measurements?.length) diag+=`<div style="color:var(--m);font-size:.68rem">Measurements (${r.db}): ${r.measurements.join(', ')}</div>`;
+    if(r.sample_entities?.length) diag+=`<div style="color:var(--m);font-size:.68rem">Battery entity_id tags found: ${r.sample_entities.join(', ')}</div>`;
+    else if(r.ping_ok&&!r.ok) diag+=`<div style="color:var(--y);font-size:.68rem">No battery entity_id tags found — entity may use different tag name or measurement</div>`;
+    out.innerHTML=`<div>${influxLine}</div>${diag}`
       +`<div style="margin-top:.3rem"><span style="color:var(--a)">HA recorder</span>`
       +` — <b>${r.recorder_7d??'?'}</b> records (1d) · used as fallback when InfluxDB is empty</div>`;
   }catch(e){
@@ -1821,37 +1826,73 @@ def api_options():
 
 @app.route("/api/influx-debug")
 def api_influx_debug():
-    entity   = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
-    influx_u = cfg("influxdb_url", "")
-    influx_db= cfg("influxdb_db", "homeassistant")
-    user     = cfg("influxdb_user", "")
-    password = cfg("influxdb_password", "")
+    entity    = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
+    influx_u  = cfg("influxdb_url", "").strip()   # strip accidental spaces
+    influx_db = cfg("influxdb_db", "homeassistant").strip()
+    user      = cfg("influxdb_user", "").strip()
+    password  = cfg("influxdb_password", "")
 
-    # Ping first (SHOW DATABASES) to check basic connectivity independently of auth
     ping_ok, ping_err, auth_mode = False, None, "unknown"
+    databases, measurements, sample_entities = [], [], []
+
     if influx_u:
+        # 1. Ping — SHOW DATABASES
         r_ping, ping_err, auth_mode = _influx_query(
             influx_u, influx_db, "SHOW DATABASES", user, password)
         ping_ok = r_ping is not None
+        if r_ping:
+            try:
+                s = r_ping.json()["results"][0]["series"][0]["values"]
+                databases = [v[0] for v in s if not v[0].startswith("_")]
+            except Exception:
+                pass
+
+        # 2. Show measurements in target db
+        if ping_ok:
+            r_m, _, _ = _influx_query(
+                influx_u, influx_db, "SHOW MEASUREMENTS LIMIT 20", user, password)
+            if r_m:
+                try:
+                    s = r_m.json()["results"][0]["series"][0]["values"]
+                    measurements = [v[0] for v in s]
+                except Exception:
+                    pass
+
+        # 3. Sample entity_id tag values
+        if ping_ok:
+            r_e, _, _ = _influx_query(
+                influx_u, influx_db,
+                'SHOW TAG VALUES FROM /.*/ WITH KEY = "entity_id" LIMIT 20',
+                user, password)
+            if r_e:
+                try:
+                    for series in r_e.json()["results"][0].get("series", []):
+                        for v in series.get("values", []):
+                            if "battery" in str(v).lower():
+                                sample_entities.append(v[1] if len(v) > 1 else v[0])
+                except Exception:
+                    pass
 
     rows_i, err_i = (ha_history_influx(entity, days=7) if influx_u
                      else ([], "not_configured"))
     rows_r = ha_history(entity, days=1)
 
-    result = {
-        "configured":  bool(influx_u),
-        "url":         influx_u,
-        "db":          influx_db,
-        "ping_ok":     ping_ok,
-        "auth_mode":   auth_mode,
-        "records_7d":  len(rows_i),
-        "first_ts":    rows_i[0]["last_changed"][:16]  if rows_i else None,
-        "last_ts":     rows_i[-1]["last_changed"][:16] if rows_i else None,
-        "ok":          len(rows_i) > 0,
-        "error":       err_i or ping_err,
-        "recorder_7d": len(rows_r),
-    }
-    return jsonify(result)
+    return jsonify({
+        "configured":       bool(influx_u),
+        "url":              influx_u,
+        "db":               influx_db,
+        "ping_ok":          ping_ok,
+        "auth_mode":        auth_mode,
+        "databases":        databases,
+        "measurements":     measurements,
+        "sample_entities":  sample_entities,
+        "records_7d":       len(rows_i),
+        "first_ts":         rows_i[0]["last_changed"][:16]  if rows_i else None,
+        "last_ts":          rows_i[-1]["last_changed"][:16] if rows_i else None,
+        "ok":               len(rows_i) > 0,
+        "error":            err_i or ping_err,
+        "recorder_7d":      len(rows_r),
+    })
 
 @app.route("/api/weather")
 def api_weather():

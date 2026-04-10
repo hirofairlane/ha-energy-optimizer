@@ -1054,7 +1054,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.4</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1821,7 +1821,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.4 — HAOS")
+    log.info("   Energy Optimizer v2.5 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

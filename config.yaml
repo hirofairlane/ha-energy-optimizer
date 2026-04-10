@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "2.2.0"
+version: "2.3.0"
 slug: "energy_optimizer"
 init: false
 arch:

@@ -1075,7 +1075,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.8</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.0</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1129,9 +1129,13 @@ th{color:var(--m);font-weight:500}
       <canvas id="socChart"></canvas>
     </div>
     <div class="card">
-      <h2 style="margin-top:0">Solar production (kWh)</h2>
-      <canvas id="solarChart"></canvas>
+      <h2 style="margin-top:0">Solar — last 7 days (kWh)</h2>
+      <canvas id="sol7Chart"></canvas>
     </div>
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">Solar production — last 12 months (kWh)</h2>
+    <canvas id="sol12Chart" style="max-height:220px"></canvas>
   </div>
   <div class="card" style="margin-bottom:1rem">
     <h2 style="margin-top:0">Daily savings — last 7 days (€)</h2>
@@ -1390,7 +1394,7 @@ async function saveSetup(){
 }
 
 // ── Charts ────────────────────────────────────────────────────────────────────
-let socInst=null,solInst=null,savInst=null;
+let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null;
 function mkChart(id,type,labels,datasets,yExtra={},maxH=null){
   const el=document.getElementById(id); if(!el) return null;
   if(maxH) el.style.maxHeight=maxH;
@@ -1432,19 +1436,71 @@ async function loadCharts(){
     });
     const maeEl=document.getElementById('soc-mae');
     if(maeEl) maeEl.textContent=cd.soc.mae!=null?`— MAE ${cd.soc.mae}%`:'';
-    if(solInst) solInst.destroy();
-    const todayFc=cd.solar.today_forecast??null;
-    const solLbls=['Yesterday','Today',...(todayFc!=null?['Today (forecast)']:[]),'Tomorrow'];
-    const solData=[cd.solar.yesterday,cd.solar.today,...(todayFc!=null?[todayFc]:[]),cd.solar.tomorrow];
-    const solBg=['rgba(251,191,36,.55)','rgba(74,222,128,.7)',...(todayFc!=null?['rgba(167,139,250,.55)']:[]),'rgba(56,189,248,.5)'];
-    const solBdr=['#fbbf24','#4ade80',...(todayFc!=null?['#a78bfa']:[]),'#38bdf8'];
-    solInst=mkChart('solarChart','bar',solLbls,[
-      {label:'kWh',data:solData,backgroundColor:solBg,borderColor:solBdr,borderWidth:1,borderRadius:4}]);
+    // ── Solar 7-day line chart ──────────────────────────────────────────────
+    if(sol7Inst) sol7Inst.destroy();
+    const s7=cd.solar_7d||{labels:[],actual:[],forecast:[]};
+    sol7Inst=new Chart(document.getElementById('sol7Chart').getContext('2d'),{
+      type:'line',
+      data:{labels:s7.labels,datasets:[
+        {label:'Actual kWh',data:s7.actual,borderColor:'#4ade80',
+         backgroundColor:'rgba(74,222,128,.08)',fill:true,tension:.3,
+         pointRadius:4,pointBackgroundColor:'#4ade80'},
+        {label:'HA Forecast kWh',data:s7.forecast,borderColor:'#a78bfa',
+         backgroundColor:'transparent',fill:false,tension:.3,
+         pointRadius:4,pointBackgroundColor:'#a78bfa',borderDash:[5,3]},
+      ]},
+      options:{responsive:true,maintainAspectRatio:true,
+        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
+        scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
+                y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}}
+    });
+    // ── Solar 12-month line chart ───────────────────────────────────────────
+    if(sol12Inst) sol12Inst.destroy();
+    const s12=cd.solar_12m||{labels:[],actual:[],forecast:[]};
+    sol12Inst=new Chart(document.getElementById('sol12Chart').getContext('2d'),{
+      type:'line',
+      data:{labels:s12.labels,datasets:[
+        {label:'Actual kWh',data:s12.actual,borderColor:'#4ade80',
+         backgroundColor:'rgba(74,222,128,.08)',fill:true,tension:.3,
+         pointRadius:5,pointBackgroundColor:'#4ade80'},
+        {label:'HA Forecast kWh',data:s12.forecast,borderColor:'#a78bfa',
+         backgroundColor:'transparent',fill:false,tension:.3,
+         pointRadius:5,pointBackgroundColor:'#a78bfa',borderDash:[5,3]},
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
+        scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
+                y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}}
+    });
+    // ── Savings bar chart with value labels ─────────────────────────────────
+    const dlPlugin={id:'dl',afterDatasetsDraw(chart){
+      const ctx=chart.ctx; ctx.save();
+      chart.data.datasets.forEach((ds,i)=>{
+        chart.getDatasetMeta(i).data.forEach((bar,j)=>{
+          const v=ds.data[j]; if(v>0.005){
+            ctx.fillStyle='#e2e8f0'; ctx.font='bold 10px sans-serif';
+            ctx.textAlign='center'; ctx.textBaseline='bottom';
+            ctx.fillText('€'+v.toFixed(2), bar.x, bar.y-2);
+          }
+        });
+      }); ctx.restore();
+    }};
     if(savInst) savInst.destroy();
     if(cd.savings_daily&&cd.savings_daily.labels.length>0){
-      savInst=mkChart('savingsChart','bar',cd.savings_daily.labels,[
-        {label:'€ saved',data:cd.savings_daily.values,backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4}
-      ],{},'180px');
+      const el=document.getElementById('savingsChart');
+      if(el){ el.style.maxHeight='180px';
+        savInst=new Chart(el.getContext('2d'),{type:'bar',
+          data:{labels:cd.savings_daily.labels,datasets:[
+            {label:'€ saved',data:cd.savings_daily.values,
+             backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4}
+          ]},
+          options:{responsive:true,maintainAspectRatio:true,
+            plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
+            scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
+                    y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}},
+          plugins:[dlPlugin]
+        });
+      }
     }
   } catch(e){ console.warn('Chart error',e); }
 }
@@ -1905,22 +1961,110 @@ def api_chart_data():
             daily: dict = {}
             interval_h = cfg("decision_interval_minutes", 15) / 60
             prices     = load_tariff().get("prices", DEFAULT_TARIFF["prices"])
+            p_export = prices.get("export", 0.040)
             for dec in history:
                 day    = dec.get("timestamp", "")[:10]
-                tariff = dec.get("tariff", {})
                 sens   = dec.get("sensors", {})
-                if (tariff.get("period") == "peak"
-                        and sens.get("battery_power", 0) < 0
-                        and sens.get("grid_power", 500) <= 500):
-                    kwh = min(abs(sens["battery_power"]) * interval_h / 1000, 2.0)
-                    eur = kwh * (prices.get("peak", 0.30) - prices.get("export", 0.06))
-                    daily[day] = round(daily.get(day, 0) + eur, 3)
+                period = dec.get("tariff", {}).get("period", "mid")
+                grid   = sens.get("grid_power", 0)       # +ve = import, -ve = export
+                bat    = sens.get("battery_power", 0)    # +ve = charging, -ve = discharging
+                p_imp  = prices.get(period, prices.get("mid", 0.1483))
+                kwh_f  = interval_h / 1000
+                # Counterfactual grid without smart battery: remove battery contribution
+                grid_nb  = grid - bat
+                cost_nb  = grid_nb * kwh_f * (p_imp if grid_nb > 0 else p_export)
+                cost_act = grid    * kwh_f * (p_imp if grid    > 0 else p_export)
+                saving   = cost_nb - cost_act
+                if abs(saving) > 0.0001:
+                    daily[day] = round(daily.get(day, 0) + saving, 4)
             for i in range(6, -1, -1):
                 day = (datetime.now() - timedelta(days=i)).date().isoformat()
                 savings_labels.append(day[5:])
                 savings_values.append(round(daily.get(day, 0), 2))
         except Exception:
             pass
+
+    # ── Solar 7-day & 12-month line charts ───────────────────────────────────
+    solar_7d_labels,  solar_7d_actual,  solar_7d_forecast  = [], [], []
+    solar_12m_labels, solar_12m_actual, solar_12m_forecast = [], [], []
+
+    if influx_u:
+        sol_tmrw_id = cfg("sensor_solar_tomorrow", "sensor.energy_production_tomorrow").split(".")[-1]
+        influx_db   = cfg("influxdb_db", "homeassistant").strip()
+        influx_user = cfg("influxdb_user", "").strip()
+        influx_pass = cfg("influxdb_password", "")
+
+        # Daily MAX actual + daily LAST forecast — 395d covers 13 months
+        q_act = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{solar_entity_id}\' '
+                 f'AND time >= now() - 395d GROUP BY time(1d) fill(null)')
+        q_fc  = (f'SELECT LAST("value") FROM /.*/ WHERE "entity_id" = \'{sol_tmrw_id}\' '
+                 f'AND time >= now() - 396d GROUP BY time(1d) fill(null)')
+        r_act, _, _ = _influx_query(influx_u, influx_db, q_act, influx_user, influx_pass)
+        r_fc,  _, _ = _influx_query(influx_u, influx_db, q_fc,  influx_user, influx_pass)
+
+        # Parse into date → value dicts
+        actual_d: dict   = {}
+        forecast_d: dict = {}
+        if r_act:
+            try:
+                s = r_act.json()["results"][0].get("series", [])
+                if s:
+                    ci = {c: i for i, c in enumerate(s[0]["columns"])}
+                    for pt in s[0]["values"]:
+                        if pt[ci["max"]] is not None:
+                            d = datetime.fromtimestamp(pt[ci["time"]] / 1000).date()
+                            actual_d[d] = round(float(pt[ci["max"]]), 1)
+            except Exception:
+                pass
+        if r_fc:
+            try:
+                s = r_fc.json()["results"][0].get("series", [])
+                if s:
+                    ci = {c: i for i, c in enumerate(s[0]["columns"])}
+                    for pt in s[0]["values"]:
+                        if pt[ci["last"]] is not None:
+                            # forecast stored on day D is for day D+1
+                            d = datetime.fromtimestamp(pt[ci["time"]] / 1000).date() + timedelta(days=1)
+                            forecast_d[d] = round(float(pt[ci["last"]]), 1)
+            except Exception:
+                pass
+
+        # Patch live sensor values for today and tomorrow
+        today_d    = now_local.date()
+        tomorrow_d = today_d + timedelta(days=1)
+        actual_d[today_d]      = round(solar_today,    1)
+        forecast_d[tomorrow_d] = round(solar_tomorrow, 1)
+
+        # ── 7-day: 7 past days + tomorrow ────────────────────────────────────
+        for i in range(6, -2, -1):   # i=6 → 6 days ago; i=-1 → tomorrow
+            d   = (now_local - timedelta(days=i)).date()
+            lbl = "Tomorrow" if i == -1 else d.strftime("%m-%d")
+            solar_7d_labels.append(lbl)
+            solar_7d_actual.append(actual_d.get(d) if i >= 0 else None)
+            solar_7d_forecast.append(forecast_d.get(d))
+
+        # ── 12-month: aggregate daily values by calendar month ───────────────
+        m_actual:   dict = {}
+        m_forecast: dict = {}
+        m_cnt_a:    dict = {}
+        m_cnt_f:    dict = {}
+        for delta in range(395):
+            d = today_d - timedelta(days=delta)
+            m = d.strftime("%Y-%m")
+            if d in actual_d:
+                m_actual[m]  = m_actual.get(m, 0.0) + actual_d[d]
+                m_cnt_a[m]   = m_cnt_a.get(m, 0) + 1
+            if d in forecast_d:
+                m_forecast[m] = m_forecast.get(m, 0.0) + forecast_d[d]
+                m_cnt_f[m]    = m_cnt_f.get(m, 0) + 1
+
+        months = sorted(set(m_actual) | set(m_forecast))[-13:]
+        for m in months:
+            dt  = datetime.strptime(m, "%Y-%m")
+            lbl = dt.strftime("%b") if dt.month != 1 else dt.strftime("%b'%y")
+            solar_12m_labels.append(lbl)
+            solar_12m_actual.append(round(m_actual[m], 1) if m_cnt_a.get(m) else None)
+            solar_12m_forecast.append(round(m_forecast[m], 1) if m_cnt_f.get(m) else None)
 
     return jsonify({
         "soc": {
@@ -1935,6 +2079,10 @@ def api_chart_data():
                           "today": round(solar_today, 1),
                           "today_forecast": solar_today_forecast,
                           "tomorrow": round(solar_tomorrow, 1)},
+        "solar_7d":      {"labels": solar_7d_labels,  "actual": solar_7d_actual,
+                          "forecast": solar_7d_forecast},
+        "solar_12m":     {"labels": solar_12m_labels, "actual": solar_12m_actual,
+                          "forecast": solar_12m_forecast},
         "savings_daily": {"labels": savings_labels, "values": savings_values},
     })
 
@@ -2091,7 +2239,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.5.8 — HAOS")
+    log.info("   Energy Optimizer v2.6.0 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

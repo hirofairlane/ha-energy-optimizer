@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "2.5.6"
+version: "2.5.7"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -87,7 +87,7 @@ options:
   # ── Daily summary notifications ────────────────────────────────────────────
   notify_daily_time: "23:00"
   notify_email_service: "correo_gmail_com"
-  notify_email_target: "scamposgarci@gmail.com"
+  notify_email_target: ""
   notify_telegram_service: "telegramsergio"
 
   # ── Notification toggles (can also be set from the GUI Setup panel) ────────

@@ -14,6 +14,7 @@ Changes in v2.4:
   - New /api/weather endpoint using weather.aemet
 """
 
+import math
 import os
 import json
 import logging
@@ -26,6 +27,15 @@ import pandas as pd
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify, request
+
+# ── ML feature version — increment when feature engineering changes ───────────
+MODEL_FEATURE_VER = 2   # v2: continuous solar_proxy from elevation angle
+
+# ── Location (solar elevation formula) ───────────────────────────────────────
+HOME_LAT = 40.67   # Guadarrama, Madrid — °N
+
+# ── Solar correction factor cache ─────────────────────────────────────────────
+_solar_correction_cache: tuple | None = None   # (factor, datetime)
 
 # ── Persistent data paths ────────────────────────────────────────────────────
 DATA_DIR       = Path("/data")
@@ -316,6 +326,82 @@ def get_sun_status() -> dict:
     hour = datetime.now().hour
     return {"is_day": 8 <= hour <= 20, "elevation": None, "source": "fallback"}
 
+# ── Solar geometry & correction ──────────────────────────────────────────────
+def _solar_proxy_for_hour(hour: int, month: int) -> float:
+    """Continuous solar proxy 0–1 from geometric elevation angle.
+    Replaces the old binary (8 ≤ h ≤ 19). Computed for HOME_LAT.
+    0 = sun below horizon; 1 = summer noon peak (~72° elevation)."""
+    doy   = month * 30.4 - 15   # approx day-of-year for mid-month
+    decl  = math.radians(23.45 * math.sin(math.radians(360 / 365 * (doy - 81))))
+    lat_r = math.radians(HOME_LAT)
+    # Solar noon in Madrid ≈ 13:30 local (UTC+1/+2, solar time equation avg)
+    h_ang = math.radians(15 * (hour - 13.5))
+    sin_e = (math.sin(lat_r) * math.sin(decl) +
+             math.cos(lat_r) * math.cos(decl) * math.cos(h_ang))
+    elev  = max(0.0, math.degrees(math.asin(max(-1.0, min(1.0, sin_e)))))
+    return round(min(1.0, elev / 70.0), 3)   # 70° ≈ peak summer noon elevation
+
+
+def _compute_solar_correction_factor() -> float:
+    """Median ratio of actual/forecast daily production from InfluxDB (last 30d).
+    Captures systematic terrain effects (e.g. a hill blocking afternoon sun).
+    Cached for 6h. Returns 1.0 if InfluxDB unavailable or insufficient data."""
+    global _solar_correction_cache
+    now = datetime.now()
+    if (_solar_correction_cache and
+            (now - _solar_correction_cache[1]).total_seconds() < 6 * 3600):
+        return _solar_correction_cache[0]
+
+    factor = 1.0
+    try:
+        influx_u = cfg("influxdb_url", "").strip()
+        if not influx_u:
+            return 1.0
+        sol_id  = cfg("sensor_solar_today",    "sensor.energy_production_today").split(".")[-1]
+        fc_id   = cfg("sensor_solar_tomorrow", "sensor.energy_production_tomorrow").split(".")[-1]
+        db      = cfg("influxdb_db", "homeassistant").strip()
+        usr     = cfg("influxdb_user",     "").strip()
+        pwd     = cfg("influxdb_password", "")
+
+        q_act = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{sol_id}\' '
+                 f'AND time >= now() - 32d GROUP BY time(1d) fill(null)')
+        q_fc  = (f'SELECT LAST("value") FROM /.*/ WHERE "entity_id" = \'{fc_id}\' '
+                 f'AND time >= now() - 33d GROUP BY time(1d) fill(null)')
+        r_act, _, _ = _influx_query(influx_u, db, q_act, usr, pwd)
+        r_fc,  _, _ = _influx_query(influx_u, db, q_fc,  usr, pwd)
+
+        actual_d, forecast_d = {}, {}
+        if r_act:
+            s = r_act.json()["results"][0].get("series", [])
+            if s:
+                ci = {c: i for i, c in enumerate(s[0]["columns"])}
+                for pt in s[0]["values"]:
+                    if pt[ci["max"]] and float(pt[ci["max"]]) > 1.0:
+                        d = datetime.fromtimestamp(pt[ci["time"]] / 1000).date()
+                        actual_d[d] = float(pt[ci["max"]])
+        if r_fc:
+            s = r_fc.json()["results"][0].get("series", [])
+            if s:
+                ci = {c: i for i, c in enumerate(s[0]["columns"])}
+                for pt in s[0]["values"]:
+                    if pt[ci["last"]] and float(pt[ci["last"]]) > 1.0:
+                        d = datetime.fromtimestamp(pt[ci["time"]] / 1000).date() + timedelta(days=1)
+                        forecast_d[d] = float(pt[ci["last"]])
+
+        ratios = [actual_d[d] / forecast_d[d] for d in actual_d
+                  if d in forecast_d and forecast_d[d] > 1.0]
+        if len(ratios) >= 7:
+            ratios.sort()
+            median = ratios[len(ratios) // 2]
+            factor = max(0.3, min(1.5, round(median, 3)))
+            log.info(f"Solar correction factor: {factor:.3f} (n={len(ratios)} days)")
+    except Exception as e:
+        log.debug(f"Solar correction factor error: {e}")
+
+    _solar_correction_cache = (factor, now)
+    return factor
+
+
 # ── Sensor reading ───────────────────────────────────────────────────────────
 def read_sensors() -> dict:
     return {
@@ -392,7 +478,10 @@ def calculate_optimal_soc(sensors: dict) -> dict:
     battery_kwh  = float(cfg("battery_capacity_kwh", 10.0))
     soc_coverage = (needed_kwh / battery_kwh) * 100
 
-    solar_tm = sensors.get("solar_tomorrow", 0)
+    solar_tm_raw = sensors.get("solar_tomorrow", 0)
+    correction   = _compute_solar_correction_factor()
+    solar_tm     = round(solar_tm_raw * correction, 2)   # terrain-corrected forecast
+
     if solar_tm < 2:
         solar_adj = +25
     elif solar_tm < 5:
@@ -407,12 +496,14 @@ def calculate_optimal_soc(sensors: dict) -> dict:
     target = max(30, min(95, round(soc_coverage + solar_adj + 10)))
 
     return {
-        "target_soc":     target,
-        "needed_kwh":     round(needed_kwh, 2),
-        "avg_night_kw":   avg_kw,
-        "solar_tomorrow": solar_tm,
-        "hours_covered":  hours_until_solar,
-        "solar_adj":      solar_adj,
+        "target_soc":        target,
+        "needed_kwh":        round(needed_kwh, 2),
+        "avg_night_kw":      avg_kw,
+        "solar_tomorrow":    solar_tm,
+        "solar_tomorrow_raw": solar_tm_raw,
+        "solar_correction":  correction,
+        "hours_covered":     hours_until_solar,
+        "solar_adj":         solar_adj,
     }
 
 # ── Storm detection (AEMET OpenData) ─────────────────────────────────────────
@@ -449,7 +540,7 @@ def _history_to_df(rows: list):
     df["lag1"]        = df["value"].shift(1)
     df["lag4"]        = df["value"].shift(4)
     df["roll4"]       = df["value"].rolling(4).mean()
-    df["solar_proxy"] = df.index.hour.map(lambda h: 1 if 8 <= h <= 19 else 0)
+    df["solar_proxy"] = df.index.map(lambda ts: _solar_proxy_for_hour(ts.hour, ts.month))
     return df.dropna()
 
 FEATURES = ["hour", "weekday", "month", "lag1", "lag4", "roll4", "solar_proxy"]
@@ -496,7 +587,8 @@ def train_model() -> bool:
     pipe.fit(X, y)
     joblib.dump({"pipeline": pipe, "features": FEATURES,
                  "trained_at": datetime.now().isoformat(),
-                 "r2_cv_mean": float(np.mean(scores)), "n_samples": len(df)}, MODEL_FILE)
+                 "r2_cv_mean": float(np.mean(scores)), "n_samples": len(df),
+                 "feature_version": MODEL_FEATURE_VER}, MODEL_FILE)
     log.info(f"Model trained: {len(df)} samples, R²={np.mean(scores):.3f}")
     return True
 
@@ -504,10 +596,13 @@ def predict_soc(sensors: dict) -> dict:
     if MODEL_FILE.exists():
         try:
             art = joblib.load(MODEL_FILE)
-            now = datetime.now()
-            # Use actual sun.sun elevation for solar proxy (correct for Guadarrama lat 40.67°N)
-            sun_data   = get_sun_status()
-            solar_live = 1 if sun_data.get("is_day") else 0
+            # Auto-retrain if feature version changed (keeps model consistent with code)
+            if art.get("feature_version", 1) != MODEL_FEATURE_VER:
+                log.info("Feature version mismatch — triggering background retrain")
+                threading.Thread(target=train_model, daemon=True).start()
+                raise ValueError("stale model — retrain triggered")
+            now        = datetime.now()
+            solar_live = _solar_proxy_for_hour(now.hour, now.month)
             X   = pd.DataFrame([{
                 "hour":        now.hour,
                 "weekday":     now.weekday(),
@@ -1075,7 +1170,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.0</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.1</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1524,7 +1619,8 @@ async function load(){
         <div class="label">Solar today (kWh)</div>
         <div class="sub">Next hr: ${(ss.solar_next_hour??0).toFixed(2)} kWh</div></div>
       <div class="card"><div class="metric">${(ss.solar_tomorrow??0).toFixed(1)}</div>
-        <div class="label">Solar tomorrow (kWh)</div></div>
+        <div class="label">Solar tomorrow (kWh)</div>
+        <div class="sub" id="sol-correction"></div></div>
       <div class="card"><div class="metric ${PC[t.period]}">${(t.price_kwh??0).toFixed(2)}€</div>
         <div class="label">Price/kWh &nbsp;<span class="badge ${PC[t.period]}">${t.period}</span></div>
         <div class="sub">${t.weekend?'Weekend — valley all day':''}</div></div>
@@ -1542,8 +1638,13 @@ async function load(){
     document.getElementById('batt-soc-big').textContent=Number(ss.battery_soc??0).toFixed(0)+'%';
     document.getElementById('batt-dir').textContent=bdir+'  '+Math.abs(bpow).toFixed(0)+' W';
     document.getElementById('storm-badge').style.display=storm?'inline-block':'none';
-    if(opt) document.getElementById('batt-target-line').innerHTML=
-      'Smart target: <span>'+opt.target_soc+'%</span> — '+opt.needed_kwh+' kWh overnight, '+opt.solar_tomorrow+' kWh solar tomorrow';
+    if(opt){
+      document.getElementById('batt-target-line').innerHTML=
+        'Smart target: <span>'+opt.target_soc+'%</span> — '+opt.needed_kwh+' kWh overnight, '+opt.solar_tomorrow+' kWh solar tomorrow';
+      const sc=opt.solar_correction??1;
+      const scEl=document.getElementById('sol-correction');
+      if(scEl) scEl.textContent=sc!==1?`Terrain factor: ${(sc*100).toFixed(0)}%`:'';
+    }
 
     document.getElementById('savings-box').innerHTML=`
       <div class="savings">
@@ -1884,7 +1985,6 @@ def api_chart_data():
             soc_f = sensors["battery_soc"]
             for h in range(1, 9):
                 ft    = now + timedelta(hours=h)
-                is_day_f = 7 <= ft.hour <= 20   # simple heuristic for future hours
                 X = pd.DataFrame([{
                     "hour":        ft.hour,
                     "weekday":     ft.weekday(),
@@ -1892,7 +1992,7 @@ def api_chart_data():
                     "lag1":        soc_f,
                     "lag4":        soc_f,
                     "roll4":       soc_f,
-                    "solar_proxy": 1 if is_day_f else 0,
+                    "solar_proxy": _solar_proxy_for_hour(ft.hour, ft.month),
                 }])
                 pred  = float(art["pipeline"].predict(X[FEATURES])[0])
                 soc_f = round(max(0.0, min(100.0, pred)), 1)
@@ -2239,7 +2339,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.6.0 — HAOS")
+    log.info("   Energy Optimizer v2.6.1 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

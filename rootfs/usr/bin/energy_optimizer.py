@@ -445,20 +445,29 @@ _consumption_cache: dict = {"kw": 0.5, "updated": None}
 
 def _refresh_consumption_cache():
     global _consumption_cache
-    entity      = cfg("sensor_grid_power", "sensor.acometida_general_power")
-    rows        = ha_history(entity, days=14)
+    entity = cfg("sensor_grid_power", "sensor.acometida_general_power")
+
+    # Prefer InfluxDB (years of data); fall back to HA recorder
+    rows = []
+    influx_u = cfg("influxdb_url", "").strip()
+    if influx_u:
+        rows, _ = ha_history_influx(entity, days=14)
+    if not rows:
+        rows = ha_history(entity, days=14)
+
     night_watts = []
     for row in rows:
         try:
             ts  = datetime.fromisoformat(row["last_changed"].replace("Z", "+00:00"))
+            ts_local = ts.astimezone().replace(tzinfo=None)
             val = float(row["state"])
-            if ts.hour >= 22 or ts.hour < 8:
+            if ts_local.hour >= 22 or ts_local.hour < 8:
                 night_watts.append(abs(val))
         except (KeyError, ValueError, TypeError):
             continue
     kw = (sum(night_watts) / len(night_watts) / 1000) if len(night_watts) >= 20 else 0.5
     _consumption_cache = {"kw": round(kw, 3), "updated": datetime.now()}
-    log.info(f"  Consumption cache refreshed: {kw:.3f} kW avg night")
+    log.info(f"  Consumption cache refreshed: {kw:.3f} kW avg night ({len(night_watts)} night samples)")
 
 def _get_avg_night_consumption_kw() -> float:
     now = datetime.now()
@@ -1170,7 +1179,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.1</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.2</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -2339,7 +2348,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.6.1 — HAOS")
+    log.info("   Energy Optimizer v2.6.2 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

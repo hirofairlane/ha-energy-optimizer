@@ -477,42 +477,66 @@ def _get_avg_night_consumption_kw() -> float:
     return _consumption_cache["kw"]
 
 def calculate_optimal_soc(sensors: dict) -> dict:
-    """Estimate valley charge target balancing overnight consumption and solar forecast."""
-    now  = datetime.now()
-    hour = now.hour
-    hours_until_solar = (8 - hour) if hour < 8 else (24 - hour + 8)
+    """Target SOC for valley charging — store cheap electricity to cover tomorrow's peak demand.
 
-    avg_kw       = _get_avg_night_consumption_kw()
-    needed_kwh   = avg_kw * hours_until_solar
+    Night is valley tariff (0.1147 €/kWh): importing from grid at night is fine.
+    What matters is having enough battery to avoid grid import during PEAK hours
+    (10-14h + 18-22h at 0.2234 €/kWh).
+
+    Formula:
+        battery_needed = peak_consumption_kwh - solar_during_peak_kwh
+        peak_consumption = base_load × 8 peak_hours + temperature_adjustment
+        solar_during_peak ≈ solar_tomorrow × 0.45  (10-15h window, main overlap with peak)
+    """
     battery_kwh  = float(cfg("battery_capacity_kwh", 10.0))
-    soc_coverage = (needed_kwh / battery_kwh) * 100
 
-    solar_tm_raw = sensors.get("solar_tomorrow", 0)
+    # ── Solar (terrain-corrected) ────────────────────────────────────────────
     correction   = _compute_solar_correction_factor()
-    solar_tm     = round(solar_tm_raw * correction, 2)   # terrain-corrected forecast
+    solar_tm_raw = sensors.get("solar_tomorrow", 0)
+    solar_tm     = round(solar_tm_raw * correction, 2)
+    # ~45% of daily solar falls in the 10-15h window that overlaps with morning peak
+    # Evening peak (18-22h) gets near-zero solar in Spain
+    solar_during_peak = round(solar_tm * 0.45, 2)
 
-    if solar_tm < 2:
-        solar_adj = +25
-    elif solar_tm < 5:
-        solar_adj = +10
-    elif solar_tm > 15:
-        solar_adj = -15
-    elif solar_tm > 10:
-        solar_adj = -5
+    # ── Base consumption (kW) — night avg is the best proxy for base household load ──
+    base_kw = _get_avg_night_consumption_kw()    # W already converted to kW
+    peak_base_kwh = round(base_kw * 8, 2)        # 8 peak hours per day
+
+    # ── Temperature correction for heat pump / cooling load ──────────────────
+    temp = sensors.get("temp_outdoor", 15.0)
+    if temp < 5:
+        temp_adj_kwh = 3.0   # heat pump near full power all peak hours
+    elif temp < 10:
+        temp_adj_kwh = 2.0
+    elif temp < 15:
+        temp_adj_kwh = 1.0
+    elif temp > 30:
+        temp_adj_kwh = 1.5   # cooling in summer
+    elif temp > 25:
+        temp_adj_kwh = 0.5
     else:
-        solar_adj = 0
+        temp_adj_kwh = 0.0
 
-    target = max(30, min(95, round(soc_coverage + solar_adj + 10)))
+    peak_total_kwh = peak_base_kwh + temp_adj_kwh
+
+    # ── Battery gap (what solar doesn't cover during peak) ───────────────────
+    battery_needed = max(0.0, peak_total_kwh - solar_during_peak)
+    soc_needed = (battery_needed / battery_kwh) * 100
+
+    # +5% safety buffer, clamp 30–95%
+    target = max(30, min(95, round(soc_needed + 5)))
 
     return {
-        "target_soc":        target,
-        "needed_kwh":        round(needed_kwh, 2),
-        "avg_night_kw":      avg_kw,
-        "solar_tomorrow":    solar_tm,
+        "target_soc":         target,
+        "needed_kwh":         round(battery_needed, 2),
+        "peak_total_kwh":     round(peak_total_kwh, 2),
+        "solar_during_peak":  solar_during_peak,
+        "solar_tomorrow":     solar_tm,
         "solar_tomorrow_raw": solar_tm_raw,
-        "solar_correction":  correction,
-        "hours_covered":     hours_until_solar,
-        "solar_adj":         solar_adj,
+        "solar_correction":   correction,
+        "base_kw":            base_kw,
+        "temp_outdoor":       round(temp, 1),
+        "temp_adj_kwh":       temp_adj_kwh,
     }
 
 # ── Storm detection (AEMET OpenData) ─────────────────────────────────────────
@@ -704,8 +728,9 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
             return {
                 "action": "charge", "target_soc": target, "power_w": power,
                 "reason": (f"Valley — smart target {target}% "
-                           f"(~{optimal['needed_kwh']:.1f} kWh overnight, "
-                           f"{optimal['solar_tomorrow']:.1f} kWh solar tomorrow)"),
+                           f"(peak gap {optimal['needed_kwh']:.1f} kWh · "
+                           f"solar peak {optimal['solar_during_peak']:.1f} kWh · "
+                           f"temp adj {optimal['temp_adj_kwh']:+.1f} kWh)"),
                 "optimal": optimal,
             }
         return {"action": "self_consumption",
@@ -1179,7 +1204,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.2</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.3</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1648,8 +1673,12 @@ async function load(){
     document.getElementById('batt-dir').textContent=bdir+'  '+Math.abs(bpow).toFixed(0)+' W';
     document.getElementById('storm-badge').style.display=storm?'inline-block':'none';
     if(opt){
+      const tempStr=opt.temp_adj_kwh>0?` · temp +${opt.temp_adj_kwh}kWh (${opt.temp_outdoor}°C)`:'';
+      const scStr=opt.solar_correction&&opt.solar_correction!==1?` · terrain ${(opt.solar_correction*100).toFixed(0)}%`:'';
       document.getElementById('batt-target-line').innerHTML=
-        'Smart target: <span>'+opt.target_soc+'%</span> — '+opt.needed_kwh+' kWh overnight, '+opt.solar_tomorrow+' kWh solar tomorrow';
+        `Smart target: <span>${opt.target_soc}%</span>`
+        +` — peak demand ${opt.peak_total_kwh}kWh · solar peak ${opt.solar_during_peak}kWh`
+        +` · battery gap <b>${opt.needed_kwh}kWh</b>${tempStr}${scStr}`;
       const sc=opt.solar_correction??1;
       const scEl=document.getElementById('sol-correction');
       if(scEl) scEl.textContent=sc!==1?`Terrain factor: ${(sc*100).toFixed(0)}%`:'';
@@ -2348,7 +2377,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.6.2 — HAOS")
+    log.info("   Energy Optimizer v2.6.3 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

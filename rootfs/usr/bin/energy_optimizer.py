@@ -1075,7 +1075,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.7</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.5.8</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1125,7 +1125,7 @@ th{color:var(--m);font-weight:500}
 <div id="tab-charts" class="tab-content">
   <div class="grid2">
     <div class="card">
-      <h2 style="margin-top:0">Battery SOC — actual vs predicted (24h)</h2>
+      <h2 style="margin-top:0">Battery SOC — actual vs predicted (24h) <span id="soc-mae" style="font-size:.75rem;color:var(--m);font-weight:400"></span></h2>
       <canvas id="socChart"></canvas>
     </div>
     <div class="card">
@@ -1430,11 +1430,16 @@ async function loadCharts(){
         }
       }
     });
+    const maeEl=document.getElementById('soc-mae');
+    if(maeEl) maeEl.textContent=cd.soc.mae!=null?`— MAE ${cd.soc.mae}%`:'';
     if(solInst) solInst.destroy();
-    solInst=mkChart('solarChart','bar',['Yesterday','Today','Tomorrow'],[
-      {label:'kWh',data:[cd.solar.yesterday,cd.solar.today,cd.solar.tomorrow],
-       backgroundColor:['rgba(251,191,36,.5)','rgba(74,222,128,.7)','rgba(56,189,248,.5)'],
-       borderColor:['#fbbf24','#4ade80','#38bdf8'],borderWidth:1,borderRadius:4}]);
+    const todayFc=cd.solar.today_forecast??null;
+    const solLbls=['Yesterday','Today',...(todayFc!=null?['Today (forecast)']:[]),'Tomorrow'];
+    const solData=[cd.solar.yesterday,cd.solar.today,...(todayFc!=null?[todayFc]:[]),cd.solar.tomorrow];
+    const solBg=['rgba(251,191,36,.55)','rgba(74,222,128,.7)',...(todayFc!=null?['rgba(167,139,250,.55)']:[]),'rgba(56,189,248,.5)'];
+    const solBdr=['#fbbf24','#4ade80',...(todayFc!=null?['#a78bfa']:[]),'#38bdf8'];
+    solInst=mkChart('solarChart','bar',solLbls,[
+      {label:'kWh',data:solData,backgroundColor:solBg,borderColor:solBdr,borderWidth:1,borderRadius:4}]);
     if(savInst) savInst.destroy();
     if(cd.savings_daily&&cd.savings_daily.labels.length>0){
       savInst=mkChart('savingsChart','bar',cd.savings_daily.labels,[
@@ -1745,38 +1750,73 @@ def api_chart_data():
     soc_entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
     influx_u   = cfg("influxdb_url", "").strip()
 
-    # ── SOC actual (past 24h) — prefer InfluxDB, fallback HA recorder ─────────
+    # ── SOC — 15-min bucket grid, align actual + predicted ────────────────────
     if influx_u:
         rows, _ = ha_history_influx(soc_entity, days=1)
     if not influx_u or not rows:
         rows = ha_history(soc_entity, days=1)
 
-    soc_labels, soc_actual = [], []
+    # Parse actual points with local naive timestamps
+    actual_pts = []  # list of (local_naive_dt, float)
     for r in rows:
         try:
-            ts  = datetime.fromisoformat(r["last_changed"].replace("Z", "+00:00"))
-            val = float(r["state"])
-            soc_labels.append(ts.strftime("%H:%M"))
-            soc_actual.append(round(val, 1))
+            ts_raw   = datetime.fromisoformat(r["last_changed"].replace("Z", "+00:00"))
+            ts_local = ts_raw.astimezone().replace(tzinfo=None)
+            val      = float(r["state"])
+            actual_pts.append((ts_local, val))
         except (KeyError, ValueError, TypeError):
             continue
 
-    # ── SOC predicted (past) — from decisions.json ────────────────────────────
-    soc_predicted = [None] * len(soc_labels)
+    # Build 15-min bucket grid for past 24h
+    now_local  = datetime.now()
+    last_min   = (now_local.minute // 15) * 15
+    period_end = now_local.replace(minute=last_min, second=0, microsecond=0)
+    buckets    = [period_end - timedelta(minutes=15 * i) for i in range(95, -1, -1)]
+    soc_labels = [b.strftime("%H:%M") for b in buckets]
+    HALF       = 450  # ±7.5 min in seconds
+
+    # Actual SOC: nearest raw point per bucket
+    soc_actual = []
+    for b in buckets:
+        if actual_pts:
+            diffs = [(abs((pt[0] - b).total_seconds()), pt[1]) for pt in actual_pts]
+            gap, val = min(diffs)
+            soc_actual.append(round(val, 1) if gap <= HALF else None)
+        else:
+            soc_actual.append(None)
+
+    # Predicted SOC: nearest decision per bucket
+    decision_pts = []  # list of (local_naive_dt, float)
+    cutoff = period_end - timedelta(hours=24)
     if DECISIONS_FILE.exists():
         try:
-            cutoff  = (datetime.now() - timedelta(days=1)).isoformat()
             history = json.loads(DECISIONS_FILE.read_text())
-            pred_by_time = {}
             for dec in history:
-                if dec.get("timestamp", "") >= cutoff:
-                    ts_str = datetime.fromisoformat(dec["timestamp"]).strftime("%H:%M")
-                    pred   = dec.get("prediction", {}).get("predicted_soc")
-                    if pred is not None:
-                        pred_by_time[ts_str] = pred
-            soc_predicted = [pred_by_time.get(lbl) for lbl in soc_labels]
+                ts_str = dec.get("timestamp", "")
+                pred   = dec.get("prediction", {}).get("predicted_soc")
+                if pred is not None and ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        if ts >= cutoff:
+                            decision_pts.append((ts, pred))
+                    except ValueError:
+                        pass
         except Exception:
             pass
+
+    soc_predicted = []
+    for b in buckets:
+        if decision_pts:
+            diffs = [(abs((pt[0] - b).total_seconds()), pt[1]) for pt in decision_pts]
+            gap, val = min(diffs)
+            soc_predicted.append(val if gap <= HALF else None)
+        else:
+            soc_predicted.append(None)
+
+    # MAE between predicted and actual (where both available)
+    errors  = [abs(a - p) for a, p in zip(soc_actual, soc_predicted)
+               if a is not None and p is not None]
+    soc_mae = round(sum(errors) / len(errors), 1) if errors else None
 
     # ── SOC forecast (future 8h) — chained ML predictions ────────────────────
     future_labels, future_predicted = [], []
@@ -1812,7 +1852,6 @@ def api_chart_data():
     solar_entity_id = cfg("sensor_solar_today", "sensor.energy_production_today").split(".")[-1]
 
     if influx_u:
-        now_local   = datetime.now()
         yest_date   = (now_local - timedelta(days=1)).date()
         yest_start  = datetime(yest_date.year, yest_date.month, yest_date.day,
                                tzinfo=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1841,6 +1880,20 @@ def api_chart_data():
                          for d in history if d["timestamp"][:10] == yesterday]
             if prev_vals:
                 solar_yesterday = max(prev_vals)
+        except Exception:
+            pass
+
+    # ── Solar forecast accuracy — yesterday's forecast for today ──────────────
+    solar_today_forecast = None
+    if DECISIONS_FILE.exists():
+        try:
+            history  = json.loads(DECISIONS_FILE.read_text())
+            yest_str = (now_local - timedelta(days=1)).date().isoformat()
+            yest_dec = [d for d in history if d.get("timestamp", "")[:10] == yest_str]
+            if yest_dec:
+                v = yest_dec[-1].get("sensors", {}).get("solar_tomorrow")
+                if v is not None:
+                    solar_today_forecast = round(float(v), 1)
         except Exception:
             pass
 
@@ -1876,9 +1929,12 @@ def api_chart_data():
             "predicted":        soc_predicted,
             "future_labels":    future_labels,
             "future_predicted": future_predicted,
+            "mae":              soc_mae,
         },
         "solar":         {"yesterday": round(solar_yesterday, 1),
-                          "today": round(solar_today, 1), "tomorrow": round(solar_tomorrow, 1)},
+                          "today": round(solar_today, 1),
+                          "today_forecast": solar_today_forecast,
+                          "tomorrow": round(solar_tomorrow, 1)},
         "savings_daily": {"labels": savings_labels, "values": savings_values},
     })
 
@@ -2035,7 +2091,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.5.7 — HAOS")
+    log.info("   Energy Optimizer v2.5.8 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

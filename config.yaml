@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "2.6.3"
+version: "2.6.4"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -41,6 +41,7 @@ options:
   sensor_battery_soc: "sensor.battery_state_of_capacity"
   sensor_battery_power: "sensor.battery_charge_discharge_power"
   sensor_grid_power: "sensor.acometida_general_power"
+  sensor_solar_power: "sensor.produccion_placas_power"
 
   # ── Solar forecast sensors ─────────────────────────────────────────────────
   sensor_solar_current_hour: "sensor.energy_current_hour"
@@ -110,6 +111,7 @@ schema:
   sensor_battery_soc: str
   sensor_battery_power: str
   sensor_grid_power: str
+  sensor_solar_power: str
   sensor_solar_current_hour: str
   sensor_solar_next_hour: str
   sensor_solar_today: str

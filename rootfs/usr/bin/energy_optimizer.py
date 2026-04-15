@@ -408,6 +408,7 @@ def read_sensors() -> dict:
         "battery_soc":        ha_float(cfg("sensor_battery_soc",       "sensor.battery_state_of_capacity")),
         "battery_power":      ha_float(cfg("sensor_battery_power",      "sensor.battery_charge_discharge_power")),
         "grid_power":         ha_float(cfg("sensor_grid_power",         "sensor.acometida_general_power")),
+        "solar_power":        ha_float(cfg("sensor_solar_power",        "sensor.produccion_placas_power")),
         "solar_current_hour": ha_float(cfg("sensor_solar_current_hour", "sensor.energy_current_hour")),
         "solar_next_hour":    ha_float(cfg("sensor_solar_next_hour",    "sensor.energy_next_hour")),
         "solar_today":        ha_float(cfg("sensor_solar_today",        "sensor.energy_production_today")),
@@ -790,12 +791,16 @@ def decide_pool(sensors: dict, tariff: dict) -> dict:
     if not summer and hrs_wk >= 1.0:
         return {"action": False, "reason": f"Weekly hours met ({hrs_wk:.1f}h ≥ 1h/week)"}
 
-    solar_now = sensors["solar_current_hour"]
-    soc       = sensors["battery_soc"]
-    period    = tariff["period"]
+    solar_now  = sensors["solar_current_hour"]
+    solar_live = sensors.get("solar_power", 0)   # actual panel watts (0 if sensor not set)
+    soc        = sensors["battery_soc"]
+    period     = tariff["period"]
 
-    if solar_now > 1.2 and soc > 50:
-        return {"action": True, "reason": f"Solar surplus ({solar_now:.2f} kWh/h), SOC={soc:.0f}%"}
+    # Prefer real-time solar_power (W) for surplus check; fallback to hourly forecast (kWh/h)
+    solar_surplus = (solar_live > 1200) or (solar_now > 1.2)
+    if solar_surplus and soc > 50:
+        src = f"{solar_live:.0f}W" if solar_live > 0 else f"{solar_now:.2f} kWh/h"
+        return {"action": True, "reason": f"Solar surplus ({src}), SOC={soc:.0f}%"}
     if period == "valley":
         return {"action": True, "reason": f"Valley tariff ({prices['valley']}€/kWh), hours pending"}
     if summer and hrs_day < 0.1 and datetime.now().hour >= 20:
@@ -819,20 +824,23 @@ def _start_pool_with_cleaner(pool_sw: str, cleaner_sw: str):
 
 # ── Dishwasher logic ─────────────────────────────────────────────────────────
 def decide_dishwasher(sensors: dict, tariff: dict) -> dict:
-    state  = sensors.get("dishwasher_state", "")
-    period = tariff["period"]
-    solar  = sensors["solar_current_hour"]
-    soc    = sensors["battery_soc"]
-    prices = tariff["prices"]
+    state      = sensors.get("dishwasher_state", "")
+    period     = tariff["period"]
+    solar      = sensors["solar_current_hour"]
+    solar_live = sensors.get("solar_power", 0)   # actual panel watts
+    soc        = sensors["battery_soc"]
+    prices     = tariff["prices"]
 
     if state.lower() == "running":
         return {"action": None, "reason": "Already running", "state": state}
     if state.lower() != "ready":
         return {"action": None, "reason": f"Not ready (state: {state or 'unknown'})", "state": state}
 
-    if solar > 1.5 and soc > 60:
+    solar_surplus = (solar_live > 1500) or (solar > 1.5)
+    if solar_surplus and soc > 60:
+        src = f"{solar_live:.0f}W" if solar_live > 0 else f"{solar:.2f} kWh/h"
         return {"action": True,
-                "reason": f"Solar surplus ({solar:.2f} kWh/h) + good SOC ({soc:.0f}%)",
+                "reason": f"Solar surplus ({src}) + good SOC ({soc:.0f}%)",
                 "state": state}
     if period == "valley":
         return {"action": True, "reason": f"Valley tariff ({prices['valley']}€/kWh)", "state": state}
@@ -852,7 +860,9 @@ def _load_savings() -> dict:
             "decisions_count": 0, "since": datetime.now().date().isoformat()}
 
 def _update_savings(sensors: dict, tariff: dict):
-    if tariff["period"] != "peak" or sensors["battery_power"] >= 0 or sensors["grid_power"] > 500:
+    # grid_power: -ve = buying/importing, +ve = selling/exporting
+    # Only count savings when: peak tariff, battery is discharging (<0), and we're actually importing (grid < -500 W)
+    if tariff["period"] != "peak" or sensors["battery_power"] >= 0 or sensors["grid_power"] > -500:
         return
     savings    = _load_savings()
     prices     = tariff["prices"]
@@ -1204,7 +1214,7 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.3</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.4</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
@@ -1651,7 +1661,7 @@ async function load(){
     document.getElementById('kpis').innerHTML=`
       <div class="card"><div class="metric">${(ss.solar_today??0).toFixed(1)}</div>
         <div class="label">Solar today (kWh)</div>
-        <div class="sub">Next hr: ${(ss.solar_next_hour??0).toFixed(2)} kWh</div></div>
+        <div class="sub">Now: ${ss.solar_power>0?(ss.solar_power/1000).toFixed(2)+' kW':'—'} · Next hr: ${(ss.solar_next_hour??0).toFixed(2)} kWh</div></div>
       <div class="card"><div class="metric">${(ss.solar_tomorrow??0).toFixed(1)}</div>
         <div class="label">Solar tomorrow (kWh)</div>
         <div class="sub" id="sol-correction"></div></div>
@@ -2104,14 +2114,16 @@ def api_chart_data():
                 day    = dec.get("timestamp", "")[:10]
                 sens   = dec.get("sensors", {})
                 period = dec.get("tariff", {}).get("period", "mid")
-                grid   = sens.get("grid_power", 0)       # +ve = import, -ve = export
+                grid   = sens.get("grid_power", 0)       # -ve = buying (import), +ve = selling (export)
                 bat    = sens.get("battery_power", 0)    # +ve = charging, -ve = discharging
                 p_imp  = prices.get(period, prices.get("mid", 0.1483))
                 kwh_f  = interval_h / 1000
-                # Counterfactual grid without smart battery: remove battery contribution
-                grid_nb  = grid - bat
-                cost_nb  = grid_nb * kwh_f * (p_imp if grid_nb > 0 else p_export)
-                cost_act = grid    * kwh_f * (p_imp if grid    > 0 else p_export)
+                # Counterfactual: without smart battery, battery_power would be 0, so grid_nb = grid + bat
+                # (if battery was discharging -2000W, without it we'd import 2000W more → grid shifts more negative)
+                grid_nb  = grid + bat
+                # Cost function: negative grid = paying p_imp; positive grid = receiving p_export (income, negative cost)
+                cost_nb  = (-grid_nb * kwh_f * p_imp) if grid_nb < 0 else (-grid_nb * kwh_f * p_export)
+                cost_act = (-grid    * kwh_f * p_imp) if grid    < 0 else (-grid    * kwh_f * p_export)
                 saving   = cost_nb - cost_act
                 if abs(saving) > 0.0001:
                     daily[day] = round(daily.get(day, 0) + saving, 4)
@@ -2377,7 +2389,7 @@ def main():
     _load_setup_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.6.3 — HAOS")
+    log.info("   Energy Optimizer v2.6.4 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

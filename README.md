@@ -162,19 +162,21 @@ The system calculates savings by comparing **what actually happened** against th
 For every 15-minute decision cycle:
 
 ```
-# Sensor convention:
-#   grid_power    > 0 → importing from grid
-#   grid_power    < 0 → exporting to grid
+# Sensor convention (sensor.acometida_general_power):
+#   grid_power    < 0 → buying from grid (import)
+#   grid_power    > 0 → selling to grid  (export)
 #   battery_power > 0 → battery charging
 #   battery_power < 0 → battery discharging
 
-grid_without_battery = grid_power − battery_power
+# Energy balance at the meter: P_grid = P_solar − P_house − P_bat
+# Without smart battery (P_bat = 0): P_grid_nb = P_solar − P_house = P_grid + P_bat
+grid_without_battery = grid_power + battery_power
 
 def energy_cost(g, import_price, export_price):
-    if g > 0:
-        return g × (interval_hours / 1000) × import_price    # paying for import
+    if g < 0:
+        return −g × (interval_hours / 1000) × import_price   # paying for import (positive cost)
     else:
-        return g × (interval_hours / 1000) × export_price    # receiving for export
+        return −g × (interval_hours / 1000) × export_price   # income from export (negative cost)
 
 saving_interval = energy_cost(grid_without_battery) − energy_cost(grid_power)
 ```
@@ -355,7 +357,8 @@ The **Setup** tab has a **Test connections** button that runs a live diagnostic:
 |---|---|---|
 | `sensor_battery_soc` | Battery state of charge (%) | `sensor.battery_state_of_capacity` |
 | `sensor_battery_power` | Charge/discharge power (W, +ve=charge) | `sensor.battery_charge_discharge_power` |
-| `sensor_grid_power` | Grid meter (W, +ve=import) | `sensor.acometida_general_power` |
+| `sensor_grid_power` | Grid meter (W, **−ve=import, +ve=export**) | `sensor.acometida_general_power` |
+| `sensor_solar_power` | Panel output right now (W, live) | `sensor.produccion_placas_power` |
 | `sensor_solar_current_hour` | Solar production this hour (kWh) | `sensor.energy_current_hour` |
 | `sensor_solar_next_hour` | Solar forecast next hour (kWh) | `sensor.energy_next_hour` |
 | `sensor_solar_today` | Cumulative production today (kWh) | `sensor.energy_production_today` |
@@ -438,6 +441,11 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 ---
 
 ## Changelog
+
+### v2.6.4
+- **Grid power sign convention fixed:** `sensor.acometida_general_power` is negative = buying, positive = selling. Previous code had this backwards, producing incorrect savings figures.
+- **Savings formula corrected:** `grid_without_battery = grid + battery_power` (derived from energy balance P_grid = P_solar − P_house − P_bat). Cost function now properly handles negative import and positive export.
+- **New sensor `sensor_solar_power`:** reads `sensor.produccion_placas_power` (actual panel watts in real time). Pool pump and dishwasher surplus checks now prefer live watts (>1.2 kW / >1.5 kW) over the hourly kWh forecast. Dashboard KPI shows live kW alongside forecast.
 
 ### v2.6.3
 - **Battery logic reoriented:** target SOC now based on covering tomorrow's PEAK demand (10-14h + 18-22h), not overnight consumption. Night is valley — cheap grid import is fine.

@@ -2257,10 +2257,19 @@ th{color:var(--m);font-weight:500}
             </select>
           </div>
         </div>
-        <div style="background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3);border-radius:.5rem;padding:.6rem .8rem;font-size:.72rem;color:var(--y)">
-          <strong>Spain 2.0TD:</strong> P1 peak 0.284 €/kWh (10-14h, 18-22h weekdays) · P2 mid 0.189 €/kWh · P3 valley 0.146 €/kWh · Excedentes 0.040 €/kWh. Fine-tune hours in the Tariff tab.
+        <div style="margin-bottom:.5rem">
+          <div class="tariff-note" style="margin-bottom:.4rem">Click a day to toggle all-day valley (green = cheap all day). Click hours to cycle: <span class="badge valley">valley</span> → <span class="badge mid">mid</span> → <span class="badge peak">peak</span>.</div>
+          <div class="day-row" id="wiz-tariff-days"></div>
+          <div class="timeline" id="wiz-tariff-timeline" style="margin:.5rem 0"></div>
+          <div class="price-grid">
+            <div class="price-field"><label>Peak (€/kWh)</label><input id="wiz-p-peak" type="number" step="0.01" min="0"></div>
+            <div class="price-field"><label>Mid (€/kWh)</label><input id="wiz-p-mid" type="number" step="0.01" min="0"></div>
+            <div class="price-field"><label>Valley (€/kWh)</label><input id="wiz-p-valley" type="number" step="0.01" min="0"></div>
+            <div class="price-field"><label>Export (€/kWh)</label><input id="wiz-p-export" type="number" step="0.01" min="0"></div>
+          </div>
+          <button class="btn btn-g btn-sm" style="margin-top:.5rem" onclick="wizSaveTariff()">💾 Save tariff</button>
         </div>
-        <div style="margin-top:.8rem">
+        <div>
           <label style="font-size:.72rem;color:var(--m)">Weather entity (storm protection)</label>
           <input class="entity-select" id="wiz-weather" placeholder="weather.aemet" oninput="wizEntityTyped('weather','wiz-weather',null,null)" style="margin-top:.3rem">
           <div id="wiz-weather-cands" class="entity-cands" style="margin-top:.3rem"></div>
@@ -2588,9 +2597,14 @@ async function load(){
         <div class="sub">Outdoor: ${(ss.temp_outdoor??0).toFixed(1)}°C</div></div>
       <div class="card"><div class="metric" style="font-size:1.1rem"><span class="badge ${dwCls}">${dw}</span></div>
         <div class="label">Dishwasher</div></div>
-      <div class="card"><div class="metric" style="font-size:1rem">${m?.r2_cv_mean!=null?'R²='+m.r2_cv_mean.toFixed(2):'No model'}</div>
-        <div class="label">ML model</div>
-        <div class="sub">${m?.n_samples?m.n_samples+' samples':''}</div></div>`;
+      <div class="card">${(()=>{
+        if(!m?.r2_cv_mean) return '<div class="metric" style="font-size:.9rem">Not trained</div><div class="label">ML model</div><div class="sub">Will train tonight at 3 AM</div>';
+        const r=m.r2_cv_mean;
+        const [qual,col]=r>=0.9?['Excellent','var(--g)']:r>=0.7?['Good','var(--g)']:r>=0.5?['Fair','var(--y)']:['Learning','var(--m)'];
+        return `<div class="metric" style="font-size:1rem;color:${col}">${qual}</div>
+          <div class="label">Consumption forecast</div>
+          <div class="sub">Trained on ${m.n_samples||0} readings · accuracy R²=${r.toFixed(2)}</div>`;
+      })()}</div>`;
 
     const bpow=ss.battery_power??0;
     const bdir=bpow>50?'▲ Charging':bpow<-50?'▼ Discharging':'● Idle';
@@ -2852,7 +2866,56 @@ function wizGoTo(step) {
   wizStep = step;
   wizRenderDots();
   _wizShowAllCands();
+  if (step === 6) wizRenderTariffInStep();
   if (step === 7) wizBuildSummary();
+}
+
+function wizRenderTariffInStep() {
+  if (!tariffCfg) { loadTariff().then(()=>wizRenderTariffInStep()); return; }
+  const wd = tariffCfg.weekend_days||[5,6];
+  const daysEl = document.getElementById('wiz-tariff-days');
+  if (daysEl) daysEl.innerHTML = DAY_NAMES.map((d,i)=>
+    '<div class="day-chip'+(wd.includes(i)?' weekend':'')+'" onclick="wizTariffToggleDay('+i+')">'+
+    (wd.includes(i)?'🌿 ':'')+d+'</div>'
+  ).join('');
+  const tlEl = document.getElementById('wiz-tariff-timeline');
+  if (tlEl) {
+    const {peak_hours,valley_hours} = tariffCfg;
+    tlEl.innerHTML = Array.from({length:24},(_,h)=>{
+      const p = peak_hours.includes(h)?'peak':valley_hours.includes(h)?'valley':'mid';
+      return '<div class="t-hour '+p+'" onclick="wizTariffToggleHour('+h+')" title="'+h+':00">'+h+'</div>';
+    }).join('');
+  }
+  ['peak','mid','valley','export'].forEach(k=>{
+    const el=document.getElementById('wiz-p-'+k);
+    if(el && tariffCfg.prices) el.value=tariffCfg.prices[k]||0;
+  });
+}
+
+function wizTariffToggleDay(i) {
+  const wd=tariffCfg.weekend_days||[5,6];
+  tariffCfg.weekend_days=wd.includes(i)?wd.filter(x=>x!==i):[...wd,i].sort((a,b)=>a-b);
+  wizRenderTariffInStep(); renderDayRow();
+}
+
+function wizTariffToggleHour(h) {
+  const {peak_hours,valley_hours}=tariffCfg;
+  const isPeak=peak_hours.includes(h), isValley=valley_hours.includes(h);
+  if(isValley){ tariffCfg.valley_hours=valley_hours.filter(x=>x!==h); }
+  else if(!isPeak){ tariffCfg.peak_hours=[...peak_hours,h].sort((a,b)=>a-b); }
+  else { tariffCfg.peak_hours=peak_hours.filter(x=>x!==h); tariffCfg.valley_hours=[...valley_hours,h].sort((a,b)=>a-b); }
+  wizRenderTariffInStep(); renderTariffTimeline();
+}
+
+async function wizSaveTariff() {
+  tariffCfg.prices = {
+    peak:   parseFloat(document.getElementById('wiz-p-peak').value)||0.30,
+    mid:    parseFloat(document.getElementById('wiz-p-mid').value)||0.18,
+    valley: parseFloat(document.getElementById('wiz-p-valley').value)||0.08,
+    export: parseFloat(document.getElementById('wiz-p-export').value)||0.06,
+  };
+  const r=await fetch(BASE+'/api/tariff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(tariffCfg)}).then(r=>r.json());
+  notify(r.ok?'✓ Tariff saved':'✗ Error','r.ok?\'ok\':\'err\'');
 }
 
 function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); }

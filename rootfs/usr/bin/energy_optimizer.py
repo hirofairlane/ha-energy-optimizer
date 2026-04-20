@@ -1702,6 +1702,9 @@ th{color:var(--m);font-weight:500}
 .submeter-row{display:flex;gap:.4rem;align-items:center;margin-bottom:.4rem}
 .submeter-row input{flex:1;background:var(--b);border:1px solid #475569;border-radius:.4rem;padding:.35rem .5rem;color:var(--t);font-size:.8rem}
 .submeter-del{background:none;border:1px solid #ef4444;color:#ef4444;border-radius:.3rem;padding:.2rem .5rem;cursor:pointer;font-size:.72rem}
+.chart-subnav{background:var(--b);color:var(--m);border:1px solid #334155;font-size:.8rem;padding:.35rem .8rem;border-radius:.4rem;cursor:pointer;transition:.15s}
+.chart-subnav.active{background:rgba(56,189,248,.15);color:var(--a);border-color:var(--a)}
+.chart-subnav:hover{color:var(--t)}
 .entity-picker{background:var(--bg);border:2px solid var(--b);border-radius:.6rem;padding:.7rem;margin-bottom:.7rem}
 .entity-picker-label{font-size:.72rem;color:var(--m);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.4rem;display:flex;align-items:center;justify-content:space-between}
 .entity-picker-label span{color:var(--g);font-size:.65rem}
@@ -1786,33 +1789,141 @@ th{color:var(--m);font-weight:500}
 
 <!-- CHARTS -->
 <div id="tab-charts" class="tab-content">
-  <div class="card">
-    <h2 style="margin-top:0">⚡ Power flow — last 24h (kW)
-      <span style="font-size:.72rem;color:var(--m);font-weight:400;margin-left:.5rem">
-        solar · grid (+ export / − import) · battery (+ discharge / − charge)
-      </span>
-    </h2>
-    <canvas id="pwrChart" style="max-height:240px"></canvas>
+  <!-- Chart sub-nav -->
+  <div style="display:flex;gap:.4rem;margin-bottom:1rem;flex-wrap:wrap">
+    <button class="btn chart-subnav active" id="cn-live" onclick="chartView('live')">⚡ Live</button>
+    <button class="btn chart-subnav" id="cn-day"  onclick="chartView('day')">📅 Day</button>
+    <button class="btn chart-subnav" id="cn-hist" onclick="chartView('hist')">📈 History</button>
+    <button class="btn btn-sm" style="margin-left:auto" onclick="refreshChartView()">🔄 Refresh</button>
   </div>
-  <div class="grid2">
-    <div class="card">
-      <h2 style="margin-top:0">🔋 Battery SOC — actual vs predicted (24h) <span id="soc-mae" style="font-size:.75rem;color:var(--m);font-weight:400"></span></h2>
-      <canvas id="socChart"></canvas>
+
+  <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
+  <div id="cv-live">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem;margin-bottom:.8rem">
+      <div class="card" style="text-align:center;padding:.8rem">
+        <div style="font-size:1.6rem">☀️</div>
+        <div id="lv-solar-w" style="font-size:1.4rem;font-weight:700;color:#facc15">—</div>
+        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem">Solar</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.8rem">
+        <div style="font-size:1.6rem">🏠</div>
+        <div id="lv-house-w" style="font-size:1.4rem;font-weight:700;color:#f97316">—</div>
+        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem">House</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.8rem">
+        <div style="font-size:1.6rem">🔋</div>
+        <div id="lv-bat-w" style="font-size:1.4rem;font-weight:700;color:#a78bfa">—</div>
+        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-bat-dir">Battery</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
+      </div>
+      <div class="card" style="text-align:center;padding:.8rem">
+        <div style="font-size:1.6rem">⚡</div>
+        <div id="lv-grid-w" style="font-size:1.4rem;font-weight:700">—</div>
+        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-grid-dir">Grid</span></div>
+      </div>
     </div>
-    <div class="card">
-      <h2 style="margin-top:0">💰 Daily savings — last 7 days (€)</h2>
-      <canvas id="savingsChart"></canvas>
+    <!-- Flow diagram -->
+    <div class="card" style="padding:1.2rem">
+      <div style="display:grid;grid-template-columns:1fr auto 1fr;grid-template-rows:auto auto auto;gap:.5rem 1rem;align-items:center;max-width:600px;margin:0 auto">
+        <!-- Row 1: Solar top-center -->
+        <div></div>
+        <div style="text-align:center">
+          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">☀️ SOLAR</div>
+          <div id="fl-solar" style="font-size:1.1rem;font-weight:700;color:#facc15">— W</div>
+        </div>
+        <div></div>
+        <!-- Row 2: Battery — House — Grid -->
+        <div style="text-align:right">
+          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">🔋 BATTERY</div>
+          <div id="fl-bat" style="font-size:1.1rem;font-weight:700;color:#a78bfa">— W</div>
+          <div id="fl-bat-lbl" style="font-size:.6rem;color:var(--m)">—</div>
+        </div>
+        <div style="text-align:center;background:rgba(56,189,248,.08);border:2px solid rgba(56,189,248,.3);border-radius:.7rem;padding:.6rem 1rem">
+          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">🏠 HOUSE</div>
+          <div id="fl-house" style="font-size:1.3rem;font-weight:700;color:#f97316">— W</div>
+        </div>
+        <div style="text-align:left">
+          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">⚡ GRID</div>
+          <div id="fl-grid" style="font-size:1.1rem;font-weight:700">— W</div>
+          <div id="fl-grid-lbl" style="font-size:.6rem;color:var(--m)">—</div>
+        </div>
+        <!-- Row 3: Tariff period + last update -->
+        <div></div>
+        <div style="text-align:center;font-size:.65rem;color:var(--m);margin-top:.2rem">
+          <span id="fl-tariff"></span> · <span id="fl-ts">—</span>
+        </div>
+        <div></div>
+      </div>
+    </div>
+    <!-- SOC bar -->
+    <div class="card" style="margin-top:.7rem">
+      <h2 style="margin-top:0;font-size:.85rem">🔋 Battery SOC — last 24h <span id="soc-mae" style="font-size:.72rem;color:var(--m);font-weight:400"></span></h2>
+      <canvas id="socChart" style="max-height:180px"></canvas>
     </div>
   </div>
-  <div class="card">
-    <h2 style="margin-top:0">☀️ Solar production — last 7 days (kWh)</h2>
-    <canvas id="sol7Chart" style="max-height:200px"></canvas>
+
+  <!-- ── DAY ──────────────────────────────────────────────────────────── -->
+  <div id="cv-day" style="display:none">
+    <!-- Date nav -->
+    <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.8rem;flex-wrap:wrap">
+      <button class="btn btn-sm" onclick="dayNav(-1)">←</button>
+      <span id="day-label" style="font-weight:600;font-size:.95rem">—</span>
+      <button class="btn btn-sm" onclick="dayNav(1)">→</button>
+      <button class="btn btn-sm btn-g" onclick="dayNav(0)">Today</button>
+    </div>
+    <!-- KPI row -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;margin-bottom:.8rem" id="day-kpis">
+      <div class="card" style="text-align:center;padding:.6rem">
+        <div id="kpi-solar" style="font-size:1.1rem;font-weight:700;color:#facc15">—</div>
+        <div style="font-size:.65rem;color:var(--m)">☀️ Solar</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem">
+        <div id="kpi-cons" style="font-size:1.1rem;font-weight:700;color:#f97316">—</div>
+        <div style="font-size:.65rem;color:var(--m)">🏠 Consumed</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem">
+        <div id="kpi-exp" style="font-size:1.1rem;font-weight:700;color:#4ade80">—</div>
+        <div style="font-size:.65rem;color:var(--m)">📤 Exported</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem">
+        <div id="kpi-imp" style="font-size:1.1rem;font-weight:700;color:#f87171">—</div>
+        <div style="font-size:.65rem;color:var(--m)">📥 Imported</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem">
+        <div id="kpi-ss" style="font-size:1.1rem;font-weight:700;color:var(--a)">—</div>
+        <div style="font-size:.65rem;color:var(--m)">🔄 Self-suff.</div>
+      </div>
+    </div>
+    <!-- Stacked hourly bar -->
+    <div class="card">
+      <h2 style="margin-top:0;font-size:.85rem">Hourly energy balance (kWh)
+        <span style="font-size:.65rem;color:var(--m);font-weight:400"> above zero = sources · below zero = sinks</span>
+      </h2>
+      <canvas id="dayChart" style="max-height:260px"></canvas>
+    </div>
+    <!-- SOC day -->
+    <div class="card" style="margin-top:.7rem;margin-bottom:1rem">
+      <h2 style="margin-top:0;font-size:.85rem">Battery SOC during the day (%)</h2>
+      <canvas id="socDayChart" style="max-height:160px"></canvas>
+    </div>
   </div>
-  <div class="card" style="margin-bottom:1rem">
-    <h2 style="margin-top:0">📅 Solar production — last 12 months (kWh)</h2>
-    <canvas id="sol12Chart" style="max-height:220px"></canvas>
+
+  <!-- ── HISTORY ───────────────────────────────────────────────────────── -->
+  <div id="cv-hist" style="display:none">
+    <div class="grid2">
+      <div class="card">
+        <h2 style="margin-top:0;font-size:.85rem">☀️ Solar — last 7 days (kWh)</h2>
+        <canvas id="sol7Chart" style="max-height:200px"></canvas>
+      </div>
+      <div class="card">
+        <h2 style="margin-top:0;font-size:.85rem">💰 Daily savings — last 7 days (€)</h2>
+        <canvas id="savingsChart" style="max-height:200px"></canvas>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:1rem">
+      <h2 style="margin-top:0;font-size:.85rem">📅 Solar production — last 12 months (kWh)</h2>
+      <canvas id="sol12Chart" style="max-height:220px"></canvas>
+    </div>
   </div>
-  <div class="actions"><button class="btn btn-sm" onclick="loadCharts()">🔄 Refresh</button></div>
 </div>
 
 <!-- TARIFF -->
@@ -2329,7 +2440,7 @@ function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelector('.tab[onclick="showTab(\''+name+'\')"]').classList.add('active');
   document.getElementById('tab-'+name).classList.add('active');
-  if (name==='charts') loadCharts();
+  if (name==='charts') chartView('live');
   if (name==='tariff') loadTariff();
   if (name==='setup')  loadSetup();
   if (name==='wizard') loadWizard();
@@ -2465,128 +2576,204 @@ async function saveSetup(){
 }
 
 // ── Charts ────────────────────────────────────────────────────────────────────
-let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null,pwrInst=null;
-function mkChart(id,type,labels,datasets,yExtra={},maxH=null){
-  const el=document.getElementById(id); if(!el) return null;
-  if(maxH) el.style.maxHeight=maxH;
-  return new Chart(el.getContext('2d'),{type,data:{labels,datasets},
-    options:{responsive:true,maintainAspectRatio:true,
-      plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-      scales:{x:{ticks:{color:'#94a3b8',maxTicksLimit:10,font:{size:10}},grid:{color:'#334155'}},
-              y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'},...yExtra}}}});
+let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null,pwrInst=null,dayInst=null,socDayInst=null;
+let _chartView='live', _chartDate=new Date().toISOString().slice(0,10), _liveTimer=null;
+
+const CHART_DEFAULTS = {responsive:true,maintainAspectRatio:true,
+  interaction:{mode:'index',intersect:false},
+  plugins:{legend:{labels:{color:'#94a3b8',font:{size:10},boxWidth:10}}},
+  scales:{
+    x:{ticks:{color:'#94a3b8',maxTicksLimit:12,font:{size:9}},grid:{color:'#1e293b'}},
+    y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}
+  }
+};
+
+function _mkOpts(extra={}){
+  const o=JSON.parse(JSON.stringify(CHART_DEFAULTS));
+  if(extra.yMin!==undefined) o.scales.y.min=extra.yMin;
+  if(extra.yMax!==undefined) o.scales.y.max=extra.yMax;
+  if(extra.stacked){ o.scales.y.stacked=true; o.scales.x.stacked=true; }
+  if(extra.tooltip) o.plugins.tooltip=extra.tooltip;
+  return o;
 }
 
-async function loadCharts(){
-  try {
-    const cd=await fetch(BASE+'/api/chart-data').then(r=>r.json());
+function chartView(v){
+  _chartView=v;
+  ['live','day','hist'].forEach(k=>{
+    document.getElementById('cv-'+k).style.display = k===v?'':'none';
+    document.getElementById('cn-'+k).classList.toggle('active', k===v);
+  });
+  if(_liveTimer){ clearInterval(_liveTimer); _liveTimer=null; }
+  if(v==='live'){ loadLive(); _liveTimer=setInterval(loadLive,30000); }
+  else if(v==='day') loadDay(_chartDate);
+  else loadHistory();
+}
 
-    // ── Power flow 24h ─────────────────────────────────────────────────────
-    if(pwrInst) pwrInst.destroy();
-    const pf=cd.power_flow||{labels:[],solar:[],grid:[],battery:[]};
-    if(pf.labels.length>0){
-      // Derive load = solar - grid + battery (kW)
-      const load=pf.solar.map((_,i)=>
-        Math.max(0, pf.solar[i] - pf.grid[i] + pf.battery[i]));
-      // Split grid into import (negative → positive) and export (positive)
-      const gridImport=pf.grid.map(v=>v<0?Math.abs(v):null);
-      const gridExport=pf.grid.map(v=>v>0?v:null);
-      // Split battery into charge (negative → positive) and discharge (positive)
-      const batDischarge=pf.battery.map(v=>v>0?v:null);
-      const batCharge=pf.battery.map(v=>v<0?Math.abs(v):null);
-      pwrInst=new Chart(document.getElementById('pwrChart').getContext('2d'),{
-        type:'line',
-        data:{labels:pf.labels,datasets:[
-          {label:'Solar (kW)',data:pf.solar,borderColor:'#facc15',
-           backgroundColor:'rgba(250,204,21,.15)',fill:true,tension:.4,pointRadius:0,borderWidth:2},
-          {label:'Load (kW)',data:load,borderColor:'#f97316',
-           backgroundColor:'transparent',fill:false,tension:.4,pointRadius:0,borderWidth:2,borderDash:[4,2]},
-          {label:'Grid export (kW)',data:gridExport,borderColor:'#4ade80',
-           backgroundColor:'rgba(74,222,128,.1)',fill:true,tension:.4,pointRadius:0,borderWidth:1.5},
-          {label:'Grid import (kW)',data:gridImport,borderColor:'#f87171',
-           backgroundColor:'rgba(248,113,113,.12)',fill:true,tension:.4,pointRadius:0,borderWidth:1.5},
-          {label:'Bat discharge (kW)',data:batDischarge,borderColor:'#a78bfa',
-           backgroundColor:'transparent',fill:false,tension:.4,pointRadius:0,borderWidth:1.5},
-          {label:'Bat charge (kW)',data:batCharge,borderColor:'#38bdf8',
-           backgroundColor:'transparent',fill:false,tension:.4,pointRadius:0,borderWidth:1.5,borderDash:[3,2]},
+function refreshChartView(){ chartView(_chartView); }
+
+// ── LIVE view ─────────────────────────────────────────────────────────────────
+async function loadLive(){
+  try {
+    const [s, cd] = await Promise.all([
+      fetch(BASE+'/api/status').then(r=>r.json()),
+      fetch(BASE+'/api/chart-data').then(r=>r.json())
+    ]);
+    const ss = s.sensors||{};
+    const solar  = ss.solar_power  ?? 0;
+    const grid   = ss.grid_power   ?? 0;
+    const bat    = ss.battery_power?? 0;
+    const soc    = ss.battery_soc  ?? 0;
+    const house  = Math.max(0, solar + bat - grid);
+
+    const fmt = w => Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W';
+
+    document.getElementById('lv-solar-w').textContent = fmt(solar);
+    document.getElementById('lv-house-w').textContent = fmt(house);
+    document.getElementById('lv-bat-w').textContent   = fmt(Math.abs(bat));
+    document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'Charging':bat<-50?'Discharging':'Idle';
+
+    const gridEl = document.getElementById('lv-grid-w');
+    gridEl.textContent = fmt(Math.abs(grid));
+    gridEl.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
+    document.getElementById('lv-grid-dir').textContent = grid>50?'Exporting':grid<-50?'Importing':'Idle';
+
+    // Flow diagram
+    document.getElementById('fl-solar').textContent = fmt(solar);
+    document.getElementById('fl-house').textContent = fmt(house);
+    document.getElementById('fl-bat').textContent   = fmt(Math.abs(bat));
+    document.getElementById('fl-bat-lbl').textContent = bat>50?'▲ charging':bat<-50?'▼ discharging':'● idle';
+    const flGrid = document.getElementById('fl-grid');
+    flGrid.textContent = fmt(Math.abs(grid));
+    flGrid.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
+    document.getElementById('fl-grid-lbl').textContent = grid>50?'▲ exporting':grid<-50?'▼ importing':'● idle';
+    const tp = s.tariff?.period||'';
+    document.getElementById('fl-tariff').innerHTML = tp ? `<span class="badge ${tp}">${tp}</span>` : '';
+    document.getElementById('fl-ts').textContent = new Date().toLocaleTimeString();
+
+    // SOC 24h chart
+    const sdat = cd.soc||{};
+    const futL = sdat.future_labels||[], futP = sdat.future_predicted||[];
+    const nP   = (sdat.labels||[]).length;
+    const allL = [...(sdat.labels||[]),...futL];
+    const actD = [...(sdat.actual||[]),...Array(futL.length).fill(null)];
+    const preD = [...(sdat.predicted||[]),...Array(futL.length).fill(null)];
+    const futD = [...Array(nP).fill(null),...futP];
+    if(socInst) socInst.destroy();
+    const socCtx = document.getElementById('socChart')?.getContext('2d');
+    if(socCtx) socInst = new Chart(socCtx,{type:'line',
+      data:{labels:allL,datasets:[
+        {label:'Actual %',data:actD,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.08)',fill:true,tension:.3,pointRadius:0},
+        {label:'Predicted %',data:preD,borderColor:'#a78bfa',backgroundColor:'transparent',fill:false,tension:.3,pointRadius:0,borderDash:[4,3]},
+        {label:'Forecast %',data:futD,borderColor:'#4ade80',backgroundColor:'rgba(74,222,128,.06)',fill:true,tension:.3,pointRadius:0,borderDash:[6,3]},
+      ]},
+      options:{..._mkOpts({yMin:0,yMax:100}),plugins:{...CHART_DEFAULTS.plugins,
+        tooltip:{callbacks:{label:ctx=>` ${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(1)??''}%`}}}}
+    });
+    const maeEl=document.getElementById('soc-mae');
+    if(maeEl) maeEl.textContent=sdat.mae!=null?`— MAE ${sdat.mae}%`:'';
+  } catch(e){ console.warn('Live error',e); }
+}
+
+// ── DAY view ──────────────────────────────────────────────────────────────────
+function dayNav(dir){
+  if(dir===0){ _chartDate=new Date().toISOString().slice(0,10); }
+  else {
+    const d=new Date(_chartDate+'T12:00:00');
+    d.setDate(d.getDate()+dir);
+    _chartDate=d.toISOString().slice(0,10);
+  }
+  loadDay(_chartDate);
+}
+
+async function loadDay(date){
+  document.getElementById('day-label').textContent = new Date(date+'T12:00:00').toLocaleDateString(undefined,{weekday:'short',year:'numeric',month:'short',day:'numeric'});
+  try {
+    const cd = await fetch(BASE+'/api/chart-data?date='+date).then(r=>r.json());
+    const h  = cd.hourly||{};
+    const kpi = h.kpi||{};
+
+    // KPIs
+    document.getElementById('kpi-solar').textContent = (kpi.solar_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-cons').textContent  = (kpi.consumption_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-exp').textContent   = (kpi.export_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-imp').textContent   = (kpi.import_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-ss').textContent    = (kpi.self_sufficiency_pct??0).toFixed(0)+'%';
+
+    // Stacked hourly bar
+    if(dayInst) dayInst.destroy();
+    const dCtx = document.getElementById('dayChart')?.getContext('2d');
+    if(dCtx && h.labels) {
+      dayInst = new Chart(dCtx,{type:'bar',
+        data:{labels:h.labels, datasets:[
+          {label:'Solar (kWh)',   data:h.solar,        backgroundColor:'rgba(250,204,21,.7)', stack:'src'},
+          {label:'Bat discharge', data:h.bat_discharge, backgroundColor:'rgba(167,139,250,.7)',stack:'src'},
+          {label:'Grid import',  data:h.grid_import,  backgroundColor:'rgba(248,113,113,.7)',stack:'src'},
+          {label:'Grid export',  data:(h.grid_export||[]).map(v=>v!=null?-v:null),  backgroundColor:'rgba(74,222,128,.6)', stack:'snk'},
+          {label:'Bat charge',   data:(h.bat_charge||[]).map(v=>v!=null?-v:null),   backgroundColor:'rgba(56,189,248,.6)', stack:'snk'},
         ]},
-        options:{responsive:true,maintainAspectRatio:true,
-          interaction:{mode:'index',intersect:false},
-          plugins:{legend:{labels:{color:'#94a3b8',font:{size:10},boxWidth:12}},
-                   tooltip:{callbacks:{label:ctx=>` ${ctx.dataset.label}: ${(ctx.parsed.y??0).toFixed(2)} kW`}}},
-          scales:{
-            x:{ticks:{color:'#94a3b8',maxTicksLimit:12,font:{size:10}},grid:{color:'#1e293b'}},
-            y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'},
-               title:{display:true,text:'kW',color:'#64748b',font:{size:10}}}
+        options:{..._mkOpts({stacked:true}),
+          plugins:{...CHART_DEFAULTS.plugins,
+            tooltip:{callbacks:{label:ctx=>{
+              const v=Math.abs(ctx.parsed.y??0);
+              return ` ${ctx.dataset.label}: ${v.toFixed(3)} kWh`;
+            }}}
           }
         }
       });
     }
 
-    // Combine past + future labels for x-axis
-    const futureLabels=cd.soc.future_labels||[];
-    const futurePred=cd.soc.future_predicted||[];
-    const nPast=cd.soc.labels.length;
-    const allLabels=[...cd.soc.labels,...futureLabels];
-    // Pad arrays: actual and past-predicted are null in the future segment
-    const actualData=[...cd.soc.actual,...Array(futureLabels.length).fill(null)];
-    const pastPredData=[...(cd.soc.predicted||[]),...Array(futureLabels.length).fill(null)];
-    // Future forecast: null for past segment, values for future
-    const futureData=[...Array(nPast).fill(null),...futurePred];
-    if(socInst) socInst.destroy();
-    socInst=new Chart(document.getElementById('socChart').getContext('2d'),{
-      type:'line',
-      data:{labels:allLabels,datasets:[
-        {label:'Actual SOC %',data:actualData,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.08)',fill:true,tension:.3,pointRadius:0},
-        {label:'Predicted (past) %',data:pastPredData,borderColor:'#a78bfa',backgroundColor:'transparent',fill:false,tension:.3,pointRadius:0,borderDash:[4,3]},
-        {label:'Forecast (next 8h) %',data:futureData,borderColor:'#4ade80',backgroundColor:'rgba(74,222,128,.06)',fill:true,tension:.3,pointRadius:0,borderDash:[6,3]},
-      ]},
-      options:{responsive:true,maintainAspectRatio:true,
-        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-        scales:{
-          x:{ticks:{color:'#94a3b8',maxTicksLimit:10,font:{size:10}},grid:{color:'#334155'}},
-          y:{min:0,max:100,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}
-        }
-      }
-    });
-    const maeEl=document.getElementById('soc-mae');
-    if(maeEl) maeEl.textContent=cd.soc.mae!=null?`— MAE ${cd.soc.mae}%`:'';
+    // SOC line for the day
+    const socHours = h.labels||[];
+    const socVals  = h.soc||[];
+    if(socDayInst) socDayInst.destroy();
+    const sdCtx = document.getElementById('socDayChart')?.getContext('2d');
+    if(sdCtx && socVals.some(v=>v!=null)){
+      socDayInst = new Chart(sdCtx,{type:'line',
+        data:{labels:socHours,datasets:[
+          {label:'SOC %',data:socVals,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.1)',
+           fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#38bdf8'}
+        ]},
+        options:_mkOpts({yMin:0,yMax:100})
+      });
+    }
+  } catch(e){ console.warn('Day error',e); }
+}
+
+// ── HISTORY view ──────────────────────────────────────────────────────────────
+async function loadHistory(){
+  try {
+    const cd=await fetch(BASE+'/api/chart-data').then(r=>r.json());
+
     // ── Solar 7-day line chart ──────────────────────────────────────────────
     if(sol7Inst) sol7Inst.destroy();
     const s7=cd.solar_7d||{labels:[],actual:[],forecast:[]};
-    sol7Inst=new Chart(document.getElementById('sol7Chart').getContext('2d'),{
-      type:'line',
-      data:{labels:s7.labels,datasets:[
-        {label:'Actual kWh',data:s7.actual,borderColor:'#4ade80',
-         backgroundColor:'rgba(74,222,128,.08)',fill:true,tension:.3,
-         pointRadius:4,pointBackgroundColor:'#4ade80'},
-        {label:'HA Forecast kWh',data:s7.forecast,borderColor:'#a78bfa',
-         backgroundColor:'transparent',fill:false,tension:.3,
-         pointRadius:4,pointBackgroundColor:'#a78bfa',borderDash:[5,3]},
-      ]},
-      options:{responsive:true,maintainAspectRatio:true,
-        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-        scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
-                y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}}
-    });
-    // ── Solar 12-month line chart ───────────────────────────────────────────
+    const s7Ctx=document.getElementById('sol7Chart')?.getContext('2d');
+    if(s7Ctx){
+      sol7Inst=new Chart(s7Ctx,{type:'bar',
+        data:{labels:s7.labels,datasets:[
+          {label:'Actual kWh',data:s7.actual,backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4},
+          {label:'Forecast kWh',data:s7.forecast,backgroundColor:'rgba(167,139,250,.4)',borderColor:'#a78bfa',borderWidth:1,borderRadius:4},
+        ]},
+        options:_mkOpts({stacked:false})
+      });
+    }
+
+    // ── Solar 12-month bar chart ────────────────────────────────────────────
     if(sol12Inst) sol12Inst.destroy();
     const s12=cd.solar_12m||{labels:[],actual:[],forecast:[]};
-    sol12Inst=new Chart(document.getElementById('sol12Chart').getContext('2d'),{
-      type:'line',
-      data:{labels:s12.labels,datasets:[
-        {label:'Actual kWh',data:s12.actual,borderColor:'#4ade80',
-         backgroundColor:'rgba(74,222,128,.08)',fill:true,tension:.3,
-         pointRadius:5,pointBackgroundColor:'#4ade80'},
-        {label:'HA Forecast kWh',data:s12.forecast,borderColor:'#a78bfa',
-         backgroundColor:'transparent',fill:false,tension:.3,
-         pointRadius:5,pointBackgroundColor:'#a78bfa',borderDash:[5,3]},
-      ]},
-      options:{responsive:true,maintainAspectRatio:false,
-        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-        scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
-                y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}}
-    });
-    // ── Savings bar chart with value labels ─────────────────────────────────
+    const s12Ctx=document.getElementById('sol12Chart')?.getContext('2d');
+    if(s12Ctx){
+      sol12Inst=new Chart(s12Ctx,{type:'bar',
+        data:{labels:s12.labels,datasets:[
+          {label:'Actual kWh',data:s12.actual,backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4},
+          {label:'Forecast kWh',data:s12.forecast,backgroundColor:'rgba(167,139,250,.4)',borderColor:'#a78bfa',borderWidth:1,borderRadius:4},
+        ]},
+        options:_mkOpts({stacked:false})
+      });
+    }
+
+    // ── Daily savings bar chart ─────────────────────────────────────────────
     const dlPlugin={id:'dl',afterDatasetsDraw(chart){
       const ctx=chart.ctx; ctx.save();
       chart.data.datasets.forEach((ds,i)=>{
@@ -2600,23 +2787,18 @@ async function loadCharts(){
       }); ctx.restore();
     }};
     if(savInst) savInst.destroy();
-    if(cd.savings_daily&&cd.savings_daily.labels.length>0){
-      const el=document.getElementById('savingsChart');
-      if(el){ el.style.maxHeight='180px';
-        savInst=new Chart(el.getContext('2d'),{type:'bar',
-          data:{labels:cd.savings_daily.labels,datasets:[
-            {label:'€ saved',data:cd.savings_daily.values,
-             backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4}
-          ]},
-          options:{responsive:true,maintainAspectRatio:true,
-            plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-            scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
-                    y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}},
-          plugins:[dlPlugin]
-        });
-      }
+    const savEl=document.getElementById('savingsChart');
+    if(savEl && cd.savings_daily?.labels?.length>0){
+      savInst=new Chart(savEl.getContext('2d'),{type:'bar',
+        data:{labels:cd.savings_daily.labels,datasets:[
+          {label:'€ saved',data:cd.savings_daily.values,
+           backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4}
+        ]},
+        options:_mkOpts({stacked:false}),
+        plugins:[dlPlugin]
+      });
     }
-  } catch(e){ console.warn('Chart error',e); }
+  } catch(e){ console.warn('History error',e); }
 }
 
 // ── Status & decisions ────────────────────────────────────────────────────────
@@ -3487,10 +3669,8 @@ function _wizPopulateFields() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 load();
 loadWeather();
-loadCharts();
 setInterval(load,30000);
 setInterval(loadWeather,300000);
-setInterval(loadCharts,120000);
 </script>
 </body></html>"""
 
@@ -3582,9 +3762,76 @@ def api_setup_post():
     save_setup(validated)
     return jsonify({"ok": True})
 
+def _hourly_from_decisions(date_str: str) -> dict:
+    """Aggregate decisions.json into hourly kWh buckets for a given YYYY-MM-DD date."""
+    K = 0.25 / 1000  # 15-min interval → kWh factor
+    hours: dict = {h: {"sol": [], "grid": [], "bat": [], "soc": []} for h in range(24)}
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str or ts_str[:10] != date_str:
+                    continue
+                try:
+                    h = datetime.fromisoformat(ts_str).hour
+                except ValueError:
+                    continue
+                s = dec.get("sensors", {})
+                hours[h]["sol"].append(s.get("solar_power") or 0)
+                hours[h]["grid"].append(s.get("grid_power") or 0)
+                hours[h]["bat"].append(s.get("battery_power") or 0)
+                if s.get("battery_soc") is not None:
+                    hours[h]["soc"].append(float(s["battery_soc"]))
+        except Exception:
+            pass
+
+    res: dict = {k: [] for k in ("labels","solar","grid_import","grid_export",
+                                  "bat_charge","bat_discharge","consumption","soc")}
+    for h in range(24):
+        res["labels"].append(f"{h:02d}:00")
+        d = hours[h]
+        if not d["sol"]:
+            for k in res:
+                if k != "labels":
+                    res[k].append(None)
+            continue
+        sol  = sum(d["sol"]) * K
+        gimp = sum(max(-g, 0) for g in d["grid"]) * K
+        gexp = sum(max(g, 0) for g in d["grid"]) * K
+        bchg = sum(max(-b, 0) for b in d["bat"]) * K
+        bdis = sum(max(b, 0) for b in d["bat"]) * K
+        cons = max(0.0, sol + bdis + gimp - gexp - bchg)
+        res["solar"].append(round(sol, 3))
+        res["grid_import"].append(round(gimp, 3))
+        res["grid_export"].append(round(gexp, 3))
+        res["bat_charge"].append(round(bchg, 3))
+        res["bat_discharge"].append(round(bdis, 3))
+        res["consumption"].append(round(cons, 3))
+        res["soc"].append(round(sum(d["soc"]) / len(d["soc"]), 1) if d["soc"] else None)
+
+    # Daily KPIs
+    nn = lambda lst: [v for v in lst if v is not None]
+    total_sol  = sum(nn(res["solar"]))
+    total_imp  = sum(nn(res["grid_import"]))
+    total_exp  = sum(nn(res["grid_export"]))
+    total_cons = sum(nn(res["consumption"]))
+    self_suff  = round(min(100, (1 - total_imp / max(total_cons, 0.01)) * 100), 1) if total_cons else 0
+    solar_sc   = round(min(100, (1 - total_exp / max(total_sol, 0.01)) * 100), 1) if total_sol else 0
+    res["kpi"] = {
+        "solar_kwh":             round(total_sol,  2),
+        "import_kwh":            round(total_imp,  2),
+        "export_kwh":            round(total_exp,  2),
+        "consumption_kwh":       round(total_cons, 2),
+        "self_sufficiency_pct":  self_suff,
+        "solar_self_consumed_pct": solar_sc,
+    }
+    return res
+
+
 @app.route("/api/chart-data")
 def api_chart_data():
     from datetime import timezone as _tz
+    date_param = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
     soc_entity = _wiz("battery_soc", "sensor_battery_soc", "sensor.battery_state_of_capacity")
     # InfluxDB source: wizard config takes precedence over legacy cfg
     _wiz_influx = _WIZARD.get("influxdb", {})
@@ -3907,6 +4154,8 @@ def api_chart_data():
         "savings_daily": {"labels": savings_labels, "values": savings_values},
         "power_flow":    {"labels": pf_labels, "solar": pf_solar,
                           "grid": pf_grid, "battery": pf_battery},
+        "hourly":        _hourly_from_decisions(date_param),
+        "date":          date_param,
     })
 
 @app.route("/api/run", methods=["POST"])

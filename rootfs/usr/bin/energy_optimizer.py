@@ -733,59 +733,52 @@ BASE_FEATURES = ["hour", "weekday", "month", "lag1", "lag4", "roll4", "solar_pro
 
 # ── History helpers ───────────────────────────────────────────────────────────
 
-def _influx_v2_history(entity: str, days: int, influx_cfg: dict) -> list:
-    """Fetch entity history from InfluxDB v2 (Flux API) configured in the wizard.
-    Returns HA-style rows: [{"last_changed": iso_str, "state": str_value}, ...]
-    Pre-aggregates to 15-min means to keep payload small."""
+def _influx_wizard_history(entity: str, days: int, influx_cfg: dict) -> list:
+    """Fetch entity history from InfluxDB v1 (InfluxQL) configured in the wizard.
+    The official HA InfluxDB integration uses v1 user/password auth.
+    Returns HA-style rows: [{"last_changed": iso_str, "state": str_value}, ...]"""
     try:
-        from influxdb_client import InfluxDBClient
-        url    = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
-        token  = influx_cfg["token"]
-        org    = influx_cfg.get("org", "homeassistant")
-        bucket = influx_cfg.get("bucket", "homeassistant")
-        # HA InfluxDB integration stores entity_id without domain prefix as a tag
+        url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
+        db   = influx_cfg.get("db", "homeassistant")
+        user = influx_cfg.get("username", "")
+        pwd  = influx_cfg.get("password", "")
+        # HA stores entity_id without domain as the measurement name
         entity_short = entity.split(".")[-1] if "." in entity else entity
-        flux = (
-            f'from(bucket:"{bucket}") '
-            f'|> range(start: -{days}d) '
-            f'|> filter(fn:(r) => r["entity_id"] == "{entity_short}" or r["entity_id"] == "{entity}") '
-            f'|> filter(fn:(r) => r["_field"] == "value") '
-            f'|> aggregateWindow(every: 15m, fn: mean, createEmpty: false) '
-            f'|> sort(columns: ["_time"])'
+        q = (
+            f'SELECT mean("value") FROM "{entity_short}" '
+            f'WHERE time > now()-{days}d '
+            f'GROUP BY time(15m) fill(previous)'
         )
-        client = InfluxDBClient(url=url, token=token, org=org, timeout=30_000)
-        tables = client.query_api().query(flux, org=org)
-        client.close()
+        resp, err, _ = _influx_query(url, db, q, user, pwd)
+        if err or not resp:
+            return []
         rows = []
-        for table in tables:
-            for rec in table.records:
-                val = rec.get_value()
+        for series in resp.get("results", [{}])[0].get("series", []):
+            for point in series.get("values", []):
+                ts, val = point[0], point[1]
                 if val is None:
                     continue
-                rows.append({
-                    "last_changed": rec.get_time().isoformat(),
-                    "state":        str(val),
-                })
+                rows.append({"last_changed": ts, "state": str(val)})
         return rows
     except Exception as e:
-        log.debug(f"InfluxDB v2 history {entity}: {e}")
+        log.debug(f"InfluxDB wizard history {entity}: {e}")
         return []
 
 def _load_history_best_effort(entity: str, days: int) -> list:
-    """Unified history loader: wizard InfluxDB v2 → legacy InfluxDB v1 → HA recorder.
+    """Unified history loader: wizard InfluxDB v1 → legacy InfluxDB v1 cfg → HA recorder.
     Always returns HA-style rows; empty list if nothing is available."""
-    # 1. Wizard InfluxDB v2 (token-based, configured in wizard Data Sources step)
+    # 1. Wizard InfluxDB (v1 user/password, configured in wizard Data Sources step)
     influx_cfg = _WIZARD.get("influxdb", {})
-    if influx_cfg.get("host") and influx_cfg.get("token"):
-        rows = _influx_v2_history(entity, days, influx_cfg)
+    if influx_cfg.get("host"):
+        rows = _influx_wizard_history(entity, days, influx_cfg)
         if rows:
-            log.debug(f"  [{entity}] {len(rows)} rows from InfluxDB v2 ({days}d)")
+            log.debug(f"  [{entity}] {len(rows)} rows from wizard InfluxDB ({days}d)")
             return rows
     # 2. Legacy InfluxDB v1 (cfg-based, old add-on config)
     if cfg("influxdb_url", ""):
         rows, _ = ha_history_influx(entity, days=min(days, 365))
         if rows:
-            log.debug(f"  [{entity}] {len(rows)} rows from InfluxDB v1")
+            log.debug(f"  [{entity}] {len(rows)} rows from InfluxDB v1 cfg")
             return rows
     # 3. HA recorder (capped at 14 days — typical recorder retention)
     rows = ha_history(entity, days=min(days, 14))
@@ -914,9 +907,9 @@ def train_model() -> bool:
 
     log.info("═══ ML Training started (dynamic features v3) ═══")
 
-    # Days of history to request — more data available when InfluxDB v2 is configured
+    # Days of history to request — more data available when InfluxDB is configured
     influx_cfg = _WIZARD.get("influxdb", {})
-    days = 90 if (influx_cfg.get("host") and influx_cfg.get("token")) else \
+    days = 90 if influx_cfg.get("host") else \
            60 if cfg("influxdb_url", "") else 14
 
     df, features = _build_training_df(days=days)
@@ -1976,9 +1969,9 @@ th{color:var(--m);font-weight:500}
             <div class="wiz-field"><label>Host / IP</label><input type="text" id="wiz-influx-host" placeholder="172.30.32.1"></div>
             <div class="wiz-field"><label>Port</label><input type="number" id="wiz-influx-port" value="8086" style="width:80px"></div>
           </div>
-          <div class="wiz-field" style="margin-bottom:.4rem"><label>Organisation</label><input type="text" id="wiz-influx-org" placeholder="homeassistant"></div>
-          <div class="wiz-field" style="margin-bottom:.4rem"><label>Token</label><input type="password" id="wiz-influx-token" placeholder="your-influxdb-token"></div>
-          <div class="wiz-field" style="margin-bottom:.6rem"><label>Bucket</label><input type="text" id="wiz-influx-bucket" placeholder="homeassistant"></div>
+          <div class="wiz-field" style="margin-bottom:.4rem"><label>Database</label><input type="text" id="wiz-influx-db" placeholder="homeassistant"></div>
+          <div class="wiz-field" style="margin-bottom:.4rem"><label>Username</label><input type="text" id="wiz-influx-user" placeholder="(leave blank if none)" autocomplete="off"></div>
+          <div class="wiz-field" style="margin-bottom:.6rem"><label>Password</label><input type="password" id="wiz-influx-pass" placeholder="(leave blank if none)"></div>
           <button class="btn btn-sm" onclick="wizTestInflux()" id="btn-test-influx">🔌 Test connection</button>
           <span id="wiz-influx-status" style="font-size:.72rem;margin-left:.5rem;color:var(--m)"></span>
         </div>
@@ -2883,11 +2876,11 @@ async function wizTestInflux() {
   const st  = document.getElementById('wiz-influx-status');
   btn.disabled = true; st.textContent = 'Testing…';
   wizCfg.influxdb = {
-    host:   document.getElementById('wiz-influx-host').value.trim(),
-    port:   parseInt(document.getElementById('wiz-influx-port').value) || 8086,
-    org:    document.getElementById('wiz-influx-org').value.trim(),
-    token:  document.getElementById('wiz-influx-token').value.trim(),
-    bucket: document.getElementById('wiz-influx-bucket').value.trim(),
+    host:     document.getElementById('wiz-influx-host').value.trim(),
+    port:     parseInt(document.getElementById('wiz-influx-port').value) || 8086,
+    db:       document.getElementById('wiz-influx-db').value.trim() || 'homeassistant',
+    username: document.getElementById('wiz-influx-user').value.trim(),
+    password: document.getElementById('wiz-influx-pass').value,
   };
   try {
     const r = await fetch(BASE+'/api/wizard/data-quality', {
@@ -3046,27 +3039,50 @@ function _wizScoreEntities(role, forceShowSwitches) {
   return scored;
 }
 
+function _wizCandHtml(e, i, isFallback, inputId, candsId, role, stateId, statusId) {
+  const samp = wizDQSamples[e.entity_id] ? ` <span class="ent-samples">(${wizDQSamples[e.entity_id]}pts)</span>` : '';
+  const best = i===0 && !isFallback;
+  return `<span class="entity-cand${best?' best':''}" onclick="_wizSelectCand('${e.entity_id}','${inputId}','${candsId}','${role}','${stateId||''}','${statusId||''}')">
+    ${best?'⭐ ':''}${e.name||e.entity_id}
+    <span style="font-size:.6rem;opacity:.7">${e.entity_id} ${e.state||''} ${e.unit||''}</span>${samp}
+  </span>`;
+}
+
 function _wizRenderCands(role, inputId, candsId, stateId, statusId) {
   const candsEl = document.getElementById(candsId);
   if (!candsEl) return;
   const isForceSw = role === 'battery_force_charge';
   const scored = _wizScoreEntities(role, isForceSw);
-  if (!scored.length) {
-    candsEl.innerHTML = '<span style="font-size:.68rem;color:var(--m)">No candidates found</span>';
-    return;
-  }
-  const isFallback = scored[0]._fallback;
-  const label = isFallback ? '<span style="font-size:.62rem;color:var(--y);margin-bottom:.2rem;display:block">⚠ No auto-match — all switches listed:</span>' : '';
-  candsEl.innerHTML = label + scored.slice(0, isFallback ? 15 : 5).map((e,i) => {
-    const samp = wizDQSamples[e.entity_id] ? ` <span class="ent-samples">(${wizDQSamples[e.entity_id]}pts)</span>` : '';
-    return `<span class="entity-cand${i===0&&!isFallback?' best':''}" onclick="_wizSelectCand('${e.entity_id}','${inputId}','${candsId}','${role}','${stateId||''}','${statusId||''}')">
-      ${i===0&&!isFallback?'⭐ ':''}${e.name||e.entity_id}
-      <span style="font-size:.6rem;opacity:.7">${e.state||''} ${e.unit||''}</span>${samp}
-    </span>`;
-  }).join('');
-  // Update status badge based on current input value
+  const isFallback = scored.length && scored[0]._fallback;
+  const topLabel = isFallback ? '<span style="font-size:.62rem;color:var(--y);margin-bottom:.2rem;display:block">⚠ No auto-match — all switches listed:</span>' : '';
+  const topHtml = scored.length
+    ? topLabel + scored.slice(0, isFallback ? 15 : 5).map((e,i) => _wizCandHtml(e,i,isFallback,inputId,candsId,role,stateId,statusId)).join('')
+    : '<span style="font-size:.68rem;color:var(--m)">No suggestions — use search below</span>';
+  const searchId  = candsId+'-srch';
+  const resultsId = candsId+'-res';
+  candsEl.innerHTML = topHtml +
+    `<div style="margin-top:.4rem">
+      <input id="${searchId}" type="search" placeholder="🔍 Search all entities…"
+        style="width:100%;padding:.28rem .5rem;font-size:.72rem;border:1px solid var(--b);border-radius:.35rem;background:var(--bg);color:var(--t);margin-top:.2rem"
+        oninput="_wizSearchFilter('${searchId}','${resultsId}','${inputId}','${candsId}','${role}','${stateId||''}','${statusId||''}')">
+      <div id="${resultsId}" class="entity-cands" style="margin-top:.2rem"></div>
+    </div>`;
   const inputEl = document.getElementById(inputId);
   if (inputEl && statusId) _wizUpdateStatusBadge(statusId, role, inputEl.value);
+}
+
+function _wizSearchFilter(searchId, resultsId, inputId, candsId, role, stateId, statusId) {
+  const q = (document.getElementById(searchId)?.value || '').trim().toLowerCase();
+  const el = document.getElementById(resultsId);
+  if (!el) return;
+  if (!q) { el.innerHTML = ''; return; }
+  const matches = wizEntities.filter(e => {
+    const id   = (e.entity_id||'').toLowerCase();
+    const name = (e.name||'').toLowerCase();
+    return id.includes(q) || name.includes(q);
+  }).slice(0, 25);
+  if (!matches.length) { el.innerHTML = '<span style="font-size:.68rem;color:var(--m)">No results</span>'; return; }
+  el.innerHTML = matches.map((e,i) => _wizCandHtml(e,i,false,inputId,candsId,role,stateId,statusId)).join('');
 }
 
 function _wizSelectCand(entityId, inputId, candsId, role, stateId, statusId) {
@@ -3332,11 +3348,11 @@ function _wizPopulateFields() {
   // Influx fields
   if (wizCfg.influxdb) {
     const f = wizCfg.influxdb;
-    if (f.host)   { const el=document.getElementById('wiz-influx-host');   if(el) el.value=f.host; }
-    if (f.port)   { const el=document.getElementById('wiz-influx-port');   if(el) el.value=f.port; }
-    if (f.org)    { const el=document.getElementById('wiz-influx-org');    if(el) el.value=f.org; }
-    if (f.token)  { const el=document.getElementById('wiz-influx-token');  if(el) el.value=f.token; }
-    if (f.bucket) { const el=document.getElementById('wiz-influx-bucket'); if(el) el.value=f.bucket; }
+    if (f.host)     { const el=document.getElementById('wiz-influx-host'); if(el) el.value=f.host; }
+    if (f.port)     { const el=document.getElementById('wiz-influx-port'); if(el) el.value=f.port; }
+    if (f.db)       { const el=document.getElementById('wiz-influx-db');   if(el) el.value=f.db; }
+    if (f.username) { const el=document.getElementById('wiz-influx-user'); if(el) el.value=f.username; }
+    if (f.password) { const el=document.getElementById('wiz-influx-pass'); if(el) el.value=f.password; }
   }
   wizSelectDS(wizCfg.data_source || 'influxdb');
   const fieldMap = {
@@ -3955,43 +3971,29 @@ def api_wizard_data_quality():
     source_ok = False
     source_label = "none"
 
-    # ── Try InfluxDB ─────────────────────────────────────────────────────────
+    # ── Try InfluxDB v1 (official HA integration, user/password auth) ────────
     if influx_cfg.get("host"):
         try:
-            from influxdb_client import InfluxDBClient
-            url    = f"http://{influx_cfg['host']}:{influx_cfg.get('port',8086)}"
-            token  = influx_cfg.get("token","")
-            org    = influx_cfg.get("org","homeassistant")
-            bucket = influx_cfg.get("bucket","homeassistant")
-            client = InfluxDBClient(url=url, token=token, org=org, timeout=8000)
-            qapi   = client.query_api()
+            url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
+            db   = influx_cfg.get("db", "homeassistant")
+            user = influx_cfg.get("username", "")
+            pwd  = influx_cfg.get("password", "")
             for role, entity_id in sensors.items():
                 if not entity_id:
                     continue
+                entity_short = entity_id.split(".")[-1] if "." in entity_id else entity_id
+                q = f'SELECT count("value") FROM "{entity_short}" WHERE time > now()-60d'
+                resp, err, _ = _influx_query(url, db, q, user, pwd)
+                if err or not resp:
+                    continue
                 try:
-                    query = (
-                        f'from(bucket:"{bucket}") '
-                        f'|> range(start: -60d) '
-                        f'|> filter(fn:(r) => r["entity_id"] == "{entity_id}") '
-                        f'|> count() '
-                        f'|> yield(name:"count")'
-                    )
-                    tables = qapi.query(query, org=org)
-                    total = sum(
-                        r.get_value()
-                        for t in tables
-                        for r in t.records
-                        if isinstance(r.get_value(), (int, float))
-                    )
-                    if total > 0:
-                        samples[entity_id] = int(total)
-                except Exception:
+                    count = resp["results"][0]["series"][0]["values"][0][1]
+                    if count:
+                        samples[entity_id] = int(count)
+                except (KeyError, IndexError, TypeError):
                     pass
-            client.close()
             source_ok    = True
             source_label = "influxdb"
-        except ImportError:
-            log.warning("influxdb-client not installed — falling back to HA recorder")
         except Exception as e:
             log.warning(f"InfluxDB quality check failed: {e}")
 

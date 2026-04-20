@@ -32,7 +32,8 @@ from flask import Flask, jsonify, request
 MODEL_FEATURE_VER = 2   # v2: continuous solar_proxy from elevation angle
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
-HOME_LAT = 40.67   # Guadarrama, Madrid — °N
+HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
+HOME_LON = -4.00   # Guadarrama, Madrid — °E (fallback)
 
 # ── Solar correction factor cache ─────────────────────────────────────────────
 _solar_correction_cache: tuple | None = None   # (factor, datetime)
@@ -44,6 +45,7 @@ DECISIONS_FILE = DATA_DIR / "decisions.json"
 SAVINGS_FILE   = DATA_DIR / "savings.json"
 TARIFF_FILE    = DATA_DIR / "tariff.json"
 SETUP_FILE     = DATA_DIR / "setup.json"
+WIZARD_FILE    = DATA_DIR / "wizard_config.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -89,6 +91,42 @@ def cfg(key: str, default=None):
     if key in _SETUP:
         return _SETUP[key]
     return OPT.get(key, default)
+
+# ── Wizard config (from GUI wizard — stored in /data/wizard_config.json) ──────
+_WIZARD: dict = {}
+
+def _load_wizard_cache():
+    global _WIZARD
+    if WIZARD_FILE.exists():
+        try:
+            _WIZARD = json.loads(WIZARD_FILE.read_text())
+        except Exception:
+            _WIZARD = {}
+    else:
+        _WIZARD = {}
+
+def save_wizard(data: dict):
+    global _WIZARD
+    _WIZARD.update(data)
+    WIZARD_FILE.write_text(json.dumps(_WIZARD, indent=2))
+    log.info("Wizard configuration saved")
+
+def _wiz(role: str, legacy_cfg_key: str = None, legacy_default=None):
+    """3-tier fallback: wizard_config.json > setup.json/options.json > hardcoded default."""
+    sensors = _WIZARD.get("sensors", {})
+    if role in sensors and sensors[role]:
+        return sensors[role]
+    if legacy_cfg_key:
+        return cfg(legacy_cfg_key, legacy_default)
+    return legacy_default
+
+def _home_lat() -> float:
+    loc = _WIZARD.get("location", {})
+    return float(loc.get("latitude") or HOME_LAT)
+
+def _home_lon() -> float:
+    loc = _WIZARD.get("location", {})
+    return float(loc.get("longitude") or HOME_LON)
 
 # ── HA Client ────────────────────────────────────────────────────────────────
 HA_BASE  = "http://supervisor/core"
@@ -325,6 +363,83 @@ def get_sun_status() -> dict:
         }
     hour = datetime.now().hour
     return {"is_day": 8 <= hour <= 20, "elevation": None, "source": "fallback"}
+
+# ── Entity discovery ─────────────────────────────────────────────────────────
+ROLE_HINTS = {
+    "grid_power":          {"domains":["sensor"],"device_class":["power"],"units":["W","kW"],"keywords":["grid","acometida","net","meter","import","export","red"]},
+    "solar_power":         {"domains":["sensor"],"device_class":["power"],"units":["W","kW"],"keywords":["solar","pv","placas","inverter","photovoltaic","panels","produccion"]},
+    "battery_soc":         {"domains":["sensor"],"device_class":["battery"],"units":["%"],"keywords":["soc","battery","bateria","capacity","charge","estado"]},
+    "battery_power":       {"domains":["sensor"],"device_class":["power"],"units":["W","kW"],"keywords":["battery","bateria","charge","discharge","luna","storage"]},
+    "temp_outdoor":        {"domains":["sensor"],"device_class":["temperature"],"units":["°C","°F"],"keywords":["outdoor","outside","exterior","outside_temp","outsidetemp","ambient","exterior"]},
+    "temp_indoor":         {"domains":["sensor"],"device_class":["temperature"],"units":["°C","°F"],"keywords":["indoor","interior","room","salon","living","home","temperatura"]},
+    "solar_fc_today":      {"domains":["sensor"],"device_class":["energy"],"units":["kWh"],"keywords":["today","hoy","production_today","forecast_today","solar_today"]},
+    "solar_fc_tomorrow":   {"domains":["sensor"],"device_class":["energy"],"units":["kWh"],"keywords":["tomorrow","manana","production_tomorrow","forecast_tomorrow"]},
+    "solar_fc_h0":         {"domains":["sensor"],"device_class":["energy","power"],"units":["kWh","W"],"keywords":["current_hour","esta_hora","h0","energy_now","forecast_hour"]},
+    "solar_fc_h1":         {"domains":["sensor"],"device_class":["energy","power"],"units":["kWh","W"],"keywords":["next_hour","proxima_hora","h1","energy_next"]},
+    "weather":             {"domains":["weather"],"device_class":[],"units":[],"keywords":["aemet","openweather","weather","tiempo","forecast"]},
+    "battery_mode_select": {"domains":["select"],"device_class":[],"units":[],"keywords":["battery","working_mode","bateria","luna","storage","mode"]},
+    "battery_cutoff_soc":  {"domains":["number"],"device_class":[],"units":["%"],"keywords":["cutoff","corte","charge_cutoff","grid_charge","soc"]},
+    "battery_backup_soc":  {"domains":["number"],"device_class":[],"units":["%"],"keywords":["backup","reserva","minimum","minimo","reserve"]},
+    "battery_charge_power":{"domains":["number"],"device_class":["power"],"units":["W","kW"],"keywords":["charge_power","charging_power","potencia_carga"]},
+    "battery_force_charge":{"domains":["switch","button"],"device_class":[],"units":[],"keywords":["force_charge","forzar","force","forced"]},
+    "pool_switch":         {"domains":["switch"],"device_class":[],"units":[],"keywords":["pool","piscina","pump","bomba","depuradora","filtro"]},
+    "pool_cleaner":        {"domains":["switch"],"device_class":[],"units":[],"keywords":["cleaner","limpiafondos","limpia","robot","vacuum"]},
+    "pool_hours_day":      {"domains":["sensor"],"device_class":["duration"],"units":["h","min"],"keywords":["pool","piscina","hours","horas","encendida","runtime"]},
+    "hvac_mode":           {"domains":["climate","select","input_select"],"device_class":[],"units":[],"keywords":["hvac","clima","aerotermia","heat_pump","bomba_calor","ebus","viessmann"]},
+    "hvac_temp_heat":      {"domains":["number","input_number"],"device_class":["temperature"],"units":["°C"],"keywords":["heat","calor","heating","setpoint","consigna","target"]},
+    "hvac_temp_cool":      {"domains":["number","input_number"],"device_class":["temperature"],"units":["°C"],"keywords":["cool","frio","cooling","setpoint","consigna","target"]},
+    "dishwasher_state":    {"domains":["sensor"],"device_class":[],"units":[],"keywords":["dishwasher","lavavajillas","washer","machine","operation","estado"]},
+    "ev_charger":          {"domains":["switch","number"],"device_class":[],"units":["A","W"],"keywords":["ev","car","coche","charger","cargador","wallbox","zappi","ocpp"]},
+}
+
+def _score_entity(state: dict, role: str) -> int:
+    hints = ROLE_HINTS.get(role, {})
+    entity_id = state.get("entity_id", "")
+    domain = entity_id.split(".")[0] if "." in entity_id else ""
+    attrs = state.get("attributes", {})
+    dc = attrs.get("device_class", "")
+    unit = attrs.get("unit_of_measurement", "")
+    name_lower = (attrs.get("friendly_name", "") + " " + entity_id).lower()
+    score = 0
+    if hints.get("domains") and domain not in hints["domains"]:
+        return 0
+    if dc and hints.get("device_class") and dc in hints["device_class"]:
+        score += 50
+    if unit and hints.get("units") and unit in hints["units"]:
+        score += 40
+    for kw in hints.get("keywords", []):
+        if kw.lower() in name_lower:
+            score += 25
+    return score
+
+def get_entity_candidates(role: str, all_states: list, top_n: int = 8) -> list:
+    """Return top_n scored entity candidates for a given role."""
+    scored = []
+    for state in all_states:
+        s = _score_entity(state, role)
+        if s > 0:
+            attrs = state.get("attributes", {})
+            scored.append({
+                "entity_id": state.get("entity_id"),
+                "name": attrs.get("friendly_name", state.get("entity_id")),
+                "state": state.get("state"),
+                "unit": attrs.get("unit_of_measurement", ""),
+                "device_class": attrs.get("device_class", ""),
+                "score": s,
+            })
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_n]
+
+def get_entities_by_domain(domain: str, all_states: list) -> list:
+    return [
+        {
+            "entity_id": s.get("entity_id"),
+            "name": s.get("attributes", {}).get("friendly_name", s.get("entity_id")),
+            "state": s.get("state"),
+        }
+        for s in all_states
+        if s.get("entity_id", "").startswith(domain + ".")
+    ]
 
 # ── Solar geometry & correction ──────────────────────────────────────────────
 def _solar_proxy_for_hour(hour: int, month: int) -> float:
@@ -1106,6 +1221,7 @@ PANEL = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Energy Optimizer</title>
+<link href="https://fonts.googleapis.com/css2?family=Bangers&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#0f172a;--s:#1e293b;--b:#334155;--a:#38bdf8;--g:#4ade80;--y:#fbbf24;--r:#f87171;--o:#fb923c;--t:#e2e8f0;--m:#94a3b8;--p:#a78bfa}
@@ -1211,16 +1327,67 @@ th{color:var(--m);font-weight:500}
 .forecast-day .ftemp{color:var(--t);font-weight:600}
 .forecast-day .fmin{color:var(--m)}
 .storm-alert-w{background:rgba(248,113,113,.12);border:1px solid var(--r);color:var(--r);padding:.4rem .8rem;border-radius:.5rem;font-size:.78rem;font-weight:700;margin-bottom:.7rem}
+/* ── Wizard comic style ──────────────────────────────────────────────────── */
+.wiz-wrap{max-width:740px;margin:0 auto}
+.wiz-header{font-family:'Bangers',cursive;font-size:2.2rem;color:#fbbf24;text-shadow:3px 3px 0 #0f172a,-1px -1px 0 #0f172a;letter-spacing:.04em;margin-bottom:.3rem}
+.wiz-subtitle{font-size:.82rem;color:var(--m);margin-bottom:1.2rem}
+.wiz-steps{display:flex;gap:.3rem;margin-bottom:1.5rem;overflow-x:auto;padding-bottom:.3rem}
+.wiz-step-dot{display:flex;flex-direction:column;align-items:center;gap:.2rem;min-width:60px;cursor:pointer}
+.wiz-step-dot .dot{width:32px;height:32px;border-radius:50%;border:3px solid var(--b);background:var(--s);display:flex;align-items:center;justify-content:center;font-size:.85rem;font-weight:700;transition:.2s;color:var(--m)}
+.wiz-step-dot.done .dot{background:rgba(74,222,128,.2);border-color:var(--g);color:var(--g)}
+.wiz-step-dot.active .dot{background:rgba(251,191,36,.2);border-color:var(--y);color:var(--y);box-shadow:0 0 0 3px rgba(251,191,36,.15)}
+.wiz-step-dot .dot-lbl{font-size:.58rem;color:var(--m);text-align:center;max-width:60px;line-height:1.2}
+.wiz-step-dot.done .dot-lbl,.wiz-step-dot.active .dot-lbl{color:var(--t)}
+.wiz-pane{display:none}.wiz-pane.active{display:block}
+.wiz-card{background:var(--s);border:3px solid var(--b);border-radius:1rem;box-shadow:4px 4px 0 var(--b);padding:1.2rem;margin-bottom:1rem;position:relative}
+.wiz-card-title{font-family:'Bangers',cursive;font-size:1.35rem;color:var(--a);letter-spacing:.03em;margin-bottom:.8rem;display:flex;align-items:center;gap:.4rem}
+.wiz-robot{position:absolute;top:-14px;right:12px;font-size:1.8rem;filter:drop-shadow(2px 2px 0 var(--b))}
+.bubble{background:#fffef0;color:#1e293b;border:3px solid #1e293b;border-radius:1rem;padding:.6rem .9rem;font-size:.8rem;line-height:1.5;margin-bottom:1rem;position:relative;box-shadow:3px 3px 0 #1e293b}
+.bubble::after{content:"";position:absolute;bottom:-14px;left:20px;border:7px solid transparent;border-top-color:#1e293b}
+.bubble::before{content:"";position:absolute;bottom:-11px;left:21px;border:6px solid transparent;border-top-color:#fffef0;z-index:1}
+.entity-picker{background:var(--bg);border:2px solid var(--b);border-radius:.6rem;padding:.7rem;margin-bottom:.7rem}
+.entity-picker-label{font-size:.72rem;color:var(--m);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.4rem;display:flex;align-items:center;justify-content:space-between}
+.entity-picker-label span{color:var(--g);font-size:.65rem}
+.entity-select{width:100%;background:var(--b);border:1px solid #475569;border-radius:.4rem;padding:.4rem .6rem;color:var(--t);font-size:.82rem;margin-bottom:.35rem}
+.entity-cands{display:flex;flex-wrap:wrap;gap:.3rem;margin-top:.25rem}
+.entity-cand{background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.3);color:var(--a);padding:.2rem .55rem;border-radius:.3rem;font-size:.7rem;cursor:pointer;transition:.15s}
+.entity-cand:hover{background:rgba(56,189,248,.2);border-color:var(--a)}
+.entity-cand.best{background:rgba(74,222,128,.12);border-color:var(--g);color:var(--g)}
+.entity-state{font-size:.68rem;color:var(--m);margin-top:.15rem}
+.hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.7rem;margin-bottom:1rem}
+.hw-card{background:var(--bg);border:3px solid var(--b);border-radius:.8rem;padding:.8rem;cursor:pointer;transition:.15s;box-shadow:3px 3px 0 var(--b);text-align:center}
+.hw-card:hover{border-color:var(--a);box-shadow:3px 3px 0 var(--a)}
+.hw-card.selected{border-color:var(--g);box-shadow:3px 3px 0 var(--g);background:rgba(74,222,128,.06)}
+.hw-card .hw-icon{font-size:2rem;margin-bottom:.3rem}
+.hw-card .hw-name{font-size:.78rem;font-weight:600;color:var(--t)}
+.hw-card .hw-desc{font-size:.65rem;color:var(--m);margin-top:.15rem}
+.wiz-nav{display:flex;justify-content:space-between;align-items:center;margin-top:1rem;gap:.5rem}
+.wiz-progress{font-size:.72rem;color:var(--m)}
+.comic-btn{font-family:'Bangers',cursive;font-size:1.1rem;letter-spacing:.05em;padding:.5rem 1.4rem;border:3px solid #1e293b;border-radius:.6rem;box-shadow:3px 3px 0 #1e293b;cursor:pointer;transition:.1s transform,.1s box-shadow}
+.comic-btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 #1e293b}
+.comic-btn.next{background:#fbbf24;color:#1e293b}
+.comic-btn.back{background:var(--s);color:var(--t)}
+.comic-btn.save{background:#4ade80;color:#0f172a}
+.wiz-loc-row{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-bottom:.7rem}
+.wiz-field label{font-size:.72rem;color:var(--m);display:block;margin-bottom:.2rem}
+.wiz-field input{width:100%;background:var(--b);border:2px solid #475569;border-radius:.4rem;padding:.4rem .6rem;color:var(--t);font-size:.85rem}
+.wiz-field input:focus{outline:none;border-color:var(--a)}
+.summary-table{width:100%;border-collapse:collapse;font-size:.8rem}
+.summary-table td{padding:.4rem .5rem;border-bottom:1px solid var(--b)}
+.summary-table td:first-child{color:var(--m);width:40%}
+.summary-table td:last-child{color:var(--t);font-weight:600}
+.wiz-done-icon{font-size:3rem;text-align:center;margin:1rem 0}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v2.6.4</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v3.0.0</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
-  <button class="tab active" onclick="showTab('dashboard')">📊 Dashboard</button>
-  <button class="tab" onclick="showTab('charts')">📈 Charts</button>
-  <button class="tab" onclick="showTab('tariff')">⚡ Tariff</button>
-  <button class="tab" onclick="showTab('setup')">⚙️ Setup</button>
+  <button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
+  <button class="tab" onclick="showTab('charts')">Charts</button>
+  <button class="tab" onclick="showTab('tariff')">Tariff</button>
+  <button class="tab" onclick="showTab('setup')">Setup</button>
+  <button class="tab" onclick="showTab('wizard')" style="color:#fbbf24">Wizard</button>
 </div>
 
 <!-- DASHBOARD -->
@@ -1389,6 +1556,242 @@ th{color:var(--m);font-weight:500}
   </div>
 </div>
 
+<!-- WIZARD -->
+<div id="tab-wizard" class="tab-content">
+  <div class="wiz-wrap">
+    <div class="wiz-header">Setup Wizard</div>
+    <div class="wiz-subtitle" id="wiz-sub">Configure your installation so the optimizer knows your hardware</div>
+    <div class="wiz-steps" id="wiz-dots"></div>
+
+    <!-- Step 0: Location -->
+    <div class="wiz-pane active" id="wiz-pane-0">
+      <div class="bubble">Hey! I'm Bolt, your energy assistant. Let me help you configure everything in a few quick steps. First — where is your home?</div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">📍 Location</div>
+        <div class="wiz-robot">🤖</div>
+        <div class="wiz-loc-row">
+          <div class="wiz-field"><label>Latitude</label><input type="number" id="wiz-lat" step="0.0001" placeholder="40.4168"></div>
+          <div class="wiz-field"><label>Longitude</label><input type="number" id="wiz-lon" step="0.0001" placeholder="-3.7038"></div>
+        </div>
+        <div class="wiz-field" style="margin-bottom:.7rem"><label>Timezone</label>
+          <input type="text" id="wiz-tz" placeholder="Europe/Madrid">
+        </div>
+        <button class="btn btn-sm" onclick="wizDetectLocation()" style="margin-bottom:.5rem">🔍 Auto-detect from Home Assistant</button>
+        <div id="wiz-loc-status" style="font-size:.72rem;color:var(--m);margin-top:.3rem"></div>
+      </div>
+      <div class="wiz-nav">
+        <span class="wiz-progress">Step 1 of 7</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 1: Grid -->
+    <div class="wiz-pane" id="wiz-pane-1">
+      <div class="bubble">Great! Now let's find your grid connection sensor — this measures what you import/export from the utility.</div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">⚡ Grid Power Meter</div>
+        <div class="wiz-robot">🤖</div>
+        <div class="entity-picker">
+          <div class="entity-picker-label">Grid power sensor (W, positive = import) <span id="wiz-grid-score"></span></div>
+          <input class="entity-select" id="wiz-grid-entity" placeholder="sensor.grid_power" oninput="wizEntityTyped('grid_power','wiz-grid-entity')">
+          <div id="wiz-grid-cands" class="entity-cands"></div>
+          <div id="wiz-grid-state" class="entity-state"></div>
+        </div>
+        <div style="font-size:.72rem;color:var(--m)">Sign convention: negative = importing from grid, positive = exporting. Set to match your meter.</div>
+        <div style="margin-top:.7rem">
+          <label style="font-size:.72rem;color:var(--m);display:flex;align-items:center;gap:.5rem">
+            <input type="checkbox" id="wiz-grid-flip" style="accent-color:var(--a)"> Flip sign (multiply by -1)
+          </label>
+        </div>
+      </div>
+      <div class="wiz-nav">
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 2 of 7</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Solar -->
+    <div class="wiz-pane" id="wiz-pane-2">
+      <div class="bubble">Do you have solar panels? Let's find the production sensors and forecast data.</div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">☀️ Solar</div>
+        <div class="wiz-robot">🤖</div>
+        <div class="entity-picker">
+          <div class="entity-picker-label">Solar production (W, real-time)</div>
+          <input class="entity-select" id="wiz-solar-entity" placeholder="sensor.solar_power" oninput="wizEntityTyped('solar_power','wiz-solar-entity')">
+          <div id="wiz-solar-cands" class="entity-cands"></div>
+          <div id="wiz-solar-state" class="entity-state"></div>
+        </div>
+        <div class="entity-picker">
+          <div class="entity-picker-label">Forecast — today (kWh) <span style="color:var(--m);font-size:.65rem">Forecast.Solar / Solcast</span></div>
+          <input class="entity-select" id="wiz-fc-today" placeholder="sensor.energy_production_today" oninput="wizEntityTyped('solar_fc_today','wiz-fc-today')">
+          <div id="wiz-fc-today-cands" class="entity-cands"></div>
+        </div>
+        <div class="entity-picker">
+          <div class="entity-picker-label">Forecast — tomorrow (kWh)</div>
+          <input class="entity-select" id="wiz-fc-tomorrow" placeholder="sensor.energy_production_tomorrow">
+          <div id="wiz-fc-tomorrow-cands" class="entity-cands"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+          <div class="entity-picker">
+            <div class="entity-picker-label">Forecast — current hour</div>
+            <input class="entity-select" id="wiz-fc-h0" placeholder="sensor.energy_current_hour">
+            <div id="wiz-fc-h0-cands" class="entity-cands"></div>
+          </div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Forecast — next hour</div>
+            <input class="entity-select" id="wiz-fc-h1" placeholder="sensor.energy_next_hour">
+            <div id="wiz-fc-h1-cands" class="entity-cands"></div>
+          </div>
+        </div>
+        <div style="font-size:.72rem;color:var(--m);margin-top:.5rem">Forecast sensors are optional but improve charging decisions.</div>
+      </div>
+      <div class="wiz-nav">
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 3 of 7</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Battery -->
+    <div class="wiz-pane" id="wiz-pane-3">
+      <div class="bubble">Battery storage is where the magic happens! Let's map your battery sensors and controls.</div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">🔋 Battery</div>
+        <div class="wiz-robot">🤖</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+          <div class="entity-picker">
+            <div class="entity-picker-label">State of charge (%)</div>
+            <input class="entity-select" id="wiz-batt-soc" placeholder="sensor.battery_state_of_capacity" oninput="wizEntityTyped('battery_soc','wiz-batt-soc')">
+            <div id="wiz-batt-soc-cands" class="entity-cands"></div>
+            <div id="wiz-batt-soc-state" class="entity-state"></div>
+          </div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Power (W, negative=charging)</div>
+            <input class="entity-select" id="wiz-batt-power" placeholder="sensor.battery_charge_discharge_power" oninput="wizEntityTyped('battery_power','wiz-batt-power')">
+            <div id="wiz-batt-power-cands" class="entity-cands"></div>
+          </div>
+        </div>
+        <div style="font-size:.75rem;color:var(--a);font-weight:600;margin:.7rem 0 .4rem">Control entities (Huawei Luna2000 / SolarEdge / generic)</div>
+        <div class="entity-picker">
+          <div class="entity-picker-label">Working mode select</div>
+          <input class="entity-select" id="wiz-batt-mode" placeholder="select.battery_working_mode" oninput="wizEntityTyped('battery_mode_select','wiz-batt-mode')">
+          <div id="wiz-batt-mode-cands" class="entity-cands"></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem">
+          <div class="entity-picker">
+            <div class="entity-picker-label">Charge cutoff SOC</div>
+            <input class="entity-select" id="wiz-batt-cutoff" placeholder="number.battery_grid_charge_cutoff_soc">
+            <div id="wiz-batt-cutoff-cands" class="entity-cands"></div>
+          </div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Backup SOC</div>
+            <input class="entity-select" id="wiz-batt-backup" placeholder="number.battery_backup_soc">
+            <div id="wiz-batt-backup-cands" class="entity-cands"></div>
+          </div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Force charge switch</div>
+            <input class="entity-select" id="wiz-batt-force" placeholder="switch.battery_force_charge">
+            <div id="wiz-batt-force-cands" class="entity-cands"></div>
+          </div>
+        </div>
+        <div style="margin-top:.6rem">
+          <label style="font-size:.72rem;color:var(--m)">Battery capacity (kWh)</label>
+          <input type="number" id="wiz-batt-cap" value="10" min="1" max="100" step="0.5" style="width:100px;background:var(--b);border:2px solid #475569;border-radius:.4rem;padding:.35rem .5rem;color:var(--t);font-size:.85rem;margin-top:.2rem">
+        </div>
+      </div>
+      <div class="wiz-nav">
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 4 of 7</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 4: Loads -->
+    <div class="wiz-pane" id="wiz-pane-4">
+      <div class="bubble">Which devices do you want me to manage? Select all that apply, then I'll find the right entities.</div>
+      <div class="hw-grid" id="wiz-hw-grid">
+        <div class="hw-card selected" data-hw="hvac" onclick="wizToggleHw(this)">
+          <div class="hw-icon">🌡️</div>
+          <div class="hw-name">Heat Pump</div>
+          <div class="hw-desc">Aerotermia / HVAC</div>
+        </div>
+        <div class="hw-card selected" data-hw="pool" onclick="wizToggleHw(this)">
+          <div class="hw-icon">🏊</div>
+          <div class="hw-name">Pool</div>
+          <div class="hw-desc">Filter pump + cleaner</div>
+        </div>
+        <div class="hw-card" data-hw="ev" onclick="wizToggleHw(this)">
+          <div class="hw-icon">🚗</div>
+          <div class="hw-name">EV Charger</div>
+          <div class="hw-desc">Wallbox / OCPP</div>
+        </div>
+        <div class="hw-card" data-hw="dishwasher" onclick="wizToggleHw(this)">
+          <div class="hw-icon">🍽️</div>
+          <div class="hw-name">Dishwasher</div>
+          <div class="hw-desc">Delay start</div>
+        </div>
+      </div>
+      <div id="wiz-loads-entities"></div>
+      <div class="wiz-nav">
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 5 of 7</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 5: Tariff -->
+    <div class="wiz-pane" id="wiz-pane-5">
+      <div class="bubble">Tell me about your electricity contract. I'll optimize charging around your pricing periods.</div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">💶 Electricity Tariff</div>
+        <div class="wiz-robot">🤖</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-bottom:.8rem">
+          <div class="wiz-field"><label>Contracted power (kW)</label>
+            <input type="number" id="wiz-contracted-kw" value="5.75" step="0.25" min="1" max="30">
+          </div>
+          <div class="wiz-field"><label>Country / tariff type</label>
+            <select id="wiz-tariff-type" class="entity-select" style="margin-bottom:0">
+              <option value="es_2td">Spain 2.0TD</option>
+              <option value="es_pvpc">Spain PVPC (dynamic)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+        </div>
+        <div style="font-size:.72rem;color:var(--m)">Peak / valley schedule can be fine-tuned in the Tariff tab after setup.</div>
+        <div style="margin-top:.8rem">
+          <label style="font-size:.72rem;color:var(--m)">Weather entity (for storm protection)</label>
+          <input class="entity-select" id="wiz-weather" placeholder="weather.aemet" oninput="wizEntityTyped('weather','wiz-weather')" style="margin-top:.3rem">
+          <div id="wiz-weather-cands" class="entity-cands" style="margin-top:.3rem"></div>
+        </div>
+      </div>
+      <div class="wiz-nav">
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 6 of 7</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 6: Summary + Save -->
+    <div class="wiz-pane" id="wiz-pane-6">
+      <div class="bubble">Looking great! Here's a summary of your configuration. Hit Save to activate!</div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">📋 Summary</div>
+        <div class="wiz-robot">🤖</div>
+        <table class="summary-table" id="wiz-summary-table"></table>
+        <div id="wiz-save-status" style="font-size:.78rem;margin-top:.8rem;color:var(--m)"></div>
+      </div>
+      <div class="wiz-nav">
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 7 of 7</span>
+        <button class="comic-btn save" onclick="wizSave()">Save &amp; Activate</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
 <script>
 const BASE = "__BASE__";
 
@@ -1401,6 +1804,7 @@ function showTab(name) {
   if (name==='charts') loadCharts();
   if (name==='tariff') loadTariff();
   if (name==='setup')  loadSetup();
+  if (name==='wizard') loadWizard();
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -1853,6 +2257,338 @@ async function loadWeather(){
       ${fcHtml?`<div class="forecast-row">${fcHtml}</div>`:''}
     </div>`;
   }catch(e){box.innerHTML='';}
+}
+
+// ── Wizard ───────────────────────────────────────────────────────────────────
+const WIZ_STEPS = ['Location','Grid','Solar','Battery','Loads','Tariff','Summary'];
+let wizStep = 0;
+let wizEntities = [];
+let wizCfg = {location:{}, sensors:{}, hardware:['hvac','pool'], tariff:{}, battery_capacity_kwh:10};
+
+async function loadWizard() {
+  // Load existing wizard config
+  try {
+    const r = await fetch(BASE+'/api/wizard/config').then(r=>r.json());
+    if (r.sensors) wizCfg = Object.assign(wizCfg, r);
+    _wizPopulateFields();
+  } catch(e) {}
+  // Load all HA entities for auto-detection
+  try {
+    const r = await fetch(BASE+'/api/ha/entities').then(r=>r.json());
+    wizEntities = r.entities || [];
+  } catch(e) { wizEntities = []; }
+  wizRenderDots();
+  wizGoTo(wizStep);
+  // Auto-show candidates for current step
+  _wizShowAllCands();
+}
+
+function wizRenderDots() {
+  document.getElementById('wiz-dots').innerHTML = WIZ_STEPS.map((lbl,i) =>
+    `<div class="wiz-step-dot ${i<wizStep?'done':i===wizStep?'active':''}" onclick="wizGoTo(${i})">
+      <div class="dot">${i<wizStep?'✓':(i+1)}</div>
+      <div class="dot-lbl">${lbl}</div>
+    </div>`
+  ).join('');
+}
+
+function wizGoTo(step) {
+  document.querySelectorAll('.wiz-pane').forEach(p=>p.classList.remove('active'));
+  document.getElementById('wiz-pane-'+step).classList.add('active');
+  wizStep = step;
+  wizRenderDots();
+  _wizShowAllCands();
+}
+
+function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); if(wizStep===WIZ_STEPS.length-1) wizBuildSummary(); }
+function wizBack() { if(wizStep > 0) wizGoTo(wizStep-1); }
+
+async function wizDetectLocation() {
+  document.getElementById('wiz-loc-status').textContent = 'Detecting...';
+  try {
+    const r = await fetch(BASE+'/api/ha/location').then(r=>r.json());
+    if (r.latitude) { document.getElementById('wiz-lat').value = r.latitude; wizCfg.location.latitude = r.latitude; }
+    if (r.longitude) { document.getElementById('wiz-lon').value = r.longitude; wizCfg.location.longitude = r.longitude; }
+    if (r.time_zone) { document.getElementById('wiz-tz').value = r.time_zone; wizCfg.location.timezone = r.time_zone; }
+    document.getElementById('wiz-loc-status').textContent = r.latitude ? '✓ Location loaded from Home Assistant' : 'Not found in HA config';
+  } catch(e) { document.getElementById('wiz-loc-status').textContent = 'Error contacting HA'; }
+}
+
+function wizEntityTyped(role, inputId) {
+  const val = document.getElementById(inputId).value.trim();
+  wizCfg.sensors[role] = val;
+  // Show live state
+  const stateEl = document.getElementById(inputId.replace('wiz-','wiz-').replace('-entity','').replace('-power','').replace('-soc','') + '-state');
+  if (stateEl && val) {
+    const ent = wizEntities.find(e=>e.entity_id===val);
+    stateEl.textContent = ent ? `Current: ${ent.state} ${ent.unit||''}` : '';
+  }
+}
+
+function _wizShowAllCands() {
+  const stepRoles = [
+    [],
+    ['grid_power'],
+    ['solar_power','solar_fc_today','solar_fc_tomorrow','solar_fc_h0','solar_fc_h1'],
+    ['battery_soc','battery_power','battery_mode_select','battery_cutoff_soc','battery_backup_soc','battery_force_charge'],
+    ['temp_outdoor','temp_indoor','hvac_mode','hvac_temp_heat','hvac_temp_cool','pool_switch','pool_cleaner','dishwasher_state','ev_charger'],
+    ['weather'],
+    []
+  ];
+  const roleMappings = {
+    'grid_power':          {inputId:'wiz-grid-entity',   candsId:'wiz-grid-cands',       stateId:'wiz-grid-state'},
+    'solar_power':         {inputId:'wiz-solar-entity',  candsId:'wiz-solar-cands',      stateId:'wiz-solar-state'},
+    'solar_fc_today':      {inputId:'wiz-fc-today',      candsId:'wiz-fc-today-cands',   stateId:null},
+    'solar_fc_tomorrow':   {inputId:'wiz-fc-tomorrow',   candsId:'wiz-fc-tomorrow-cands',stateId:null},
+    'solar_fc_h0':         {inputId:'wiz-fc-h0',         candsId:'wiz-fc-h0-cands',      stateId:null},
+    'solar_fc_h1':         {inputId:'wiz-fc-h1',         candsId:'wiz-fc-h1-cands',      stateId:null},
+    'battery_soc':         {inputId:'wiz-batt-soc',      candsId:'wiz-batt-soc-cands',   stateId:'wiz-batt-soc-state'},
+    'battery_power':       {inputId:'wiz-batt-power',    candsId:'wiz-batt-power-cands', stateId:null},
+    'battery_mode_select': {inputId:'wiz-batt-mode',     candsId:'wiz-batt-mode-cands',  stateId:null},
+    'battery_cutoff_soc':  {inputId:'wiz-batt-cutoff',   candsId:'wiz-batt-cutoff-cands',stateId:null},
+    'battery_backup_soc':  {inputId:'wiz-batt-backup',   candsId:'wiz-batt-backup-cands',stateId:null},
+    'battery_force_charge':{inputId:'wiz-batt-force',    candsId:'wiz-batt-force-cands', stateId:null},
+    'weather':             {inputId:'wiz-weather',       candsId:'wiz-weather-cands',    stateId:null},
+  };
+  const roles = stepRoles[wizStep] || [];
+  roles.forEach(role => {
+    const m = roleMappings[role];
+    if (!m) return;
+    const inputEl = document.getElementById(m.inputId);
+    const candsEl = document.getElementById(m.candsId);
+    if (!inputEl || !candsEl) return;
+    // Pre-fill from saved config
+    if (!inputEl.value && wizCfg.sensors[role]) inputEl.value = wizCfg.sensors[role];
+    // Show candidates
+    _wizRenderCands(role, m.inputId, m.candsId, m.stateId);
+  });
+  if (wizStep === 4) wizRenderLoadsEntities();
+}
+
+function _wizRenderCands(role, inputId, candsId, stateId) {
+  const candsEl = document.getElementById(candsId);
+  if (!candsEl) return;
+  // Score entities client-side using simple keyword matching
+  const scored = _wizScoreEntities(role);
+  if (!scored.length) { candsEl.innerHTML = '<span style="font-size:.68rem;color:var(--m)">No candidates found</span>'; return; }
+  candsEl.innerHTML = scored.slice(0,5).map((e,i) =>
+    `<span class="entity-cand${i===0?' best':''}" onclick="_wizSelectCand('${e.entity_id}','${inputId}','${candsId}','${role}','${stateId||''}')">
+      ${i===0?'⭐ ':''}${e.name||e.entity_id}
+      <span style="font-size:.6rem;opacity:.7">${e.state||''} ${e.unit||''}</span>
+    </span>`
+  ).join('');
+}
+
+function _wizSelectCand(entityId, inputId, candsId, role, stateId) {
+  document.getElementById(inputId).value = entityId;
+  wizCfg.sensors[role] = entityId;
+  if (stateId) {
+    const ent = wizEntities.find(e=>e.entity_id===entityId);
+    const el = document.getElementById(stateId);
+    if (el && ent) el.textContent = `Current: ${ent.state} ${ent.unit||''}`;
+  }
+  // Highlight selected
+  document.querySelectorAll('#'+candsId+' .entity-cand').forEach(c=>{
+    c.style.background = c.textContent.includes(entityId) ? 'rgba(74,222,128,.2)' : '';
+  });
+}
+
+const WIZ_ROLE_HINTS = {
+  grid_power:         {kw:['grid','acometida','net','meter','import','red'],units:['W','kW'],dc:['power']},
+  solar_power:        {kw:['solar','pv','placas','inverter','photovoltaic','produccion'],units:['W','kW'],dc:['power']},
+  battery_soc:        {kw:['soc','battery','bateria','capacity','charge'],units:['%'],dc:['battery']},
+  battery_power:      {kw:['battery','bateria','charge','discharge','luna','storage'],units:['W','kW'],dc:['power']},
+  solar_fc_today:     {kw:['today','hoy','production_today','forecast_today'],units:['kWh'],dc:['energy']},
+  solar_fc_tomorrow:  {kw:['tomorrow','manana','production_tomorrow'],units:['kWh'],dc:['energy']},
+  solar_fc_h0:        {kw:['current_hour','esta_hora','energy_now'],units:['kWh','W'],dc:['energy','power']},
+  solar_fc_h1:        {kw:['next_hour','proxima','energy_next'],units:['kWh','W'],dc:['energy','power']},
+  battery_mode_select:{kw:['working_mode','battery','luna','mode'],units:[],dc:[]},
+  battery_cutoff_soc: {kw:['cutoff','grid_charge','charge_cutoff'],units:['%'],dc:[]},
+  battery_backup_soc: {kw:['backup','reserva','minimum'],units:['%'],dc:[]},
+  battery_force_charge:{kw:['force_charge','forzar','forced'],units:[],dc:[]},
+  temp_outdoor:       {kw:['outdoor','outside','exterior','outsidetemp'],units:['C','F'],dc:['temperature']},
+  temp_indoor:        {kw:['indoor','salon','room','living','temperatura'],units:['C','F'],dc:['temperature']},
+  hvac_mode:          {kw:['hvac','clima','aerotermia','heat_pump','ebus'],units:[],dc:[]},
+  hvac_temp_heat:     {kw:['heat','calor','heating','setpoint'],units:['C'],dc:['temperature']},
+  hvac_temp_cool:     {kw:['cool','frio','cooling','setpoint'],units:['C'],dc:['temperature']},
+  pool_switch:        {kw:['pool','piscina','pump','depuradora','filtro'],units:[],dc:[]},
+  pool_cleaner:       {kw:['cleaner','limpiafondos','robot','vacuum'],units:[],dc:[]},
+  dishwasher_state:   {kw:['dishwasher','lavavajillas','operation'],units:[],dc:[]},
+  ev_charger:         {kw:['ev','car','coche','charger','wallbox','zappi'],units:['A','W'],dc:[]},
+  weather:            {kw:['aemet','openweather','weather','tiempo'],units:[],dc:[]},
+};
+
+function _wizScoreEntities(role) {
+  const hints = WIZ_ROLE_HINTS[role] || {kw:[],units:[],dc:[]};
+  return wizEntities.map(e => {
+    let score = 0;
+    const id = (e.entity_id||'').toLowerCase();
+    const name = (e.name||'').toLowerCase();
+    const combined = id + ' ' + name;
+    hints.kw.forEach(k => { if(combined.includes(k.toLowerCase())) score += 25; });
+    if (hints.dc.length && hints.dc.includes(e.device_class)) score += 50;
+    if (hints.units.length && hints.units.some(u=>e.unit&&e.unit.includes(u))) score += 40;
+    return {...e, _score: score};
+  }).filter(e=>e._score>0).sort((a,b)=>b._score-a._score);
+}
+
+function wizToggleHw(card) {
+  card.classList.toggle('selected');
+  const hw = card.dataset.hw;
+  if (card.classList.contains('selected')) {
+    if (!wizCfg.hardware.includes(hw)) wizCfg.hardware.push(hw);
+  } else {
+    wizCfg.hardware = wizCfg.hardware.filter(h=>h!==hw);
+  }
+  wizRenderLoadsEntities();
+}
+
+function wizRenderLoadsEntities() {
+  const hw = wizCfg.hardware;
+  // Sync card visual state
+  document.querySelectorAll('.hw-card').forEach(c => {
+    c.classList.toggle('selected', hw.includes(c.dataset.hw));
+  });
+  const sections = [];
+  if (hw.includes('hvac')) sections.push(`
+    <div class="entity-picker"><div class="entity-picker-label">HVAC / Heat pump mode entity</div>
+      <input class="entity-select" id="wiz-hvac-mode" placeholder="climate.aerotermia" oninput="wizCfg.sensors.hvac_mode=this.value">
+      <div id="wiz-hvac-mode-cands" class="entity-cands"></div></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+      <div class="entity-picker"><div class="entity-picker-label">Heat setpoint (number)</div>
+        <input class="entity-select" id="wiz-hvac-heat" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.sensors.hvac_temp_heat=this.value">
+        <div id="wiz-hvac-heat-cands" class="entity-cands"></div></div>
+      <div class="entity-picker"><div class="entity-picker-label">Cool setpoint (number)</div>
+        <input class="entity-select" id="wiz-hvac-cool" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.sensors.hvac_temp_cool=this.value">
+        <div id="wiz-hvac-cool-cands" class="entity-cands"></div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.3rem">
+      <div class="entity-picker"><div class="entity-picker-label">Outdoor temp sensor</div>
+        <input class="entity-select" id="wiz-temp-out" placeholder="sensor.outdoor_temp" oninput="wizCfg.sensors.temp_outdoor=this.value">
+        <div id="wiz-temp-out-cands" class="entity-cands"></div></div>
+      <div class="entity-picker"><div class="entity-picker-label">Indoor temp sensor</div>
+        <input class="entity-select" id="wiz-temp-in" placeholder="sensor.indoor_temp" oninput="wizCfg.sensors.temp_indoor=this.value">
+        <div id="wiz-temp-in-cands" class="entity-cands"></div></div>
+    </div>`);
+  if (hw.includes('pool')) sections.push(`
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+      <div class="entity-picker"><div class="entity-picker-label">Pool pump switch</div>
+        <input class="entity-select" id="wiz-pool-sw" placeholder="switch.pool_pump" oninput="wizCfg.sensors.pool_switch=this.value">
+        <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
+      <div class="entity-picker"><div class="entity-picker-label">Pool cleaner switch (optional)</div>
+        <input class="entity-select" id="wiz-pool-cl" placeholder="switch.pool_cleaner" oninput="wizCfg.sensors.pool_cleaner=this.value">
+        <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
+    </div>`);
+  if (hw.includes('ev')) sections.push(`
+    <div class="entity-picker"><div class="entity-picker-label">EV charger entity</div>
+      <input class="entity-select" id="wiz-ev" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value">
+      <div id="wiz-ev-cands" class="entity-cands"></div></div>`);
+  if (hw.includes('dishwasher')) sections.push(`
+    <div class="entity-picker"><div class="entity-picker-label">Dishwasher state sensor</div>
+      <input class="entity-select" id="wiz-dw" placeholder="sensor.dishwasher_operation_state" oninput="wizCfg.sensors.dishwasher_state=this.value">
+      <div id="wiz-dw-cands" class="entity-cands"></div></div>`);
+  document.getElementById('wiz-loads-entities').innerHTML = sections.length
+    ? `<div class="wiz-card" style="margin-top:.7rem"><div class="wiz-card-title" style="font-size:1rem">Entity mapping</div>${sections.join('')}</div>`
+    : '';
+  // Render candidates for newly created inputs
+  setTimeout(() => {
+    [['hvac_mode','wiz-hvac-mode','wiz-hvac-mode-cands'],
+     ['hvac_temp_heat','wiz-hvac-heat','wiz-hvac-heat-cands'],
+     ['hvac_temp_cool','wiz-hvac-cool','wiz-hvac-cool-cands'],
+     ['temp_outdoor','wiz-temp-out','wiz-temp-out-cands'],
+     ['temp_indoor','wiz-temp-in','wiz-temp-in-cands'],
+     ['pool_switch','wiz-pool-sw','wiz-pool-sw-cands'],
+     ['pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands'],
+     ['ev_charger','wiz-ev','wiz-ev-cands'],
+     ['dishwasher_state','wiz-dw','wiz-dw-cands'],
+    ].forEach(([role,inp,cands]) => {
+      if (document.getElementById(inp)) _wizRenderCands(role,inp,cands,null);
+    });
+  }, 50);
+}
+
+function wizBuildSummary() {
+  const rows = [
+    ['Location', wizCfg.location.latitude ? `${wizCfg.location.latitude}, ${wizCfg.location.longitude}` : '—'],
+    ['Timezone', wizCfg.location.timezone || '—'],
+    ['Grid sensor', wizCfg.sensors.grid_power || '—'],
+    ['Solar sensor', wizCfg.sensors.solar_power || '—'],
+    ['Battery SOC', wizCfg.sensors.battery_soc || '—'],
+    ['Battery power', wizCfg.sensors.battery_power || '—'],
+    ['Battery mode', wizCfg.sensors.battery_mode_select || '—'],
+    ['Battery capacity', (wizCfg.battery_capacity_kwh||'—') + ' kWh'],
+    ['Hardware', wizCfg.hardware.join(', ') || '—'],
+    ['Weather entity', wizCfg.sensors.weather || '—'],
+    ['Contracted power', (wizCfg.tariff?.contracted_kw||'—') + ' kW'],
+  ];
+  document.getElementById('wiz-summary-table').innerHTML =
+    rows.map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  // Collect tariff data
+  wizCfg.tariff = wizCfg.tariff || {};
+  wizCfg.tariff.contracted_kw = parseFloat(document.getElementById('wiz-contracted-kw')?.value) || 5.75;
+  wizCfg.tariff.type = document.getElementById('wiz-tariff-type')?.value || 'es_2td';
+  // Location
+  wizCfg.location.latitude  = parseFloat(document.getElementById('wiz-lat')?.value) || null;
+  wizCfg.location.longitude = parseFloat(document.getElementById('wiz-lon')?.value) || null;
+  wizCfg.location.timezone  = document.getElementById('wiz-tz')?.value || null;
+  // Battery capacity
+  wizCfg.battery_capacity_kwh = parseFloat(document.getElementById('wiz-batt-cap')?.value) || 10;
+  // Grid flip
+  wizCfg.grid_flip = document.getElementById('wiz-grid-flip')?.checked || false;
+  // Re-render with final values
+  document.getElementById('wiz-summary-table').innerHTML =
+    rows.map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+}
+
+async function wizSave() {
+  wizBuildSummary();
+  document.getElementById('wiz-save-status').textContent = 'Saving...';
+  try {
+    const r = await fetch(BASE+'/api/wizard/config', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(wizCfg)
+    }).then(r=>r.json());
+    if (r.ok) {
+      document.getElementById('wiz-save-status').innerHTML =
+        '<span style="color:var(--g);font-size:1rem">✓ Configuration saved! The optimizer will use your new settings immediately.</span>';
+      notify('✓ Wizard configuration saved!', 'ok', 5000);
+    } else {
+      document.getElementById('wiz-save-status').textContent = 'Error: ' + (r.error||'unknown');
+    }
+  } catch(e) {
+    document.getElementById('wiz-save-status').textContent = 'Network error: ' + e.message;
+  }
+}
+
+function _wizPopulateFields() {
+  if (wizCfg.location) {
+    if (wizCfg.location.latitude)  document.getElementById('wiz-lat').value  = wizCfg.location.latitude;
+    if (wizCfg.location.longitude) document.getElementById('wiz-lon').value  = wizCfg.location.longitude;
+    if (wizCfg.location.timezone)  document.getElementById('wiz-tz').value   = wizCfg.location.timezone;
+  }
+  if (wizCfg.battery_capacity_kwh) {
+    const el = document.getElementById('wiz-batt-cap');
+    if (el) el.value = wizCfg.battery_capacity_kwh;
+  }
+  if (wizCfg.hardware) {
+    document.querySelectorAll('.hw-card').forEach(c => {
+      c.classList.toggle('selected', wizCfg.hardware.includes(c.dataset.hw));
+    });
+  }
+  const fieldMap = {
+    grid_power:'wiz-grid-entity', solar_power:'wiz-solar-entity',
+    solar_fc_today:'wiz-fc-today', solar_fc_tomorrow:'wiz-fc-tomorrow',
+    solar_fc_h0:'wiz-fc-h0', solar_fc_h1:'wiz-fc-h1',
+    battery_soc:'wiz-batt-soc', battery_power:'wiz-batt-power',
+    battery_mode_select:'wiz-batt-mode', battery_cutoff_soc:'wiz-batt-cutoff',
+    battery_backup_soc:'wiz-batt-backup', battery_force_charge:'wiz-batt-force',
+    weather:'wiz-weather',
+  };
+  Object.entries(fieldMap).forEach(([role,id]) => {
+    const el = document.getElementById(id);
+    if (el && wizCfg.sensors && wizCfg.sensors[role]) el.value = wizCfg.sensors[role];
+  });
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -2383,13 +3119,85 @@ def api_weather():
         "storm": is_storm_forecast(),
     })
 
+# ── Wizard / entity-discovery API endpoints ──────────────────────────────────
+@app.route("/api/ha/entities")
+def api_ha_entities():
+    role   = request.args.get("role")
+    domain = request.args.get("domain")
+    all_states = ha_get("/api/states") or []
+    if domain:
+        return jsonify({"entities": get_entities_by_domain(domain, all_states)})
+    # Return all entities with scores for every role, or a single role
+    if role and role in ROLE_HINTS:
+        cands = get_entity_candidates(role, all_states)
+        return jsonify({"entities": cands})
+    # No filter: return lightweight list of all entities for client-side scoring
+    entities = [
+        {
+            "entity_id":    s.get("entity_id"),
+            "name":         s.get("attributes", {}).get("friendly_name", s.get("entity_id")),
+            "state":        s.get("state"),
+            "unit":         s.get("attributes", {}).get("unit_of_measurement", ""),
+            "device_class": s.get("attributes", {}).get("device_class", ""),
+        }
+        for s in all_states
+    ]
+    return jsonify({"entities": entities})
+
+@app.route("/api/ha/location")
+def api_ha_location():
+    cfg_data = ha_get("/api/config") or {}
+    return jsonify({
+        "latitude":  cfg_data.get("latitude"),
+        "longitude": cfg_data.get("longitude"),
+        "time_zone": cfg_data.get("time_zone"),
+        "elevation": cfg_data.get("elevation"),
+    })
+
+@app.route("/api/wizard/config", methods=["GET"])
+def api_wizard_get():
+    if WIZARD_FILE.exists():
+        try:
+            return jsonify(json.loads(WIZARD_FILE.read_text()))
+        except Exception:
+            pass
+    return jsonify({})
+
+@app.route("/api/wizard/config", methods=["POST"])
+def api_wizard_post():
+    data = request.get_json(silent=True) or {}
+    try:
+        save_wizard(data)
+        _load_wizard_cache()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/wizard/test-entity")
+def api_wizard_test_entity():
+    entity_id = request.args.get("entity_id", "")
+    if not entity_id:
+        return jsonify({"ok": False, "error": "entity_id required"}), 400
+    state = ha_state(entity_id)
+    if state:
+        attrs = state.get("attributes", {})
+        return jsonify({
+            "ok":           True,
+            "state":        state.get("state"),
+            "unit":         attrs.get("unit_of_measurement", ""),
+            "device_class": attrs.get("device_class", ""),
+            "friendly_name":attrs.get("friendly_name", entity_id),
+        })
+    return jsonify({"ok": False, "error": "Entity not found or unavailable"})
+
 # ── Startup ──────────────────────────────────────────────────────────────────
 def main():
     global _scheduler_ref
     _load_setup_cache()
+    _load_wizard_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v2.6.4 — HAOS")
+    log.info("   Energy Optimizer v3.0.0 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

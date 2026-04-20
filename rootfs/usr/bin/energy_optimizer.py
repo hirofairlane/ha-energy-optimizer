@@ -1786,23 +1786,31 @@ th{color:var(--m);font-weight:500}
 
 <!-- CHARTS -->
 <div id="tab-charts" class="tab-content">
+  <div class="card">
+    <h2 style="margin-top:0">⚡ Power flow — last 24h (kW)
+      <span style="font-size:.72rem;color:var(--m);font-weight:400;margin-left:.5rem">
+        solar · grid (+ export / − import) · battery (+ discharge / − charge)
+      </span>
+    </h2>
+    <canvas id="pwrChart" style="max-height:240px"></canvas>
+  </div>
   <div class="grid2">
     <div class="card">
-      <h2 style="margin-top:0">Battery SOC — actual vs predicted (24h) <span id="soc-mae" style="font-size:.75rem;color:var(--m);font-weight:400"></span></h2>
+      <h2 style="margin-top:0">🔋 Battery SOC — actual vs predicted (24h) <span id="soc-mae" style="font-size:.75rem;color:var(--m);font-weight:400"></span></h2>
       <canvas id="socChart"></canvas>
     </div>
     <div class="card">
-      <h2 style="margin-top:0">Solar — last 7 days (kWh)</h2>
-      <canvas id="sol7Chart"></canvas>
+      <h2 style="margin-top:0">💰 Daily savings — last 7 days (€)</h2>
+      <canvas id="savingsChart"></canvas>
     </div>
   </div>
   <div class="card">
-    <h2 style="margin-top:0">Solar production — last 12 months (kWh)</h2>
-    <canvas id="sol12Chart" style="max-height:220px"></canvas>
+    <h2 style="margin-top:0">☀️ Solar production — last 7 days (kWh)</h2>
+    <canvas id="sol7Chart" style="max-height:200px"></canvas>
   </div>
   <div class="card" style="margin-bottom:1rem">
-    <h2 style="margin-top:0">Daily savings — last 7 days (€)</h2>
-    <canvas id="savingsChart" style="max-height:180px"></canvas>
+    <h2 style="margin-top:0">📅 Solar production — last 12 months (kWh)</h2>
+    <canvas id="sol12Chart" style="max-height:220px"></canvas>
   </div>
   <div class="actions"><button class="btn btn-sm" onclick="loadCharts()">🔄 Refresh</button></div>
 </div>
@@ -2457,7 +2465,7 @@ async function saveSetup(){
 }
 
 // ── Charts ────────────────────────────────────────────────────────────────────
-let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null;
+let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null,pwrInst=null;
 function mkChart(id,type,labels,datasets,yExtra={},maxH=null){
   const el=document.getElementById(id); if(!el) return null;
   if(maxH) el.style.maxHeight=maxH;
@@ -2471,6 +2479,49 @@ function mkChart(id,type,labels,datasets,yExtra={},maxH=null){
 async function loadCharts(){
   try {
     const cd=await fetch(BASE+'/api/chart-data').then(r=>r.json());
+
+    // ── Power flow 24h ─────────────────────────────────────────────────────
+    if(pwrInst) pwrInst.destroy();
+    const pf=cd.power_flow||{labels:[],solar:[],grid:[],battery:[]};
+    if(pf.labels.length>0){
+      // Derive load = solar - grid + battery (kW)
+      const load=pf.solar.map((_,i)=>
+        Math.max(0, pf.solar[i] - pf.grid[i] + pf.battery[i]));
+      // Split grid into import (negative → positive) and export (positive)
+      const gridImport=pf.grid.map(v=>v<0?Math.abs(v):null);
+      const gridExport=pf.grid.map(v=>v>0?v:null);
+      // Split battery into charge (negative → positive) and discharge (positive)
+      const batDischarge=pf.battery.map(v=>v>0?v:null);
+      const batCharge=pf.battery.map(v=>v<0?Math.abs(v):null);
+      pwrInst=new Chart(document.getElementById('pwrChart').getContext('2d'),{
+        type:'line',
+        data:{labels:pf.labels,datasets:[
+          {label:'Solar (kW)',data:pf.solar,borderColor:'#facc15',
+           backgroundColor:'rgba(250,204,21,.15)',fill:true,tension:.4,pointRadius:0,borderWidth:2},
+          {label:'Load (kW)',data:load,borderColor:'#f97316',
+           backgroundColor:'transparent',fill:false,tension:.4,pointRadius:0,borderWidth:2,borderDash:[4,2]},
+          {label:'Grid export (kW)',data:gridExport,borderColor:'#4ade80',
+           backgroundColor:'rgba(74,222,128,.1)',fill:true,tension:.4,pointRadius:0,borderWidth:1.5},
+          {label:'Grid import (kW)',data:gridImport,borderColor:'#f87171',
+           backgroundColor:'rgba(248,113,113,.12)',fill:true,tension:.4,pointRadius:0,borderWidth:1.5},
+          {label:'Bat discharge (kW)',data:batDischarge,borderColor:'#a78bfa',
+           backgroundColor:'transparent',fill:false,tension:.4,pointRadius:0,borderWidth:1.5},
+          {label:'Bat charge (kW)',data:batCharge,borderColor:'#38bdf8',
+           backgroundColor:'transparent',fill:false,tension:.4,pointRadius:0,borderWidth:1.5,borderDash:[3,2]},
+        ]},
+        options:{responsive:true,maintainAspectRatio:true,
+          interaction:{mode:'index',intersect:false},
+          plugins:{legend:{labels:{color:'#94a3b8',font:{size:10},boxWidth:12}},
+                   tooltip:{callbacks:{label:ctx=>` ${ctx.dataset.label}: ${(ctx.parsed.y??0).toFixed(2)} kW`}}},
+          scales:{
+            x:{ticks:{color:'#94a3b8',maxTicksLimit:12,font:{size:10}},grid:{color:'#1e293b'}},
+            y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'},
+               title:{display:true,text:'kW',color:'#64748b',font:{size:10}}}
+          }
+        }
+      });
+    }
+
     // Combine past + future labels for x-axis
     const futureLabels=cd.soc.future_labels||[];
     const futurePred=cd.soc.future_predicted||[];
@@ -3534,8 +3585,15 @@ def api_setup_post():
 @app.route("/api/chart-data")
 def api_chart_data():
     from datetime import timezone as _tz
-    soc_entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
-    influx_u   = cfg("influxdb_url", "").strip()
+    soc_entity = _wiz("battery_soc", "sensor_battery_soc", "sensor.battery_state_of_capacity")
+    # InfluxDB source: wizard config takes precedence over legacy cfg
+    _wiz_influx = _WIZARD.get("influxdb", {})
+    influx_u    = (_wiz_influx.get("host") and
+                   f"http://{_wiz_influx['host']}:{_wiz_influx.get('port',8086)}") or \
+                  cfg("influxdb_url", "").strip()
+    influx_db   = _wiz_influx.get("db") or cfg("influxdb_db", "homeassistant").strip()
+    influx_user = _wiz_influx.get("username") or cfg("influxdb_user", "").strip()
+    influx_pass = _wiz_influx.get("password") or cfg("influxdb_password", "")
 
     # ── SOC — 15-min bucket grid, align actual + predicted ────────────────────
     if influx_u:
@@ -3610,12 +3668,13 @@ def api_chart_data():
     sensors = read_sensors()
     if MODEL_FILE.exists():
         try:
-            art   = joblib.load(MODEL_FILE)
-            now   = datetime.now()
-            soc_f = sensors["battery_soc"]
+            art      = joblib.load(MODEL_FILE)
+            mdl_feats = art.get("features", BASE_FEATURES)
+            now      = datetime.now()
+            soc_f    = sensors.get("battery_soc", 50.0) or 50.0
             for h in range(1, 9):
-                ft    = now + timedelta(hours=h)
-                X = pd.DataFrame([{
+                ft = now + timedelta(hours=h)
+                row = {
                     "hour":        ft.hour,
                     "weekday":     ft.weekday(),
                     "month":       ft.month,
@@ -3623,8 +3682,17 @@ def api_chart_data():
                     "lag4":        soc_f,
                     "roll4":       soc_f,
                     "solar_proxy": _solar_proxy_for_hour(ft.hour, ft.month),
-                }])
-                pred  = float(art["pipeline"].predict(X[FEATURES])[0])
+                    "temp_out":    sensors.get("temp_outdoor", 15.0),
+                    "temp_out_lag4": sensors.get("temp_outdoor", 15.0),
+                    "solar_lag1":  sensors.get("solar_power", 0) / 1000,
+                    "solar_roll4": sensors.get("solar_power", 0) / 1000,
+                    "grid_lag1":   sensors.get("grid_power", 0) / 1000,
+                    "grid_roll4":  sensors.get("grid_power", 0) / 1000,
+                    "grid_abs_lag1": abs(sensors.get("grid_power", 0)) / 1000,
+                }
+                X    = pd.DataFrame([row])
+                cols = [c for c in mdl_feats if c in X.columns]
+                pred = float(art["pipeline"].predict(X[cols])[0])
                 soc_f = round(max(0.0, min(100.0, pred)), 1)
                 future_labels.append(ft.strftime("%H:%M"))
                 future_predicted.append(soc_f)
@@ -3645,9 +3713,7 @@ def api_chart_data():
                                tzinfo=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         q_sol = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{solar_entity_id}\' '
                  f'AND time >= \'{yest_start}\' AND time < \'{today_start}\'')
-        r_sol, _, _ = _influx_query(
-            influx_u, cfg("influxdb_db", "homeassistant").strip(), q_sol,
-            cfg("influxdb_user", "").strip(), cfg("influxdb_password", ""))
+        r_sol, _, _ = _influx_query(influx_u, influx_db, q_sol, influx_user, influx_pass)
         if r_sol:
             try:
                 s = r_sol.json()["results"][0].get("series", [])
@@ -3721,10 +3787,8 @@ def api_chart_data():
     solar_12m_labels, solar_12m_actual, solar_12m_forecast = [], [], []
 
     if influx_u:
-        sol_tmrw_id = cfg("sensor_solar_tomorrow", "sensor.energy_production_tomorrow").split(".")[-1]
-        influx_db   = cfg("influxdb_db", "homeassistant").strip()
-        influx_user = cfg("influxdb_user", "").strip()
-        influx_pass = cfg("influxdb_password", "")
+        sol_tmrw_id = _wiz("solar_fc_tomorrow", "sensor_solar_tomorrow",
+                           "sensor.energy_production_tomorrow").split(".")[-1]
 
         # Daily MAX actual + daily LAST forecast — 395d covers 13 months
         q_act = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{solar_entity_id}\' '
@@ -3798,6 +3862,31 @@ def api_chart_data():
             solar_12m_actual.append(round(m_actual[m], 1) if m_cnt_a.get(m) else None)
             solar_12m_forecast.append(round(m_forecast[m], 1) if m_cnt_f.get(m) else None)
 
+    # ── Power flow 24h from decisions.json ───────────────────────────────────
+    pf_labels, pf_solar, pf_grid, pf_battery = [], [], [], []
+    now_local_pf = datetime.now()
+    cutoff_pf    = now_local_pf - timedelta(hours=24)
+    if DECISIONS_FILE.exists():
+        try:
+            history_pf = json.loads(DECISIONS_FILE.read_text())
+            for dec in sorted(history_pf, key=lambda d: d.get("timestamp", "")):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if ts < cutoff_pf:
+                    continue
+                sens = dec.get("sensors", {})
+                pf_labels.append(ts.strftime("%H:%M"))
+                pf_solar.append(round((sens.get("solar_power") or 0) / 1000, 2))
+                pf_grid.append(round((sens.get("grid_power") or 0) / 1000, 2))
+                pf_battery.append(round((sens.get("battery_power") or 0) / 1000, 2))
+        except Exception:
+            pass
+
     return jsonify({
         "soc": {
             "labels":           soc_labels,
@@ -3816,6 +3905,8 @@ def api_chart_data():
         "solar_12m":     {"labels": solar_12m_labels, "actual": solar_12m_actual,
                           "forecast": solar_12m_forecast},
         "savings_daily": {"labels": savings_labels, "values": savings_values},
+        "power_flow":    {"labels": pf_labels, "solar": pf_solar,
+                          "grid": pf_grid, "battery": pf_battery},
     })
 
 @app.route("/api/run", methods=["POST"])

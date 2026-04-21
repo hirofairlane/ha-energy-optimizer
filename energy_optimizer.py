@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.2.4"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.2.5"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1644,6 +1644,10 @@ th{color:var(--m);font-weight:500}
 .wiz-step-dot.done .dot{background:rgba(74,222,128,.2);border-color:var(--g);color:var(--g)}
 .wiz-step-dot.active .dot{background:rgba(251,191,36,.2);border-color:var(--y);color:var(--y);box-shadow:0 0 0 3px rgba(251,191,36,.15)}
 .wiz-step-dot .dot-lbl{font-size:.55rem;color:var(--m);text-align:center;max-width:55px;line-height:1.2}
+.wiz-sub-dot{display:flex;flex-direction:column;align-items:center;cursor:pointer;min-width:24px}
+.wiz-sub-dot .sub-circle{width:22px;height:22px;border-radius:50%;border:2px solid #475569;background:var(--s);display:flex;align-items:center;justify-content:center;font-size:.62rem;transition:.2s}
+.wiz-sub-dot.active .sub-circle{border-color:var(--y);background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.15)}
+.wiz-sub-dot.done .sub-circle{border-color:var(--g);background:rgba(74,222,128,.1)}
 .wiz-step-dot.done .dot-lbl,.wiz-step-dot.active .dot-lbl{color:var(--t)}
 .wiz-pane{display:none}.wiz-pane.active{display:block}
 .wiz-card{background:var(--s);border:3px solid var(--b);border-radius:1rem;box-shadow:4px 4px 0 var(--b);padding:1.2rem;margin-bottom:1rem;position:relative}
@@ -2672,7 +2676,7 @@ async function loadLive(){
     document.getElementById('lv-house-w').textContent = fmt(house);
     document.getElementById('lv-bat-w').textContent   = fmt(Math.abs(bat));
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-dir').textContent  = bat<-50?'Charging':bat>50?'Discharging':'Idle';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'Charging':bat<-50?'Discharging':'Idle';
 
     const gridEl = document.getElementById('lv-grid-w');
     gridEl.textContent = fmt(Math.abs(grid));
@@ -2688,25 +2692,33 @@ async function loadLive(){
       el.classList.remove('fl-dim'); el.classList.add('fl-active');
       el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
     }
-    const importing=grid<-50, exporting=grid>50, charging=bat<-50, discharging=bat>50, hasSolar=solar>100;
-    // Solar → House: solar actively powering the house
-    setLine('fl-ln-sol-hse', hasSolar && house>50, false, spd(Math.min(solar,house)));
-    // Solar → Battery: solar charging battery
-    setLine('fl-ln-sol-bat', hasSolar && charging, false, spd(Math.abs(bat)));
-    // Solar → Grid: exporting excess to grid (forward); Grid → Solar path reversed if importing
-    setLine('fl-ln-sol-grd', exporting, false, spd(grid));
-    // Battery ↔ House: discharge only (forward); charging from grid uses fl-ln-grd-bat
-    setLine('fl-ln-bat-hse', discharging, false, spd(Math.abs(bat)));
-    // Grid → Battery: direct arc when charging from grid (no solar)
-    setLine('fl-ln-grd-bat', charging && importing && !hasSolar, false, spd(Math.abs(bat)));
-    // Grid → House: importing (grid powering house consumption)
-    const houseConsumingFromGrid = importing && (house > 50);
-    setLine('fl-ln-grd-hse', houseConsumingFromGrid, false, spd(Math.abs(grid)));
+    // Physics-based flow — sensor conventions: P_bat +carga/-descarga, P_red +venta/-compra
+    const P_sol  = solar, P_red = grid, P_bat = bat;
+    const NOISE  = 10;  // W — filter noise
+    const P_casa = P_sol - P_red - P_bat;            // house balance
+    // Flow vectors
+    const f_sol_casa = Math.max(0, Math.min(P_sol, P_casa));
+    const f_sol_bat  = Math.max(0, Math.min(P_sol - P_casa, P_bat));
+    const f_sol_red  = Math.max(0, P_sol - P_casa - Math.max(0, P_bat));
+    const f_bat_casa = Math.max(0, -P_bat);
+    const f_red_bat  = Math.max(0, P_bat - Math.max(0, P_sol - P_casa));
+    const f_red_casa = Math.max(0, -(P_red + f_red_bat));
+    const f_export   = Math.max(0, P_red);
+    // Derived state for labels
+    const charging = P_bat > 50, discharging = P_bat < -50;
+    const importing = P_red < -50, exporting = P_red > 50;
+    // Animate lines
+    setLine('fl-ln-sol-hse', f_sol_casa > NOISE, false, spd(f_sol_casa));
+    setLine('fl-ln-sol-bat', f_sol_bat  > NOISE, false, spd(f_sol_bat));
+    setLine('fl-ln-sol-grd', f_sol_red  > NOISE || f_export > NOISE, false, spd(Math.max(f_sol_red, f_export)));
+    setLine('fl-ln-bat-hse', f_bat_casa > NOISE, false, spd(f_bat_casa));
+    setLine('fl-ln-grd-bat', f_red_bat  > NOISE, false, spd(f_red_bat));
+    setLine('fl-ln-grd-hse', f_red_casa > NOISE, false, spd(f_red_casa));
 
     document.getElementById('sv-solar-val').textContent = fmt(solar);
     document.getElementById('sv-house-val').textContent = fmt(house);
     document.getElementById('sv-bat-val').textContent   = fmt(Math.abs(bat));
-    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(discharging?'↑ desc':charging?'↓ carga':'idle');
+    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(charging?'↓ carga':discharging?'↑ desc':'idle');
     const svGridVal=document.getElementById('sv-grid-val');
     if(svGridVal){svGridVal.textContent=fmt(Math.abs(grid)); svGridVal.setAttribute('fill',grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8');}
     document.getElementById('sv-grid-lbl').textContent = exporting?'↑ exportando':importing?'↓ importando':'idle';
@@ -3174,12 +3186,28 @@ async function loadWizard() {
 }
 
 function wizRenderDots() {
-  document.getElementById('wiz-dots').innerHTML = WIZ_STEPS.map((lbl,i) =>
-    `<div class="wiz-step-dot ${i<wizStep?'done':i===wizStep?'active':''}" onclick="wizGoTo(${i})">
-      <div class="dot">${i<wizStep?'✓':(i+1)}</div>
+  const _HW_EMO = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+  const _selDevs = (wizCfg.hardware||[]).filter(h=>h&&h!=='');
+  let html = '';
+  WIZ_STEPS.forEach((lbl, i) => {
+    const st = i < wizStep ? 'done' : i === wizStep ? 'active' : '';
+    html += `<div class="wiz-step-dot ${st}" onclick="wizGoTo(${i})">
+      <div class="dot">${i < wizStep ? '✓' : (i+1)}</div>
       <div class="dot-lbl">${lbl}</div>
-    </div>`
-  ).join('');
+    </div>`;
+    if (i === 5 && _selDevs.length > 0) {
+      _selDevs.forEach((hw, si) => {
+        const emo  = _HW_EMO[hw] || '🔧';
+        const done = wizStep > 5 || (wizStep === 5 && wizLoadsSub > si + 1);
+        const act  = wizStep === 5 && wizLoadsSub === si + 1;
+        html += `<div class="wiz-sub-dot ${act?'active':done?'done':''}"
+          onclick="if(wizStep===5){wizLoadsGoTo(${si+1});}else{wizGoTo(5);}" title="${hw}">
+          <div class="sub-circle">${emo}</div>
+        </div>`;
+      });
+    }
+  });
+  document.getElementById('wiz-dots').innerHTML = html;
 }
 
 function _wizNavUpdate() {
@@ -3652,7 +3680,7 @@ function wizLoadsBack() {
   if (wizLoadsSub > 0) { wizLoadsSub--; _wizLoadsUpdateNav(); }
   else wizBack();
 }
-function wizLoadsGoTo(sub) { wizLoadsSub = sub; _wizLoadsUpdateNav(); }
+function wizLoadsGoTo(sub) { wizLoadsSub = sub; _wizLoadsUpdateNav(); wizRenderDots(); }
 
 function _wizRenderSingleDevice(hw, container) {
   if (!container) return;

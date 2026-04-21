@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Energy Optimizer — Home Assistant Add-on v2.4
 Smart energy management: battery, heat pump, pool pump, pool cleaner, dishwasher
@@ -30,6 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
+ADD_ON_VERSION = "3.2.7"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1643,6 +1644,10 @@ th{color:var(--m);font-weight:500}
 .wiz-step-dot.done .dot{background:rgba(74,222,128,.2);border-color:var(--g);color:var(--g)}
 .wiz-step-dot.active .dot{background:rgba(251,191,36,.2);border-color:var(--y);color:var(--y);box-shadow:0 0 0 3px rgba(251,191,36,.15)}
 .wiz-step-dot .dot-lbl{font-size:.55rem;color:var(--m);text-align:center;max-width:55px;line-height:1.2}
+.wiz-sub-dot{display:flex;flex-direction:column;align-items:center;cursor:pointer;min-width:24px}
+.wiz-sub-dot .sub-circle{width:22px;height:22px;border-radius:50%;border:2px solid #475569;background:var(--s);display:flex;align-items:center;justify-content:center;font-size:.62rem;transition:.2s}
+.wiz-sub-dot.active .sub-circle{border-color:var(--y);background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.15)}
+.wiz-sub-dot.done .sub-circle{border-color:var(--g);background:rgba(74,222,128,.1)}
 .wiz-step-dot.done .dot-lbl,.wiz-step-dot.active .dot-lbl{color:var(--t)}
 .wiz-pane{display:none}.wiz-pane.active{display:block}
 .wiz-card{background:var(--s);border:3px solid var(--b);border-radius:1rem;box-shadow:4px 4px 0 var(--b);padding:1.2rem;margin-bottom:1rem;position:relative}
@@ -1718,6 +1723,7 @@ th{color:var(--m);font-weight:500}
 .entity-cand{background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.3);color:var(--a);padding:.2rem .55rem;border-radius:.3rem;font-size:.7rem;cursor:pointer;transition:.15s}
 .entity-cand:hover{background:rgba(56,189,248,.2);border-color:var(--a)}
 .entity-cand.best{background:rgba(74,222,128,.12);border-color:var(--g);color:var(--g)}
+.custom-load-row{background:rgba(255,255,255,.03);border:1px solid var(--b);border-radius:.5rem;padding:.6rem;margin-bottom:.4rem}.loads-subdot{display:inline-flex;align-items:center;justify-content:center;width:1.6rem;height:1.6rem;border-radius:.3rem;font-size:.85rem;background:var(--bg);border:1px solid var(--b);cursor:pointer;transition:.15s}.loads-subdot.active{border-color:var(--g);background:rgba(74,222,128,.15)}.loads-subdot:hover{border-color:var(--a)}
 .ent-search-btn{background:none;border:1px solid var(--b);border-radius:.4rem;padding:.2rem .45rem;cursor:pointer;color:var(--m);font-size:.85rem;flex-shrink:0;line-height:1;transition:.15s}.ent-search-btn:hover{border-color:var(--a);color:var(--a)}.entity-picker-row{display:flex;gap:.3rem;align-items:center}.entity-picker-row input{flex:1;min-width:0}
 .entity-state{font-size:.68rem;color:var(--m);margin-top:.15rem}
 .hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:.6rem;margin-bottom:.9rem}
@@ -1806,26 +1812,34 @@ th{color:var(--m);font-weight:500}
 
   <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
   <div id="cv-live">
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem;margin-bottom:.8rem">
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">☀️</div>
-        <div id="lv-solar-w" style="font-size:1.4rem;font-weight:700;color:#facc15">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem">Solar</div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.6rem;margin-bottom:.8rem">
+      <!-- SOL -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">☀️</div>
+        <div id="lv-solar-w" style="font-size:1.3rem;font-weight:700;color:#facc15;line-height:1.2">—</div>
+        <div id="lv-solar-avg" style="font-size:.65rem;color:#a16207;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem">Solar</div>
       </div>
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">🏠</div>
-        <div id="lv-house-w" style="font-size:1.4rem;font-weight:700;color:#f97316">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem">House</div>
+      <!-- RED -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">⚡</div>
+        <div id="lv-grid-w" style="font-size:1.3rem;font-weight:700;line-height:1.2">—</div>
+        <div id="lv-grid-avg" style="font-size:.65rem;color:var(--m);margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-grid-dir">Red</span></div>
       </div>
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">🔋</div>
-        <div id="lv-bat-w" style="font-size:1.4rem;font-weight:700;color:#a78bfa">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-bat-dir">Battery</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
+      <!-- BAT -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">🔋</div>
+        <div id="lv-bat-w" style="font-size:1.3rem;font-weight:700;line-height:1.2;color:#a78bfa">—</div>
+        <div id="lv-bat-avg" style="font-size:.65rem;color:#7c3aed;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-bat-dir">Bat</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
       </div>
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">⚡</div>
-        <div id="lv-grid-w" style="font-size:1.4rem;font-weight:700">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-grid-dir">Grid</span></div>
+      <!-- CASA -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">🏠</div>
+        <div id="lv-house-w" style="font-size:1.3rem;font-weight:700;color:#f97316;line-height:1.2">—</div>
+        <div id="lv-house-avg" style="font-size:.65rem;color:#c2410c;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem">Casa</div>
       </div>
     </div>
     <!-- SVG energy flow diagram -->
@@ -1837,6 +1851,7 @@ th{color:var(--m);font-weight:500}
         <path id="fl-ln-sol-grd" class="fl-ln fl-dim" d="M253,76 C288,110 326,145 372,168" stroke="#4ade80"/>
         <path id="fl-ln-bat-hse" class="fl-ln fl-dim" d="M120,198 L148,193" stroke="#a78bfa"/>
         <path id="fl-ln-grd-hse" class="fl-ln fl-dim" d="M320,198 L292,193" stroke="#f87171"/>
+        <path id="fl-ln-grd-bat" class="fl-ln fl-dim" d="M316,215 C260,252 180,252 124,215" stroke="#f87171"/>
 
         <!-- Solar node (top center) -->
         <rect x="165" y="14" width="110" height="58" rx="11" class="fl-node-bg" stroke="#facc15" stroke-width="1.5"/>
@@ -1867,13 +1882,7 @@ th{color:var(--m);font-weight:500}
         <text id="sv-ts"     x="330" y="258" text-anchor="middle" fill="#334155" font-size="9" font-family="sans-serif">—</text>
       </svg>
     </div>
-    <!-- 7-day averages row -->
-    <div id="lv-avgs" style="display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem;margin-top:.4rem;text-align:center;font-size:.68rem;color:var(--m)">
-      <div>☀️ <span id="avg-solar">—</span></div>
-      <div>🏠 <span id="avg-house">—</span></div>
-      <div>🔋 <span id="avg-bat">—</span></div>
-      <div>⚡ <span id="avg-grid">—</span></div>
-    </div>
+    <!-- 7-day averages integrated into cards above -->
     <!-- SOC bar -->
     <div class="card" style="margin-top:.7rem">
       <h2 style="margin-top:0;font-size:.85rem">🔋 Battery SOC — last 24h <span id="soc-mae" style="font-size:.72rem;color:var(--m);font-weight:400"></span></h2>
@@ -2367,6 +2376,9 @@ th{color:var(--m);font-weight:500}
         <div class="hw-card" data-hw="ev" onclick="wizToggleHw(this)">
           <div class="hw-icon">🚗</div><div class="hw-name">EV Charger</div><div class="hw-desc">Wallbox / OCPP</div>
         </div>
+        <div class="hw-card" data-hw="custom" onclick="wizToggleHw(this)">
+          <div class="hw-icon">⚙️</div><div class="hw-name">Custom</div><div class="hw-desc">Any switch load</div>
+        </div>
       </div>
       <div id="wiz-loads-entities"></div>
       <div class="wiz-nav" id="wiz-loads-nav">
@@ -2663,14 +2675,18 @@ async function loadLive(){
 
     document.getElementById('lv-solar-w').textContent = fmt(solar);
     document.getElementById('lv-house-w').textContent = fmt(house);
-    document.getElementById('lv-bat-w').textContent   = fmt(Math.abs(bat));
+    // Negated display: -1300 when discharging (+bat sensor), +500 when charging (-bat sensor)
+    document.getElementById('lv-bat-w').textContent   = (bat>50?'-':bat<-50?'+':'') + fmt(Math.abs(bat));
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-dir').textContent  = bat>50?'Charging':bat<-50?'Discharging':'Idle';
+    document.getElementById('lv-bat-w').style.color = bat>50?'#f87171':bat<-50?'#4ade80':'#a78bfa';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'↓ desc':bat<-50?'↑ carga':'idle';
 
     const gridEl = document.getElementById('lv-grid-w');
-    gridEl.textContent = fmt(Math.abs(grid));
+    // Show signed value: + export (green), - import (red)
+    const gridSign = grid > 50 ? '+' : '';
+    gridEl.textContent = gridSign + fmt(Math.abs(grid));
     gridEl.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
-    document.getElementById('lv-grid-dir').textContent = grid>50?'Exporting':grid<-50?'Importing':'Idle';
+    document.getElementById('lv-grid-dir').textContent = grid>50?'↑ venta':grid<-50?'↓ compra':'idle';
 
     // SVG flow diagram
     const spd = p => Math.max(0.35, 2.4 - Math.abs(p)/1800)+'s';
@@ -2681,22 +2697,34 @@ async function loadLive(){
       el.classList.remove('fl-dim'); el.classList.add('fl-active');
       el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
     }
-    const importing=grid<-50, exporting=grid>50, charging=bat<-50, discharging=bat>50, hasSolar=solar>100;
-    // Solar → House: solar actively powering the house
-    setLine('fl-ln-sol-hse', hasSolar && house>50, false, spd(Math.min(solar,house)));
-    // Solar → Battery: solar charging battery
-    setLine('fl-ln-sol-bat', hasSolar && charging, false, spd(Math.abs(bat)));
-    // Solar → Grid: exporting excess to grid (forward); Grid → Solar path reversed if importing
-    setLine('fl-ln-sol-grd', exporting, false, spd(grid));
-    // Battery ↔ House: discharge (forward) or charging from grid (reverse)
-    setLine('fl-ln-bat-hse', discharging || (charging && !hasSolar), charging && !hasSolar, spd(Math.abs(bat)));
-    // Grid → House: importing
-    setLine('fl-ln-grd-hse', importing, false, spd(Math.abs(grid)));
+    // Physics — Huawei convention: bat>0=discharging, bat<0=charging, grid>0=export, grid<0=import
+    const NOISE   = 10;
+    const P_casa  = Math.max(0, solar + bat - grid);  // house balance (same as house var above)
+    const bat_dis = Math.max(0, bat);   // discharge power (positive when discharging)
+    const bat_chg = Math.max(0, -bat);  // charge power (positive when charging)
+    // Flow vectors
+    const f_sol_casa = Math.min(solar, Math.max(0, P_casa));
+    const f_sol_bat  = Math.min(Math.max(0, solar - f_sol_casa), bat_chg);
+    const f_sol_red  = Math.max(0, solar - f_sol_casa - f_sol_bat);
+    const f_bat_casa = Math.min(bat_dis, Math.max(0, P_casa - f_sol_casa));
+    const f_bat_red  = Math.max(0, bat_dis - f_bat_casa);
+    const f_red_bat  = Math.max(0, bat_chg - f_sol_bat);
+    const f_red_casa = Math.max(0, P_casa - f_sol_casa - f_bat_casa);
+    // Derived state (correct convention: bat>0=discharging)
+    const discharging = bat > 50, charging = bat < -50;
+    const importing = grid < -50, exporting = grid > 50;
+    // Animate — fl-ln-sol-grd also carries battery→grid export (f_bat_red)
+    setLine('fl-ln-sol-hse', f_sol_casa > NOISE, false, spd(f_sol_casa));
+    setLine('fl-ln-sol-bat', f_sol_bat  > NOISE, false, spd(f_sol_bat));
+    setLine('fl-ln-sol-grd', (f_sol_red + f_bat_red) > NOISE, false, spd(f_sol_red + f_bat_red));
+    setLine('fl-ln-bat-hse', f_bat_casa > NOISE, false, spd(f_bat_casa));
+    setLine('fl-ln-grd-bat', f_red_bat  > NOISE, false, spd(f_red_bat));
+    setLine('fl-ln-grd-hse', f_red_casa > NOISE, false, spd(f_red_casa));
 
     document.getElementById('sv-solar-val').textContent = fmt(solar);
     document.getElementById('sv-house-val').textContent = fmt(house);
     document.getElementById('sv-bat-val').textContent   = fmt(Math.abs(bat));
-    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(discharging?'↑ desc':charging?'↓ carga':'idle');
+    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(discharging?'↓ desc':charging?'↑ carga':'idle');
     const svGridVal=document.getElementById('sv-grid-val');
     if(svGridVal){svGridVal.textContent=fmt(Math.abs(grid)); svGridVal.setAttribute('fill',grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8');}
     document.getElementById('sv-grid-lbl').textContent = exporting?'↑ exportando':importing?'↓ importando':'idle';
@@ -2727,12 +2755,30 @@ async function loadLive(){
     if(maeEl) maeEl.textContent=sdat.mae!=null?`— MAE ${sdat.mae}%`:'';
 
     // 7-day averages row
+    // 7-day W-level averages — integrated into each card
     const av = cd.averages||{};
-    const fav = (v,u) => v!=null ? `Ø${av.days||7}d: ${v} ${u}` : '—';
-    document.getElementById('avg-solar').textContent = fav(av.solar_kwh,'kWh/d');
-    document.getElementById('avg-house').textContent = fav(av.house_kwh,'kWh/d');
-    document.getElementById('avg-bat').textContent   = fav(av.bat_kwh,'kWh/d');
-    document.getElementById('avg-grid').textContent  = fav(av.import_kwh,'kWh imp/d');
+    const fmtW = w => w == null ? '—' : (Math.abs(w) >= 1000 ? (w/1000).toFixed(1)+' kW' : Math.round(w)+' W');
+    const fmtAvg = (v, suffix) => v != null ? `Ø7d ${fmtW(v)}${suffix||''}` : 'Ø7d —';
+    // SOL: avg during solar hours (non-zero samples)
+    const solAvgEl = document.getElementById('lv-solar-avg');
+    if(solAvgEl) solAvgEl.textContent = fmtAvg(av.avg_sol, ' (sol)');
+    // RED: net avg (+ export green, - import red)
+    const redAvgEl = document.getElementById('lv-grid-avg');
+    if(redAvgEl) {
+      redAvgEl.textContent = fmtAvg(av.avg_red);
+      redAvgEl.style.color = av.avg_red > 0 ? '#16a34a' : av.avg_red < 0 ? '#dc2626' : 'var(--m)';
+    }
+    // BAT: net avg (+ charge purple, - discharge light)
+    const batAvgEl = document.getElementById('lv-bat-avg');
+    if(batAvgEl) {
+      // avg_bat from sensor: >0=discharging tendency, <0=charging. Flip for display.
+      const avgBatDisp = av.avg_bat != null ? -av.avg_bat : null;
+      batAvgEl.textContent = fmtAvg(avgBatDisp);
+      batAvgEl.style.color = av.avg_bat > 0 ? '#f87171' : av.avg_bat < 0 ? '#4ade80' : 'var(--m)';
+    }
+    // CASA: avg consumption
+    const hsAvgEl = document.getElementById('lv-house-avg');
+    if(hsAvgEl) hsAvgEl.textContent = fmtAvg(av.avg_casa);
   } catch(e){ console.warn('Live error',e); }
 }
 
@@ -3160,12 +3206,28 @@ async function loadWizard() {
 }
 
 function wizRenderDots() {
-  document.getElementById('wiz-dots').innerHTML = WIZ_STEPS.map((lbl,i) =>
-    `<div class="wiz-step-dot ${i<wizStep?'done':i===wizStep?'active':''}" onclick="wizGoTo(${i})">
-      <div class="dot">${i<wizStep?'✓':(i+1)}</div>
+  const _HW_EMO = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+  const _selDevs = (wizCfg.hardware||[]).filter(h=>h&&h!=='');
+  let html = '';
+  WIZ_STEPS.forEach((lbl, i) => {
+    const st = i < wizStep ? 'done' : i === wizStep ? 'active' : '';
+    html += `<div class="wiz-step-dot ${st}" onclick="wizGoTo(${i})">
+      <div class="dot">${i < wizStep ? '✓' : (i+1)}</div>
       <div class="dot-lbl">${lbl}</div>
-    </div>`
-  ).join('');
+    </div>`;
+    if (i === 5 && _selDevs.length > 0) {
+      _selDevs.forEach((hw, si) => {
+        const emo  = _HW_EMO[hw] || '🔧';
+        const done = wizStep > 5 || (wizStep === 5 && wizLoadsSub > si + 1);
+        const act  = wizStep === 5 && wizLoadsSub === si + 1;
+        html += `<div class="wiz-sub-dot ${act?'active':done?'done':''}"
+          onclick="if(wizStep===5){wizLoadsGoTo(${si+1});}else{wizGoTo(5);}" title="${hw}">
+          <div class="sub-circle">${emo}</div>
+        </div>`;
+      });
+    }
+  });
+  document.getElementById('wiz-dots').innerHTML = html;
 }
 
 function _wizNavUpdate() {
@@ -3594,9 +3656,14 @@ function _wizLoadsUpdateNav() {
   if (wizLoadsSub === 0) {
     if (grid) grid.style.display = '';
     if (ents) ents.innerHTML = '';
+    const _devIcons = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+    const _miniDots0 = devices.map(d=>`<span class="loads-subdot" title="${d}">${_devIcons[d]||d}</span>`).join('');
     nav.innerHTML = `
       <button class="comic-btn back" onclick="wizBack()">← Back</button>
-      <span class="wiz-progress" id="wiz-loads-progress">Step 6 of 8 — Select devices</span>
+      <span style="display:flex;flex-direction:column;align-items:center;gap:.15rem">
+        <span style="font-size:.65rem;color:var(--m)">Step 6 — Select devices</span>
+        ${_miniDots0 ? `<span style="display:flex;gap:.25rem">${_miniDots0}</span>` : ''}
+      </span>
       <button class="comic-btn next" onclick="wizLoadsNext()">Configure →</button>`;
   } else {
     const dev = devices[wizLoadsSub-1];
@@ -3604,12 +3671,20 @@ function _wizLoadsUpdateNav() {
     if (grid) grid.style.display = 'none';
     _wizRenderSingleDevice(dev, ents);
     const isLast = wizLoadsSub >= devices.length;
+    const _devIcons1 = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+    const _miniDots1 = devices.map((d,i)=>{
+      const act = i===wizLoadsSub-1;
+      return `<span class="loads-subdot${act?' active':''}" onclick="wizLoadsGoTo(${i+1})" title="${d}">${_devIcons1[d]||d}</span>`;
+    }).join('');
     nav.innerHTML = `
       <button class="comic-btn back" onclick="wizLoadsBack()">← Back</button>
-      <span class="wiz-progress">${label} — ${wizLoadsSub}/${devices.length}</span>
+      <span style="display:flex;flex-direction:column;align-items:center;gap:.15rem">
+        <span style="font-size:.65rem;color:var(--m)">${label} · ${wizLoadsSub}/${devices.length}</span>
+        <span style="display:flex;gap:.25rem">${_miniDots1}</span>
+      </span>
       ${isLast
         ? `<button class="comic-btn next" onclick="wizNext()">Next →</button>`
-        : `<button class="comic-btn next" onclick="wizLoadsNext()">${{hvac:'Pool',pool:'Dishwasher',dishwasher:'Washer',washer:'Dryer',dryer:'EV',ev:'Done'}[dev]||'Next'} →</button>`}`;
+        : `<button class="comic-btn next" onclick="wizLoadsNext()">Next →</button>`}`;
     setTimeout(()=>{ _wizLoadsRenderCands(); _wizAddSearchButtons(); }, 60);
   }
 }
@@ -3625,6 +3700,7 @@ function wizLoadsBack() {
   if (wizLoadsSub > 0) { wizLoadsSub--; _wizLoadsUpdateNav(); }
   else wizBack();
 }
+function wizLoadsGoTo(sub) { wizLoadsSub = sub; _wizLoadsUpdateNav(); wizRenderDots(); }
 
 function _wizRenderSingleDevice(hw, container) {
   if (!container) return;
@@ -3686,6 +3762,10 @@ function _wizRenderSingleDevice(hw, container) {
       <div class="entity-picker"><div class="entity-picker-label">EV charger entity</div>
         <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value;wizEntityTyped('ev_charger','wiz-ev',null,null)">
         <div id="wiz-ev-cands" class="entity-cands"></div></div></div>`;
+  } else if (hw === 'custom') {
+    container.innerHTML = _wizCustomLoadsSection();
+    setTimeout(_wizAddSearchButtons, 60);
+    return;
   }
   container.innerHTML = html;
 }
@@ -3783,6 +3863,9 @@ function wizRenderLoadsEntities() {
       <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value;_wizRenderCands('ev_charger','wiz-ev','wiz-ev-cands',null,null)">
       <div id="wiz-ev-cands" class="entity-cands"></div></div></div>`);
 
+  // ── Custom loads ──
+  if (hw.includes('custom')) sections.push(_wizCustomLoadsSection());
+
   document.getElementById('wiz-loads-entities').innerHTML = sections.join('');
   setTimeout(()=>_wizLoadsRenderCands(), 50);
 }
@@ -3798,6 +3881,64 @@ function _wizApplianceSection(key, icon, label, stateRole, powerRole) {
         <input class="entity-select" id="wiz-${key}-power" value="${wizCfg.sensors[powerRole]||''}" placeholder="sensor.${key}_power" oninput="wizCfg.sensors['${powerRole}']=this.value;_wizRenderCands('${powerRole}','wiz-${key}-power','wiz-${key}-power-cands',null,null)">
         <div id="wiz-${key}-power-cands" class="entity-cands"></div></div>
     </div></div>`;
+}
+
+function _wizCustomLoadsSection() {
+  if (!wizCfg.custom_loads) wizCfg.custom_loads = [];
+  const items = wizCfg.custom_loads;
+  const schedOpts = [
+    {v:'valley',l:'🌙 Valley tariff only'},{v:'solar',l:'☀️ Solar surplus only'},
+    {v:'both',l:'☀️🌙 Solar + Valley'},{v:'hours',l:'⏱ Custom hours'},
+  ];
+  const rows = items.map((item,i) => `
+    <div class="custom-load-row">
+      <div style="display:grid;grid-template-columns:1fr auto;gap:.4rem;align-items:center;margin-bottom:.35rem">
+        <input class="entity-select" value="${item.name||''}" placeholder="Device name (e.g. Irrigation pump)"
+          oninput="wizCfg.custom_loads[${i}].name=this.value" style="font-weight:600">
+        <div style="display:flex;align-items:center;gap:.3rem">
+          <input type="number" value="${item.watts||0}" min="0" max="20000" step="50" style="width:72px"
+            oninput="wizCfg.custom_loads[${i}].watts=+this.value">
+          <span style="font-size:.65rem;color:var(--m)">W</span>
+        </div>
+      </div>
+      <div class="entity-picker">
+        <div class="entity-picker-label">Switch entity</div>
+        <input class="entity-select" id="wiz-cl-sw-${i}" value="${item.switch||''}" placeholder="switch.my_device"
+          oninput="wizCfg.custom_loads[${i}].switch=this.value;_wizRenderCands('pool_switch','wiz-cl-sw-'+${i},'wiz-cl-sw-'+${i}+'-cands',null,null)">
+        <div id="wiz-cl-sw-${i}-cands" class="entity-cands"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.3rem">
+        <div class="wiz-field"><label>Schedule</label>
+          <select onchange="wizCfg.custom_loads[${i}].schedule=this.value;_wizRenderCustomLoads()">
+            ${schedOpts.map(o=>`<option value="${o.v}"${item.schedule===o.v?' selected':''}>${o.l}</option>`).join('')}
+          </select>
+        </div>
+        ${item.schedule==='hours'?`<div class="wiz-field"><label>Hours (e.g. 10-14,22-06)</label>
+          <input value="${item.hours||''}" placeholder="10-14" oninput="wizCfg.custom_loads[${i}].hours=this.value"></div>`:'<div></div>'}
+      </div>
+      <button class="btn btn-sm" style="margin-top:.3rem;color:#ef4444;border-color:#ef4444"
+        onclick="wizDelCustomLoad(${i})">✕ Remove</button>
+    </div>`).join('<hr style="border-color:var(--b);margin:.4rem 0">');
+  return `<div class="wiz-card" style="margin-top:.7rem">
+    <div class="wiz-card-title" style="font-size:1rem">⚙️ Custom Loads</div>
+    <div style="font-size:.7rem;color:var(--m);margin-bottom:.6rem">
+      Any switch-controlled load. The engine schedules them during cheapest / greenest windows.</div>
+    <div id="wiz-custom-loads-list">${rows}</div>
+    <button class="btn btn-sm" onclick="wizAddCustomLoad()" style="margin-top:.5rem">+ Add device</button>
+  </div>`;
+}
+function _wizRenderCustomLoads() {
+  const el = document.getElementById('wiz-loads-entities');
+  if (el) { el.innerHTML = _wizCustomLoadsSection(); setTimeout(_wizAddSearchButtons,60); }
+}
+function wizAddCustomLoad() {
+  if (!wizCfg.custom_loads) wizCfg.custom_loads = [];
+  wizCfg.custom_loads.push({name:'',switch:'',watts:0,schedule:'valley',hours:''});
+  _wizRenderCustomLoads();
+}
+function wizDelCustomLoad(i) {
+  wizCfg.custom_loads.splice(i,1);
+  _wizRenderCustomLoads();
 }
 
 function _wizLoadsRenderCands() {
@@ -3995,15 +4136,7 @@ setInterval(loadWeather,300000);
 @app.route("/")
 def index():
     base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-    ver = "v3.1.6"
-    try:
-        import yaml as _yaml
-        _cfg_path = Path(__file__).parent.parent.parent.parent / "config.yaml"
-        if _cfg_path.exists():
-            _d = _yaml.safe_load(_cfg_path.read_text())
-            ver = "v" + str(_d.get("version", "3.1.6"))
-    except Exception:
-        pass
+    ver = "v" + ADD_ON_VERSION
     return PANEL.replace("__BASE__", base).replace("__VERSION__", ver)
 
 @app.route("/api/status")
@@ -4154,26 +4287,47 @@ def _hourly_from_decisions(date_str: str) -> dict:
 
 
 def _live_averages_7d() -> dict:
-    """Compute 7-day daily averages from decisions.json for the live view nodes."""
-    today = datetime.now().date()
-    buckets: dict = {"solar": [], "house": [], "import": [], "bat_kwh": []}
-    for i in range(1, 8):
-        ds = (today - timedelta(days=i)).isoformat()
-        h = _hourly_from_decisions(ds)
-        kpi = h.get("kpi", {})
-        if kpi.get("solar_kwh", 0) > 0 or kpi.get("consumption_kwh", 0) > 0:
-            buckets["solar"].append(kpi.get("solar_kwh", 0))
-            buckets["house"].append(kpi.get("consumption_kwh", 0))
-            buckets["import"].append(kpi.get("import_kwh", 0))
-            bd = sum(v for v in h.get("bat_discharge", []) if v)
-            buckets["bat_kwh"].append(bd)
-    def avg(lst): return round(sum(lst) / len(lst), 1) if lst else None
+    """W-level 7-day averages from 15-min decision samples.
+
+    SOL: mean only when > 0  (real production during daylight hours)
+    RED: net mean  (+ = export, - = import)
+    BAT: net mean  (+ = charging, - = discharging)
+    CASA: mean of (sol - red - bat) for each sample
+    """
+    cutoff = datetime.now() - timedelta(days=7)
+    sol_v, red_v, bat_v, casa_v = [], [], [], []
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                s    = dec.get("sensors", {})
+                sol  = s.get("solar_power")  or 0
+                red  = s.get("grid_power")   or 0
+                bat  = s.get("battery_power") or 0
+                casa = sol - red - bat
+                if sol > 0:
+                    sol_v.append(sol)
+                red_v.append(red)
+                bat_v.append(bat)
+                if casa > 0:
+                    casa_v.append(casa)
+        except Exception:
+            pass
+    def avg(lst): return round(sum(lst) / len(lst)) if lst else None
     return {
-        "days":       len(buckets["solar"]),
-        "solar_kwh":  avg(buckets["solar"]),
-        "house_kwh":  avg(buckets["house"]),
-        "import_kwh": avg(buckets["import"]),
-        "bat_kwh":    avg(buckets["bat_kwh"]),
+        "samples":  len(red_v),
+        "avg_sol":  avg(sol_v),   # W, solar-hours only
+        "avg_red":  avg(red_v),   # W, net (+ export / - import)
+        "avg_bat":  avg(bat_v),   # W, net (+ charge / - discharge)
+        "avg_casa": avg(casa_v),  # W, house consumption
     }
 
 
@@ -4788,12 +4942,44 @@ def api_wizard_data_quality():
         }
     })
 
+    # ── Get oldest record (first_ts) from InfluxDB ──────────────────────────
+    first_ts = None
+    if influx_cfg.get("host"):
+        try:
+            url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
+            db   = influx_cfg.get("db", "homeassistant")
+            user = influx_cfg.get("username", "")
+            pwd  = influx_cfg.get("password", "")
+            probe = next((v for v in sensors.values() if v), None) or cfg("sensor_battery_soc", "")
+            if probe:
+                meas = probe.split(".")[-1] if "." in probe else probe
+                resp_f, _, _ = _influx_query(url, db, f'SELECT * FROM "{meas}" ORDER BY time ASC LIMIT 1', user, pwd)
+                if resp_f:
+                    try:
+                        first_ts = resp_f["results"][0]["series"][0]["values"][0][0][:10]
+                    except (KeyError, IndexError, TypeError):
+                        pass
+            if not first_ts:
+                resp_m, _, _ = _influx_query(url, db, "SHOW MEASUREMENTS LIMIT 5", user, pwd)
+                if resp_m:
+                    try:
+                        for row in resp_m["results"][0]["series"][0]["values"]:
+                            resp_f, _, _ = _influx_query(url, db, f'SELECT * FROM "{row[0]}" ORDER BY time ASC LIMIT 1', user, pwd)
+                            if resp_f:
+                                first_ts = resp_f["results"][0]["series"][0]["values"][0][0][:10]
+                                break
+                    except (KeyError, IndexError, TypeError):
+                        pass
+        except Exception as e:
+            log.debug(f"first_ts query failed: {e}")
+
     return jsonify({
         "ok":            True,
         "score":         score,
         "source":        source_label,
         "samples":       samples,
         "total_samples": sum(samples.values()),
+        "first_ts":      first_ts,
         "error":         None,
     })
 

@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.2.6"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.2.7"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1830,7 +1830,7 @@ th{color:var(--m);font-weight:500}
       <!-- BAT -->
       <div class="card" style="text-align:center;padding:.7rem .5rem">
         <div style="font-size:1.4rem">🔋</div>
-        <div id="lv-bat-w" style="font-size:1.3rem;font-weight:700;color:#a78bfa;line-height:1.2">—</div>
+        <div id="lv-bat-w" style="font-size:1.3rem;font-weight:700;line-height:1.2;color:#a78bfa">—</div>
         <div id="lv-bat-avg" style="font-size:.65rem;color:#7c3aed;margin-top:.1rem">Ø —</div>
         <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-bat-dir">Bat</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
       </div>
@@ -2675,10 +2675,11 @@ async function loadLive(){
 
     document.getElementById('lv-solar-w').textContent = fmt(solar);
     document.getElementById('lv-house-w').textContent = fmt(house);
-    const batSign = bat > 50 ? '+' : bat < -50 ? '-' : '';
-    document.getElementById('lv-bat-w').textContent   = batSign + fmt(Math.abs(bat));
+    // Negated display: -1300 when discharging (+bat sensor), +500 when charging (-bat sensor)
+    document.getElementById('lv-bat-w').textContent   = (bat>50?'-':bat<-50?'+':'') + fmt(Math.abs(bat));
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-dir').textContent  = bat>50?'↑ carga':bat<-50?'↓ desc':'idle';
+    document.getElementById('lv-bat-w').style.color = bat>50?'#f87171':bat<-50?'#4ade80':'#a78bfa';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'↓ desc':bat<-50?'↑ carga':'idle';
 
     const gridEl = document.getElementById('lv-grid-w');
     // Show signed value: + export (green), - import (red)
@@ -2696,25 +2697,26 @@ async function loadLive(){
       el.classList.remove('fl-dim'); el.classList.add('fl-active');
       el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
     }
-    // Physics-based flow — sensor conventions: P_bat +carga/-descarga, P_red +venta/-compra
-    const P_sol  = solar, P_red = grid, P_bat = bat;
-    const NOISE  = 10;  // W — filter noise
-    const P_casa = P_sol - P_red - P_bat;            // house balance
+    // Physics — Huawei convention: bat>0=discharging, bat<0=charging, grid>0=export, grid<0=import
+    const NOISE   = 10;
+    const P_casa  = Math.max(0, solar + bat - grid);  // house balance (same as house var above)
+    const bat_dis = Math.max(0, bat);   // discharge power (positive when discharging)
+    const bat_chg = Math.max(0, -bat);  // charge power (positive when charging)
     // Flow vectors
-    const f_sol_casa = Math.max(0, Math.min(P_sol, P_casa));
-    const f_sol_bat  = Math.max(0, Math.min(P_sol - P_casa, P_bat));
-    const f_sol_red  = Math.max(0, P_sol - P_casa - Math.max(0, P_bat));
-    const f_bat_casa = Math.max(0, -P_bat);
-    const f_red_bat  = Math.max(0, P_bat - Math.max(0, P_sol - P_casa));
-    const f_red_casa = Math.max(0, -(P_red + f_red_bat));
-    const f_export   = Math.max(0, P_red);
-    // Derived state for labels
-    const charging = P_bat > 50, discharging = P_bat < -50;
-    const importing = P_red < -50, exporting = P_red > 50;
-    // Animate lines
+    const f_sol_casa = Math.min(solar, Math.max(0, P_casa));
+    const f_sol_bat  = Math.min(Math.max(0, solar - f_sol_casa), bat_chg);
+    const f_sol_red  = Math.max(0, solar - f_sol_casa - f_sol_bat);
+    const f_bat_casa = Math.min(bat_dis, Math.max(0, P_casa - f_sol_casa));
+    const f_bat_red  = Math.max(0, bat_dis - f_bat_casa);
+    const f_red_bat  = Math.max(0, bat_chg - f_sol_bat);
+    const f_red_casa = Math.max(0, P_casa - f_sol_casa - f_bat_casa);
+    // Derived state (correct convention: bat>0=discharging)
+    const discharging = bat > 50, charging = bat < -50;
+    const importing = grid < -50, exporting = grid > 50;
+    // Animate — fl-ln-sol-grd also carries battery→grid export (f_bat_red)
     setLine('fl-ln-sol-hse', f_sol_casa > NOISE, false, spd(f_sol_casa));
     setLine('fl-ln-sol-bat', f_sol_bat  > NOISE, false, spd(f_sol_bat));
-    setLine('fl-ln-sol-grd', f_sol_red  > NOISE || f_export > NOISE, false, spd(Math.max(f_sol_red, f_export)));
+    setLine('fl-ln-sol-grd', (f_sol_red + f_bat_red) > NOISE, false, spd(f_sol_red + f_bat_red));
     setLine('fl-ln-bat-hse', f_bat_casa > NOISE, false, spd(f_bat_casa));
     setLine('fl-ln-grd-bat', f_red_bat  > NOISE, false, spd(f_red_bat));
     setLine('fl-ln-grd-hse', f_red_casa > NOISE, false, spd(f_red_casa));
@@ -2722,7 +2724,7 @@ async function loadLive(){
     document.getElementById('sv-solar-val').textContent = fmt(solar);
     document.getElementById('sv-house-val').textContent = fmt(house);
     document.getElementById('sv-bat-val').textContent   = fmt(Math.abs(bat));
-    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(charging?'↓ carga':discharging?'↑ desc':'idle');
+    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(discharging?'↓ desc':charging?'↑ carga':'idle');
     const svGridVal=document.getElementById('sv-grid-val');
     if(svGridVal){svGridVal.textContent=fmt(Math.abs(grid)); svGridVal.setAttribute('fill',grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8');}
     document.getElementById('sv-grid-lbl').textContent = exporting?'↑ exportando':importing?'↓ importando':'idle';
@@ -2769,8 +2771,10 @@ async function loadLive(){
     // BAT: net avg (+ charge purple, - discharge light)
     const batAvgEl = document.getElementById('lv-bat-avg');
     if(batAvgEl) {
-      batAvgEl.textContent = fmtAvg(av.avg_bat);
-      batAvgEl.style.color = av.avg_bat > 0 ? '#7c3aed' : av.avg_bat < 0 ? '#a78bfa' : 'var(--m)';
+      // avg_bat from sensor: >0=discharging tendency, <0=charging. Flip for display.
+      const avgBatDisp = av.avg_bat != null ? -av.avg_bat : null;
+      batAvgEl.textContent = fmtAvg(avgBatDisp);
+      batAvgEl.style.color = av.avg_bat > 0 ? '#f87171' : av.avg_bat < 0 ? '#4ade80' : 'var(--m)';
     }
     // CASA: avg consumption
     const hsAvgEl = document.getElementById('lv-house-avg');

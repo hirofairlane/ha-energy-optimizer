@@ -1705,6 +1705,12 @@ th{color:var(--m);font-weight:500}
 .chart-subnav{background:var(--b);color:var(--m);border:1px solid #334155;font-size:.8rem;padding:.35rem .8rem;border-radius:.4rem;cursor:pointer;transition:.15s}
 .chart-subnav.active{background:rgba(56,189,248,.15);color:var(--a);border-color:var(--a)}
 .chart-subnav:hover{color:var(--t)}
+/* ── SVG energy flow diagram ── */
+.fl-ln{fill:none;stroke-width:3;stroke-linecap:round;stroke-dasharray:9 7;transition:opacity .4s}
+.fl-ln.fl-dim{opacity:.1;animation:none!important}
+.fl-ln.fl-active{animation:fl-dash linear infinite}
+.fl-node-bg{fill:rgba(15,23,42,.55)}
+@keyframes fl-dash{to{stroke-dashoffset:-32}}
 .entity-picker{background:var(--bg);border:2px solid var(--b);border-radius:.6rem;padding:.7rem;margin-bottom:.7rem}
 .entity-picker-label{font-size:.72rem;color:var(--m);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.4rem;display:flex;align-items:center;justify-content:space-between}
 .entity-picker-label span{color:var(--g);font-size:.65rem}
@@ -1821,38 +1827,49 @@ th{color:var(--m);font-weight:500}
         <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-grid-dir">Grid</span></div>
       </div>
     </div>
-    <!-- Flow diagram -->
-    <div class="card" style="padding:1.2rem">
-      <div style="display:grid;grid-template-columns:1fr auto 1fr;grid-template-rows:auto auto auto;gap:.5rem 1rem;align-items:center;max-width:600px;margin:0 auto">
-        <!-- Row 1: Solar top-center -->
-        <div></div>
-        <div style="text-align:center">
-          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">☀️ SOLAR</div>
-          <div id="fl-solar" style="font-size:1.1rem;font-weight:700;color:#facc15">— W</div>
-        </div>
-        <div></div>
-        <!-- Row 2: Battery — House — Grid -->
-        <div style="text-align:right">
-          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">🔋 BATTERY</div>
-          <div id="fl-bat" style="font-size:1.1rem;font-weight:700;color:#a78bfa">— W</div>
-          <div id="fl-bat-lbl" style="font-size:.6rem;color:var(--m)">—</div>
-        </div>
-        <div style="text-align:center;background:rgba(56,189,248,.08);border:2px solid rgba(56,189,248,.3);border-radius:.7rem;padding:.6rem 1rem">
-          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">🏠 HOUSE</div>
-          <div id="fl-house" style="font-size:1.3rem;font-weight:700;color:#f97316">— W</div>
-        </div>
-        <div style="text-align:left">
-          <div style="font-size:.65rem;color:var(--m);margin-bottom:.2rem">⚡ GRID</div>
-          <div id="fl-grid" style="font-size:1.1rem;font-weight:700">— W</div>
-          <div id="fl-grid-lbl" style="font-size:.6rem;color:var(--m)">—</div>
-        </div>
-        <!-- Row 3: Tariff period + last update -->
-        <div></div>
-        <div style="text-align:center;font-size:.65rem;color:var(--m);margin-top:.2rem">
-          <span id="fl-tariff"></span> · <span id="fl-ts">—</span>
-        </div>
-        <div></div>
-      </div>
+    <!-- SVG energy flow diagram -->
+    <div class="card" style="padding:.7rem 1rem">
+      <svg id="flow-svg" viewBox="0 0 440 270" style="width:100%;max-height:230px;display:block">
+        <!-- Connection lines (behind nodes) -->
+        <!-- Solar → House (vertical) -->
+        <path id="fl-ln-sol-hse" class="fl-ln fl-dim" d="M220,72 L220,150" stroke="#facc15"/>
+        <!-- Solar → Battery (curve left) -->
+        <path id="fl-ln-sol-bat" class="fl-ln fl-dim" d="M183,70 C148,105 118,142 105,172" stroke="#facc15"/>
+        <!-- Solar → Grid (curve right) -->
+        <path id="fl-ln-sol-grd" class="fl-ln fl-dim" d="M257,70 C292,105 322,142 335,172" stroke="#4ade80"/>
+        <!-- Battery → House (diagonal) -->
+        <path id="fl-ln-bat-hse" class="fl-ln fl-dim" d="M128,185 L162,162" stroke="#a78bfa"/>
+        <!-- Grid → House (diagonal) -->
+        <path id="fl-ln-grd-hse" class="fl-ln fl-dim" d="M312,185 L278,162" stroke="#f87171"/>
+
+        <!-- Solar node (top center) -->
+        <rect x="165" y="14" width="110" height="58" rx="11" class="fl-node-bg" stroke="#facc15" stroke-width="1.5"/>
+        <text x="220" y="36" text-anchor="middle" font-size="19">☀️</text>
+        <text id="sv-solar-val" x="220" y="53" text-anchor="middle" fill="#facc15" font-size="13" font-weight="700" font-family="sans-serif">—</text>
+        <text x="220" y="66" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">SOLAR</text>
+
+        <!-- House node (center, prominent) -->
+        <rect x="152" y="150" width="136" height="68" rx="13" fill="rgba(249,115,22,.08)" stroke="#f97316" stroke-width="2.5"/>
+        <text x="220" y="174" text-anchor="middle" font-size="22">🏠</text>
+        <text id="sv-house-val" x="220" y="193" text-anchor="middle" fill="#f97316" font-size="15" font-weight="700" font-family="sans-serif">—</text>
+        <text x="220" y="207" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">CONSUMO CASA</text>
+
+        <!-- Battery node (bottom left) -->
+        <rect x="12" y="172" width="112" height="62" rx="11" class="fl-node-bg" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="68" y="194" text-anchor="middle" font-size="18">🔋</text>
+        <text id="sv-bat-val" x="68" y="212" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700" font-family="sans-serif">—</text>
+        <text id="sv-bat-lbl" x="68" y="226" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">—</text>
+
+        <!-- Grid node (bottom right) -->
+        <rect x="316" y="172" width="112" height="62" rx="11" class="fl-node-bg" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="372" y="194" text-anchor="middle" font-size="18">⚡</text>
+        <text id="sv-grid-val" x="372" y="212" text-anchor="middle" fill="#94a3b8" font-size="12" font-weight="700" font-family="sans-serif">—</text>
+        <text id="sv-grid-lbl" x="372" y="226" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">—</text>
+
+        <!-- Footer: tariff + timestamp -->
+        <text id="sv-tariff" x="110" y="258" text-anchor="middle" fill="#475569" font-size="9" font-family="sans-serif">—</text>
+        <text id="sv-ts"     x="330" y="258" text-anchor="middle" fill="#334155" font-size="9" font-family="sans-serif">—</text>
+      </svg>
     </div>
     <!-- SOC bar -->
     <div class="card" style="margin-top:.7rem">
@@ -2638,18 +2655,37 @@ async function loadLive(){
     gridEl.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
     document.getElementById('lv-grid-dir').textContent = grid>50?'Exporting':grid<-50?'Importing':'Idle';
 
-    // Flow diagram
-    document.getElementById('fl-solar').textContent = fmt(solar);
-    document.getElementById('fl-house').textContent = fmt(house);
-    document.getElementById('fl-bat').textContent   = fmt(Math.abs(bat));
-    document.getElementById('fl-bat-lbl').textContent = bat>50?'▲ charging':bat<-50?'▼ discharging':'● idle';
-    const flGrid = document.getElementById('fl-grid');
-    flGrid.textContent = fmt(Math.abs(grid));
-    flGrid.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
-    document.getElementById('fl-grid-lbl').textContent = grid>50?'▲ exporting':grid<-50?'▼ importing':'● idle';
-    const tp = s.tariff?.period||'';
-    document.getElementById('fl-tariff').innerHTML = tp ? `<span class="badge ${tp}">${tp}</span>` : '';
-    document.getElementById('fl-ts').textContent = new Date().toLocaleTimeString();
+    // SVG flow diagram
+    const spd = p => Math.max(0.35, 2.4 - Math.abs(p)/1800)+'s';
+    function setLine(id, on, reverse=false, dur='1.6s'){
+      const el=document.getElementById(id); if(!el) return;
+      if(!on){ el.classList.add('fl-dim'); el.classList.remove('fl-active');
+               el.style.animationDuration=''; el.style.animationDirection=''; return; }
+      el.classList.remove('fl-dim'); el.classList.add('fl-active');
+      el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
+    }
+    const importing=grid<-50, exporting=grid>50, charging=bat<-50, discharging=bat>50, hasSolar=solar>100;
+    // Solar → House: solar actively powering the house
+    setLine('fl-ln-sol-hse', hasSolar && house>50, false, spd(Math.min(solar,house)));
+    // Solar → Battery: solar charging battery
+    setLine('fl-ln-sol-bat', hasSolar && charging, false, spd(Math.abs(bat)));
+    // Solar → Grid: exporting excess to grid (forward); Grid → Solar path reversed if importing
+    setLine('fl-ln-sol-grd', exporting, false, spd(grid));
+    // Battery ↔ House: discharge (forward) or charging from grid (reverse)
+    setLine('fl-ln-bat-hse', discharging || (charging && !hasSolar), charging && !hasSolar, spd(Math.abs(bat)));
+    // Grid → House: importing
+    setLine('fl-ln-grd-hse', importing, false, spd(Math.abs(grid)));
+
+    document.getElementById('sv-solar-val').textContent = fmt(solar);
+    document.getElementById('sv-house-val').textContent = fmt(house);
+    document.getElementById('sv-bat-val').textContent   = fmt(Math.abs(bat));
+    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(discharging?'↑ desc':charging?'↓ carga':'idle');
+    const svGridVal=document.getElementById('sv-grid-val');
+    if(svGridVal){svGridVal.textContent=fmt(Math.abs(grid)); svGridVal.setAttribute('fill',grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8');}
+    document.getElementById('sv-grid-lbl').textContent = exporting?'↑ exportando':importing?'↓ importando':'idle';
+    const tp=s.tariff?.period||'';
+    document.getElementById('sv-tariff').textContent = tp?`${tp} · ${(s.tariff?.price_kwh??0).toFixed(3)} €/kWh`:'';
+    document.getElementById('sv-ts').textContent = new Date().toLocaleTimeString();
 
     // SOC 24h chart
     const sdat = cd.soc||{};

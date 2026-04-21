@@ -1727,6 +1727,7 @@ th{color:var(--m);font-weight:500}
 .hw-card .hw-name{font-size:.76rem;font-weight:600;color:var(--t)}
 .hw-card .hw-desc{font-size:.62rem;color:var(--m);margin-top:.12rem}
 .wiz-nav{display:flex;justify-content:space-between;align-items:center;margin-top:1rem;gap:.5rem}
+.wiz-pane .wiz-nav{display:none}
 .wiz-progress{font-size:.72rem;color:var(--m)}
 .comic-btn{font-family:'Bangers',cursive;font-size:1.1rem;letter-spacing:.05em;padding:.5rem 1.4rem;border:3px solid #1e293b;border-radius:.6rem;box-shadow:3px 3px 0 #1e293b;cursor:pointer;transition:.1s transform,.1s box-shadow}
 .comic-btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 #1e293b}
@@ -1745,13 +1746,13 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v3.0.0</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">__VERSION__</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
   <button class="tab" onclick="showTab('charts')">Charts</button>
   <button class="tab" onclick="showTab('tariff')">Tariff</button>
-  <button class="tab" onclick="showTab('setup')">Setup</button>
+  <button class="tab" onclick="showTab('setup')">Tweaks</button>
   <button class="tab" onclick="showTab('wizard')" style="color:#fbbf24">Wizard</button>
 </div>
 
@@ -2070,6 +2071,8 @@ th{color:var(--m);font-weight:500}
     </div>
 
     <div class="wiz-steps" id="wiz-dots"></div>
+    <!-- Global navigation bar — updated by _wizNavUpdate() on every step change -->
+    <div id="wiz-nav" class="wiz-nav" style="margin-bottom:.9rem"></div>
 
     <!-- ── Step 0: Data Sources ─────────────────────────────────────────── -->
     <div class="wiz-pane active" id="wiz-pane-0">
@@ -2101,7 +2104,7 @@ th{color:var(--m);font-weight:500}
           </div>
         </div>
         <!-- Already-connected banner (shown when host is saved + tested OK) -->
-        <div id="wiz-influx-ok" style="display:none;background:rgba(74,222,128,.08);border:1px solid rgba(74,222,128,.3);border-radius:.5rem;padding:.6rem .8rem;margin-bottom:.6rem;display:flex;align-items:center;justify-content:space-between;gap:.6rem">
+        <div id="wiz-influx-ok" style="display:none;background:rgba(74,222,128,.08);border:1px solid rgba(74,222,128,.3);border-radius:.5rem;padding:.6rem .8rem;margin-bottom:.6rem;align-items:center;justify-content:space-between;gap:.6rem">
           <div>
             <span style="color:var(--g);font-weight:600">✓ Connected</span>
             <span id="wiz-influx-ok-detail" style="font-size:.72rem;color:var(--m);margin-left:.5rem">—</span>
@@ -3150,15 +3153,34 @@ function wizRenderDots() {
   ).join('');
 }
 
+function _wizNavUpdate() {
+  const nav = document.getElementById('wiz-nav');
+  if (!nav) return;
+  const isFirst = wizStep === 0;
+  const isLast  = wizStep === WIZ_STEPS.length - 1;
+  const isLoads = wizStep === 5;
+  if (isLoads) return;  // loads manages its own nav via wizLoadsEnter/_wizLoadsUpdateNav
+  nav.innerHTML =
+    (isFirst ? '<span></span>' : `<button class="comic-btn back" onclick="wizBack()">← Back</button>`) +
+    `<span class="wiz-progress">Step ${wizStep+1} of ${WIZ_STEPS.length} — ${WIZ_STEPS[wizStep]}</span>` +
+    (isLast
+      ? `<button class="comic-btn save" onclick="wizSave()">Save &amp; Activate</button>`
+      : `<button class="comic-btn next" onclick="wizNext()">Next →</button>`);
+}
+
 function wizGoTo(step) {
   document.querySelectorAll('.wiz-pane').forEach(p=>p.classList.remove('active'));
   document.getElementById('wiz-pane-'+step).classList.add('active');
   wizStep = step;
   wizRenderDots();
+  _wizNavUpdate();
   _wizShowAllCands();
   if (step === 6) wizRenderTariffInStep();
   if (step === 7) wizBuildSummary();
 }
+
+function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); }
+function wizBack() { if(wizStep > 0) wizGoTo(wizStep-1); }
 
 function wizRenderTariffInStep() {
   if (!tariffCfg) { loadTariff().then(()=>wizRenderTariffInStep()); return; }
@@ -3208,9 +3230,6 @@ async function wizSaveTariff() {
   notify(r.ok?'✓ Tariff saved':'✗ Error','r.ok?\'ok\':\'err\'');
 }
 
-function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); }
-function wizBack() { if(wizStep > 0) wizGoTo(wizStep-1); }
-
 // ── Data source step ───────────────────────────────────────────────────────────
 function wizSelectDS(ds) {
   wizCfg.data_source = ds;
@@ -3226,7 +3245,7 @@ function wizSelectDS(ds) {
     const host = wizCfg.influxdb?.host;
     const ft   = wizCfg.influxdb?.first_ts;
     if (host && ft) {
-      document.getElementById('wiz-influx-ok').style.display = 'flex';
+      const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
       document.getElementById('wiz-influx-ok-detail').textContent =
         `${host} · data from ${ft}`;
       document.getElementById('wiz-influx-fields').style.display = 'none';
@@ -3276,7 +3295,7 @@ async function wizTestInflux() {
       if (wizCfg.influxdb.first_ts) {
         document.getElementById('wiz-influx-ok-detail').textContent =
           `${wizCfg.influxdb.host} · data from ${wizCfg.influxdb.first_ts}`;
-        document.getElementById('wiz-influx-ok').style.display = 'flex';
+        const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
         document.getElementById('wiz-influx-fields').style.display = 'none';
       }
     } else {
@@ -3530,8 +3549,7 @@ function wizLoadsEnter() {
 
 function _wizLoadsUpdateNav() {
   const devices = wizCfg.hardware.filter(h=>h!=='');
-  const prog = document.getElementById('wiz-loads-progress');
-  const nav  = document.getElementById('wiz-loads-nav');
+  const nav = document.getElementById('wiz-nav');  // use global nav
   if (!nav) return;
   const grid = document.getElementById('wiz-hw-grid');
   const ents = document.getElementById('wiz-loads-entities');
@@ -3915,9 +3933,17 @@ setInterval(loadWeather,300000);
 # ── API endpoints ────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    # Inject HA ingress base path so JS fetch() calls reach this add-on, not HA core
     base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-    return PANEL.replace("__BASE__", base)
+    ver = "v3.1.6"
+    try:
+        import yaml as _yaml
+        _cfg_path = Path(__file__).parent.parent.parent.parent / "config.yaml"
+        if _cfg_path.exists():
+            _d = _yaml.safe_load(_cfg_path.read_text())
+            ver = "v" + str(_d.get("version", "3.1.6"))
+    except Exception:
+        pass
+    return PANEL.replace("__BASE__", base).replace("__VERSION__", ver)
 
 @app.route("/api/status")
 def api_status():
@@ -4735,7 +4761,7 @@ def main():
     _load_wizard_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v3.0.0 — HAOS")
+    log.info("   Energy Optimizer v3.1.6 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

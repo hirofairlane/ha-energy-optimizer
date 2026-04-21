@@ -3291,13 +3291,11 @@ async function wizTestInflux() {
       wizUpdateDQ(r.score||0);
       wizDQSamples = r.samples||{};
       wizCfg.influxdb.first_ts = r.first_ts || null;
-      // Switch to "already connected" banner
-      if (wizCfg.influxdb.first_ts) {
-        document.getElementById('wiz-influx-ok-detail').textContent =
-          `${wizCfg.influxdb.host} · data from ${wizCfg.influxdb.first_ts}`;
-        const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
-        document.getElementById('wiz-influx-fields').style.display = 'none';
-      }
+      // Switch to "already connected" banner (always, as long as connection succeeded)
+      const _detail = r.first_ts ? `${wizCfg.influxdb.host} · data from ${r.first_ts}` : `${wizCfg.influxdb.host} · connected`;
+      document.getElementById('wiz-influx-ok-detail').textContent = _detail;
+      const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
+      document.getElementById('wiz-influx-fields').style.display = 'none';
     } else {
       st.style.color = '#ef4444'; st.textContent = '✗ ' + (r.error||'Connection failed');
     }

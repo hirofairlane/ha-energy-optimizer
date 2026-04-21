@@ -1718,6 +1718,7 @@ th{color:var(--m);font-weight:500}
 .entity-cand{background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.3);color:var(--a);padding:.2rem .55rem;border-radius:.3rem;font-size:.7rem;cursor:pointer;transition:.15s}
 .entity-cand:hover{background:rgba(56,189,248,.2);border-color:var(--a)}
 .entity-cand.best{background:rgba(74,222,128,.12);border-color:var(--g);color:var(--g)}
+.ent-search-btn{background:none;border:1px solid var(--b);border-radius:.4rem;padding:.2rem .45rem;cursor:pointer;color:var(--m);font-size:.85rem;flex-shrink:0;line-height:1;transition:.15s}.ent-search-btn:hover{border-color:var(--a);color:var(--a)}.entity-picker-row{display:flex;gap:.3rem;align-items:center}.entity-picker-row input{flex:1;min-width:0}
 .entity-state{font-size:.68rem;color:var(--m);margin-top:.15rem}
 .hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:.6rem;margin-bottom:.9rem}
 .hw-card{background:var(--bg);border:3px solid var(--b);border-radius:.8rem;padding:.75rem;cursor:pointer;transition:.15s;box-shadow:3px 3px 0 var(--b);text-align:center}
@@ -3177,6 +3178,7 @@ function wizGoTo(step) {
   _wizShowAllCands();
   if (step === 6) wizRenderTariffInStep();
   if (step === 7) wizBuildSummary();
+  setTimeout(_wizAddSearchButtons, 80);
 }
 
 function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); }
@@ -3245,10 +3247,11 @@ function wizSelectDS(ds) {
     const host = wizCfg.influxdb?.host;
     const ft   = wizCfg.influxdb?.first_ts;
     if (host) {
-      const detail = ft ? `${host} · data from ${ft}` : `${host} · previously configured`;
+      const detail = ft ? `${host} · data since ${ft}` : `${host} · checking…`;
       document.getElementById('wiz-influx-ok-detail').textContent = detail;
       const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
       document.getElementById('wiz-influx-fields').style.display = 'none';
+      if (!ft) setTimeout(_wizAutoTestInflux, 200);
     } else {
       document.getElementById('wiz-influx-ok').style.display = 'none';
       document.getElementById('wiz-influx-fields').style.display = '';
@@ -3292,7 +3295,7 @@ async function wizTestInflux() {
       wizDQSamples = r.samples||{};
       wizCfg.influxdb.first_ts = r.first_ts || null;
       // Switch to "already connected" banner (always, as long as connection succeeded)
-      const _detail = r.first_ts ? `${wizCfg.influxdb.host} · data from ${r.first_ts}` : `${wizCfg.influxdb.host} · connected`;
+      const _detail = r.first_ts ? `${wizCfg.influxdb.host} · data since ${r.first_ts}` : `${wizCfg.influxdb.host} · connected (no history yet)`;
       document.getElementById('wiz-influx-ok-detail').textContent = _detail;
       const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
       document.getElementById('wiz-influx-fields').style.display = 'none';
@@ -3301,6 +3304,28 @@ async function wizTestInflux() {
     }
   } catch(e) { st.style.color='#ef4444'; st.textContent='✗ Network error'; }
   btn.disabled = false;
+}
+
+async function _wizAutoTestInflux() {
+  try {
+    const r = await fetch(BASE+'/api/wizard/data-quality', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({influxdb: wizCfg.influxdb, sensors: wizCfg.sensors})
+    }).then(r=>r.json());
+    const el = document.getElementById('wiz-influx-ok-detail');
+    if (!el) return;
+    if (r.ok) {
+      wizCfg.influxdb.first_ts = r.first_ts || null;
+      el.textContent = r.first_ts
+        ? `${wizCfg.influxdb.host} · data since ${r.first_ts}`
+        : `${wizCfg.influxdb.host} · connected (no history yet)`;
+    } else {
+      el.textContent = `${wizCfg.influxdb.host} · previously configured`;
+    }
+  } catch(e) {
+    const el = document.getElementById('wiz-influx-ok-detail');
+    if (el) el.textContent = (wizCfg.influxdb?.host||'') + ' · previously configured';
+  }
 }
 
 // ── Location ───────────────────────────────────────────────────────────────────
@@ -3390,7 +3415,7 @@ function _wizShowAllCands() {
     if (!inputEl.value && wizCfg.sensors[role]) inputEl.value = wizCfg.sensors[role];
     _wizRenderCands(role, m.inputId, m.candsId, m.stateId, m.statusId);
   });
-  if (wizStep === 5) wizRenderLoadsEntities();
+  if (wizStep === 5) wizLoadsEnter();
   if (wizStep === 2) _wizRenderSubmeters();
 }
 
@@ -3572,7 +3597,7 @@ function _wizLoadsUpdateNav() {
       ${isLast
         ? `<button class="comic-btn next" onclick="wizNext()">Next →</button>`
         : `<button class="comic-btn next" onclick="wizLoadsNext()">${{hvac:'Pool',pool:'Dishwasher',dishwasher:'Washer',washer:'Dryer',dryer:'EV',ev:'Done'}[dev]||'Next'} →</button>`}`;
-    setTimeout(()=>_wizLoadsRenderCands(), 50);
+    setTimeout(()=>{ _wizLoadsRenderCands(); _wizAddSearchButtons(); }, 60);
   }
 }
 
@@ -3918,6 +3943,30 @@ function _wizPopulateFields() {
   Object.entries(fieldMap).forEach(([role,id]) => {
     const el = document.getElementById(id);
     if (el && wizCfg.sensors?.[role]) el.value = wizCfg.sensors[role];
+  });
+}
+
+function _wizAddSearchButtons() {
+  document.querySelectorAll('.entity-picker').forEach(picker => {
+    if (picker.querySelector('.ent-search-btn')) return;
+    const input = picker.querySelector('input.entity-select');
+    if (!input || !input.id) return;
+    const candsId = input.id + '-cands';
+    const oninp = input.getAttribute('oninput') || '';
+    const rm = oninp.match(/_wizRenderCands\('["']?([^'"]+)['"]?/);
+    const wm = oninp.match(/wizEntityTyped\('["']?([^'"]+)['"]?/);
+    const role = (rm && rm[1]) || (wm && wm[1]) || '';
+    const row = document.createElement('div');
+    row.className = 'entity-picker-row';
+    input.parentNode.insertBefore(row, input);
+    row.appendChild(input);
+    const btn = document.createElement('button');
+    btn.className = 'ent-search-btn';
+    btn.title = 'Browse entities';
+    btn.textContent = '🔍';
+    btn.type = 'button';
+    btn.onclick = () => { input.value = ''; _wizRenderCands(role, input.id, candsId, null, null); input.focus(); };
+    row.appendChild(btn);
   });
 }
 

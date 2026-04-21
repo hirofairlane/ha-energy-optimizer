@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Energy Optimizer — Home Assistant Add-on v2.4
 Smart energy management: battery, heat pump, pool pump, pool cleaner, dishwasher
@@ -30,6 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
+ADD_ON_VERSION = "3.2.4"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1838,6 +1839,7 @@ th{color:var(--m);font-weight:500}
         <path id="fl-ln-sol-grd" class="fl-ln fl-dim" d="M253,76 C288,110 326,145 372,168" stroke="#4ade80"/>
         <path id="fl-ln-bat-hse" class="fl-ln fl-dim" d="M120,198 L148,193" stroke="#a78bfa"/>
         <path id="fl-ln-grd-hse" class="fl-ln fl-dim" d="M320,198 L292,193" stroke="#f87171"/>
+        <path id="fl-ln-grd-bat" class="fl-ln fl-dim" d="M316,215 C260,252 180,252 124,215" stroke="#f87171"/>
 
         <!-- Solar node (top center) -->
         <rect x="165" y="14" width="110" height="58" rx="11" class="fl-node-bg" stroke="#facc15" stroke-width="1.5"/>
@@ -1869,11 +1871,12 @@ th{color:var(--m);font-weight:500}
       </svg>
     </div>
     <!-- 7-day averages row -->
-    <div id="lv-avgs" style="display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem;margin-top:.4rem;text-align:center;font-size:.68rem;color:var(--m)">
-      <div>☀️ <span id="avg-solar">—</span></div>
-      <div>🏠 <span id="avg-house">—</span></div>
-      <div>🔋 <span id="avg-bat">—</span></div>
-      <div>⚡ <span id="avg-grid">—</span></div>
+    <div id="lv-avgs" style="display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;margin-top:.4rem;text-align:center;font-size:.68rem;color:var(--m)">
+      <div>🔋 <span id="avg-bat" title="Avg daily battery discharge">—</span><br><span style="font-size:.6rem">bat total</span></div>
+      <div>🏠 <span id="avg-house" title="Avg daily net house consumption">—</span><br><span style="font-size:.6rem">consumo casa</span></div>
+      <div>⚡ <span id="avg-grid" title="Avg daily grid import">—</span><br><span style="font-size:.6rem">import. red</span></div>
+      <div>🔋☀️ <span id="avg-bat-solar" title="Avg battery discharge during solar hours (08-20h)">—</span><br><span style="font-size:.6rem">bat solar</span></div>
+      <div>☀️ <span id="avg-solar" title="Avg daily solar production">—</span><br><span style="font-size:.6rem">solar</span></div>
     </div>
     <!-- SOC bar -->
     <div class="card" style="margin-top:.7rem">
@@ -2669,7 +2672,7 @@ async function loadLive(){
     document.getElementById('lv-house-w').textContent = fmt(house);
     document.getElementById('lv-bat-w').textContent   = fmt(Math.abs(bat));
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-dir').textContent  = bat>50?'Charging':bat<-50?'Discharging':'Idle';
+    document.getElementById('lv-bat-dir').textContent  = bat<-50?'Charging':bat>50?'Discharging':'Idle';
 
     const gridEl = document.getElementById('lv-grid-w');
     gridEl.textContent = fmt(Math.abs(grid));
@@ -2692,10 +2695,13 @@ async function loadLive(){
     setLine('fl-ln-sol-bat', hasSolar && charging, false, spd(Math.abs(bat)));
     // Solar → Grid: exporting excess to grid (forward); Grid → Solar path reversed if importing
     setLine('fl-ln-sol-grd', exporting, false, spd(grid));
-    // Battery ↔ House: discharge (forward) or charging from grid (reverse)
-    setLine('fl-ln-bat-hse', discharging || (charging && !hasSolar), charging && !hasSolar, spd(Math.abs(bat)));
-    // Grid → House: importing
-    setLine('fl-ln-grd-hse', importing, false, spd(Math.abs(grid)));
+    // Battery ↔ House: discharge only (forward); charging from grid uses fl-ln-grd-bat
+    setLine('fl-ln-bat-hse', discharging, false, spd(Math.abs(bat)));
+    // Grid → Battery: direct arc when charging from grid (no solar)
+    setLine('fl-ln-grd-bat', charging && importing && !hasSolar, false, spd(Math.abs(bat)));
+    // Grid → House: importing (grid powering house consumption)
+    const houseConsumingFromGrid = importing && (house > 50);
+    setLine('fl-ln-grd-hse', houseConsumingFromGrid, false, spd(Math.abs(grid)));
 
     document.getElementById('sv-solar-val').textContent = fmt(solar);
     document.getElementById('sv-house-val').textContent = fmt(house);
@@ -2732,11 +2738,15 @@ async function loadLive(){
 
     // 7-day averages row
     const av = cd.averages||{};
-    const fav = (v,u) => v!=null ? `Ø${av.days||7}d: ${v} ${u}` : '—';
-    document.getElementById('avg-solar').textContent = fav(av.solar_kwh,'kWh/d');
-    document.getElementById('avg-house').textContent = fav(av.house_kwh,'kWh/d');
-    document.getElementById('avg-bat').textContent   = fav(av.bat_kwh,'kWh/d');
-    document.getElementById('avg-grid').textContent  = fav(av.import_kwh,'kWh imp/d');
+    const fav = (v,u) => v!=null ? `${v} ${u}` : '—';
+    const d7  = av.days||7;
+    const favd = (v,u) => v!=null ? `Ø${d7}d: ${v} ${u}` : '—';
+    document.getElementById('avg-solar').textContent     = fav(av.solar_kwh,'kWh/d');
+    document.getElementById('avg-house').textContent     = fav(av.house_kwh,'kWh/d');
+    document.getElementById('avg-bat').textContent       = fav(av.bat_kwh,'kWh/d');
+    document.getElementById('avg-grid').textContent      = fav(av.import_kwh,'kWh/d');
+    const bsEl = document.getElementById('avg-bat-solar');
+    if(bsEl) bsEl.textContent = fav(av.bat_solar_kwh,'kWh/d');
   } catch(e){ console.warn('Live error',e); }
 }
 
@@ -4078,15 +4088,7 @@ setInterval(loadWeather,300000);
 @app.route("/")
 def index():
     base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-    ver = "v3.1.6"
-    try:
-        import yaml as _yaml
-        _cfg_path = Path(__file__).parent.parent.parent.parent / "config.yaml"
-        if _cfg_path.exists():
-            _d = _yaml.safe_load(_cfg_path.read_text())
-            ver = "v" + str(_d.get("version", "3.1.6"))
-    except Exception:
-        pass
+    ver = "v" + ADD_ON_VERSION
     return PANEL.replace("__BASE__", base).replace("__VERSION__", ver)
 
 @app.route("/api/status")
@@ -4239,7 +4241,7 @@ def _hourly_from_decisions(date_str: str) -> dict:
 def _live_averages_7d() -> dict:
     """Compute 7-day daily averages from decisions.json for the live view nodes."""
     today = datetime.now().date()
-    buckets: dict = {"solar": [], "house": [], "import": [], "bat_kwh": []}
+    buckets: dict = {"solar": [], "house": [], "import": [], "bat_kwh": [], "bat_solar_kwh": []}
     for i in range(1, 8):
         ds = (today - timedelta(days=i)).isoformat()
         h = _hourly_from_decisions(ds)
@@ -4250,13 +4252,18 @@ def _live_averages_7d() -> dict:
             buckets["import"].append(kpi.get("import_kwh", 0))
             bd = sum(v for v in h.get("bat_discharge", []) if v)
             buckets["bat_kwh"].append(bd)
+            # discharge during solar hours (08:00–20:00 = indices 8–19)
+            sol_hrs = h.get("bat_discharge", [])
+            bd_sol = sum(v for v in sol_hrs[8:20] if v)
+            buckets["bat_solar_kwh"].append(bd_sol)
     def avg(lst): return round(sum(lst) / len(lst), 1) if lst else None
     return {
-        "days":       len(buckets["solar"]),
-        "solar_kwh":  avg(buckets["solar"]),
-        "house_kwh":  avg(buckets["house"]),
-        "import_kwh": avg(buckets["import"]),
-        "bat_kwh":    avg(buckets["bat_kwh"]),
+        "days":          len(buckets["solar"]),
+        "solar_kwh":     avg(buckets["solar"]),
+        "house_kwh":     avg(buckets["house"]),
+        "import_kwh":    avg(buckets["import"]),
+        "bat_kwh":       avg(buckets["bat_kwh"]),
+        "bat_solar_kwh": avg(buckets["bat_solar_kwh"]),
     }
 
 

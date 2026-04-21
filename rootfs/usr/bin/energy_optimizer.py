@@ -3327,7 +3327,8 @@ function wizEntityTyped(role, inputId, statusId, stateId) {
   }
   // Live-filter candidates as user types
   const m = WIZ_CANDS_MAP[role];
-  if (m?.candsId) _wizRenderCands(role, inputId, m.candsId, stateId||m.stateId, statusId||m.statusId);
+  const _candsId = m?.candsId || (inputId + '-cands');
+  _wizRenderCands(role, inputId, _candsId, stateId||m?.stateId, statusId||m?.statusId);
 }
 
 function _wizUpdateStatusBadge(statusId, role, val) {
@@ -3692,18 +3693,18 @@ function wizRenderLoadsEntities() {
         <input class="entity-select" value="${z.name||''}" placeholder="Zone name (e.g. Ground floor)" style="margin-bottom:.4rem" oninput="wizCfg.hvac_zones[${zi}].name=this.value">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
           <div class="entity-picker"><div class="entity-picker-label">Climate entity</div>
-            <input class="entity-select" id="wiz-hvac-cli-${zi}" value="${z.climate||''}" placeholder="climate.aerotermia" oninput="wizCfg.hvac_zones[${zi}].climate=this.value">
+            <input class="entity-select" id="wiz-hvac-cli-${zi}" value="${z.climate||''}" placeholder="climate.aerotermia" oninput="wizCfg.hvac_zones[${zi}].climate=this.value;_wizRenderCands('hvac_mode','wiz-hvac-cli-'+zi,'wiz-hvac-cli-'+zi+'-cands',null,null)">
             <div id="wiz-hvac-cli-${zi}-cands" class="entity-cands"></div></div>
           <div class="entity-picker"><div class="entity-picker-label">Temp sensor</div>
-            <input class="entity-select" id="wiz-hvac-ts-${zi}" value="${z.temp_sensor||''}" placeholder="sensor.indoor_temp" oninput="wizCfg.hvac_zones[${zi}].temp_sensor=this.value">
+            <input class="entity-select" id="wiz-hvac-ts-${zi}" value="${z.temp_sensor||''}" placeholder="sensor.indoor_temp" oninput="wizCfg.hvac_zones[${zi}].temp_sensor=this.value;_wizRenderCands('temp_indoor','wiz-hvac-ts-'+zi,'wiz-hvac-ts-'+zi+'-cands',null,null)">
             <div id="wiz-hvac-ts-${zi}-cands" class="entity-cands"></div></div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.3rem">
           <div class="entity-picker"><div class="entity-picker-label">Heat setpoint</div>
-            <input class="entity-select" id="wiz-hvac-ht-${zi}" value="${z.temp_heat||''}" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_heat=this.value">
+            <input class="entity-select" id="wiz-hvac-ht-${zi}" value="${z.temp_heat||''}" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_heat=this.value;_wizRenderCands('hvac_temp_heat','wiz-hvac-ht-'+zi,'wiz-hvac-ht-'+zi+'-cands',null,null)">
             <div id="wiz-hvac-ht-${zi}-cands" class="entity-cands"></div></div>
           <div class="entity-picker"><div class="entity-picker-label">Cool setpoint</div>
-            <input class="entity-select" id="wiz-hvac-cl-${zi}" value="${z.temp_cool||''}" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_cool=this.value">
+            <input class="entity-select" id="wiz-hvac-cl-${zi}" value="${z.temp_cool||''}" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_cool=this.value;_wizRenderCands('hvac_temp_cool','wiz-hvac-cl-'+zi,'wiz-hvac-cl-'+zi+'-cands',null,null)">
             <div id="wiz-hvac-cl-${zi}-cands" class="entity-cands"></div></div>
         </div>
         ${schedHtml}
@@ -3721,10 +3722,10 @@ function wizRenderLoadsEntities() {
     <div class="wiz-card-title" style="font-size:1rem">🏊 Pool</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
       <div class="entity-picker"><div class="entity-picker-label">Filter pump switch</div>
-        <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="switch.depuradora" oninput="wizCfg.sensors.pool_switch=this.value">
+        <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="switch.depuradora" oninput="wizCfg.sensors.pool_switch=this.value;_wizRenderCands('pool_switch','wiz-pool-sw','wiz-pool-sw-cands',null,null)">
         <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
       <div class="entity-picker"><div class="entity-picker-label">Cleaner switch (optional)</div>
-        <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="switch.limpiafondos" oninput="wizCfg.sensors.pool_cleaner=this.value">
+        <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="switch.limpiafondos" oninput="wizCfg.sensors.pool_cleaner=this.value;_wizRenderCands('pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands',null,null)">
         <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
     </div></div>`);
 
@@ -3741,7 +3742,7 @@ function wizRenderLoadsEntities() {
   if (hw.includes('ev')) sections.push(`<div class="wiz-card" style="margin-top:.7rem">
     <div class="wiz-card-title" style="font-size:1rem">🚗 EV Charger</div>
     <div class="entity-picker"><div class="entity-picker-label">EV charger entity (switch / number)</div>
-      <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value">
+      <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value;_wizRenderCands('ev_charger','wiz-ev','wiz-ev-cands',null,null)">
       <div id="wiz-ev-cands" class="entity-cands"></div></div></div>`);
 
   document.getElementById('wiz-loads-entities').innerHTML = sections.join('');
@@ -3753,10 +3754,10 @@ function _wizApplianceSection(key, icon, label, stateRole, powerRole) {
     <div class="wiz-card-title" style="font-size:1rem">${icon} ${label}</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
       <div class="entity-picker"><div class="entity-picker-label">State sensor</div>
-        <input class="entity-select" id="wiz-${key}-state" value="${wizCfg.sensors[stateRole]||''}" placeholder="sensor.${key}_operation_state" oninput="wizCfg.sensors['${stateRole}']=this.value">
+        <input class="entity-select" id="wiz-${key}-state" value="${wizCfg.sensors[stateRole]||''}" placeholder="sensor.${key}_operation_state" oninput="wizCfg.sensors['${stateRole}']=this.value;_wizRenderCands('${stateRole}','wiz-${key}-state','wiz-${key}-state-cands',null,null)">
         <div id="wiz-${key}-state-cands" class="entity-cands"></div></div>
       <div class="entity-picker"><div class="entity-picker-label">Power meter (W)</div>
-        <input class="entity-select" id="wiz-${key}-power" value="${wizCfg.sensors[powerRole]||''}" placeholder="sensor.${key}_power" oninput="wizCfg.sensors['${powerRole}']=this.value">
+        <input class="entity-select" id="wiz-${key}-power" value="${wizCfg.sensors[powerRole]||''}" placeholder="sensor.${key}_power" oninput="wizCfg.sensors['${powerRole}']=this.value;_wizRenderCands('${powerRole}','wiz-${key}-power','wiz-${key}-power-cands',null,null)">
         <div id="wiz-${key}-power-cands" class="entity-cands"></div></div>
     </div></div>`;
 }

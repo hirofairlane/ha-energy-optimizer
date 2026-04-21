@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Energy Optimizer — Home Assistant Add-on v2.4
 Smart energy management: battery, heat pump, pool pump, pool cleaner, dishwasher
@@ -3244,15 +3244,15 @@ function wizSelectDS(ds) {
     // If already have a tested connection, show banner; else show form
     const host = wizCfg.influxdb?.host;
     const ft   = wizCfg.influxdb?.first_ts;
-    if (host && ft) {
+    if (host) {
+      const detail = ft ? `${host} · data from ${ft}` : `${host} · previously configured`;
+      document.getElementById('wiz-influx-ok-detail').textContent = detail;
       const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
-      document.getElementById('wiz-influx-ok-detail').textContent =
-        `${host} · data from ${ft}`;
       document.getElementById('wiz-influx-fields').style.display = 'none';
     } else {
       document.getElementById('wiz-influx-ok').style.display = 'none';
       document.getElementById('wiz-influx-fields').style.display = '';
-      if (host) document.getElementById('wiz-influx-host').value = host;
+
     }
   } else {
     document.getElementById('wiz-influx-ok').style.display = 'none';

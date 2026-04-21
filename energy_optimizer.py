@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.2.5"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.2.6"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1812,26 +1812,34 @@ th{color:var(--m);font-weight:500}
 
   <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
   <div id="cv-live">
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem;margin-bottom:.8rem">
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">☀️</div>
-        <div id="lv-solar-w" style="font-size:1.4rem;font-weight:700;color:#facc15">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem">Solar</div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.6rem;margin-bottom:.8rem">
+      <!-- SOL -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">☀️</div>
+        <div id="lv-solar-w" style="font-size:1.3rem;font-weight:700;color:#facc15;line-height:1.2">—</div>
+        <div id="lv-solar-avg" style="font-size:.65rem;color:#a16207;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem">Solar</div>
       </div>
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">🏠</div>
-        <div id="lv-house-w" style="font-size:1.4rem;font-weight:700;color:#f97316">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem">House</div>
+      <!-- RED -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">⚡</div>
+        <div id="lv-grid-w" style="font-size:1.3rem;font-weight:700;line-height:1.2">—</div>
+        <div id="lv-grid-avg" style="font-size:.65rem;color:var(--m);margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-grid-dir">Red</span></div>
       </div>
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">🔋</div>
-        <div id="lv-bat-w" style="font-size:1.4rem;font-weight:700;color:#a78bfa">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-bat-dir">Battery</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
+      <!-- BAT -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">🔋</div>
+        <div id="lv-bat-w" style="font-size:1.3rem;font-weight:700;color:#a78bfa;line-height:1.2">—</div>
+        <div id="lv-bat-avg" style="font-size:.65rem;color:#7c3aed;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-bat-dir">Bat</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
       </div>
-      <div class="card" style="text-align:center;padding:.8rem">
-        <div style="font-size:1.6rem">⚡</div>
-        <div id="lv-grid-w" style="font-size:1.4rem;font-weight:700">—</div>
-        <div style="font-size:.7rem;color:var(--m);margin-top:.2rem"><span id="lv-grid-dir">Grid</span></div>
+      <!-- CASA -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">🏠</div>
+        <div id="lv-house-w" style="font-size:1.3rem;font-weight:700;color:#f97316;line-height:1.2">—</div>
+        <div id="lv-house-avg" style="font-size:.65rem;color:#c2410c;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem">Casa</div>
       </div>
     </div>
     <!-- SVG energy flow diagram -->
@@ -1874,14 +1882,7 @@ th{color:var(--m);font-weight:500}
         <text id="sv-ts"     x="330" y="258" text-anchor="middle" fill="#334155" font-size="9" font-family="sans-serif">—</text>
       </svg>
     </div>
-    <!-- 7-day averages row -->
-    <div id="lv-avgs" style="display:grid;grid-template-columns:repeat(5,1fr);gap:.4rem;margin-top:.4rem;text-align:center;font-size:.68rem;color:var(--m)">
-      <div>🔋 <span id="avg-bat" title="Avg daily battery discharge">—</span><br><span style="font-size:.6rem">bat total</span></div>
-      <div>🏠 <span id="avg-house" title="Avg daily net house consumption">—</span><br><span style="font-size:.6rem">consumo casa</span></div>
-      <div>⚡ <span id="avg-grid" title="Avg daily grid import">—</span><br><span style="font-size:.6rem">import. red</span></div>
-      <div>🔋☀️ <span id="avg-bat-solar" title="Avg battery discharge during solar hours (08-20h)">—</span><br><span style="font-size:.6rem">bat solar</span></div>
-      <div>☀️ <span id="avg-solar" title="Avg daily solar production">—</span><br><span style="font-size:.6rem">solar</span></div>
-    </div>
+    <!-- 7-day averages integrated into cards above -->
     <!-- SOC bar -->
     <div class="card" style="margin-top:.7rem">
       <h2 style="margin-top:0;font-size:.85rem">🔋 Battery SOC — last 24h <span id="soc-mae" style="font-size:.72rem;color:var(--m);font-weight:400"></span></h2>
@@ -2674,14 +2675,17 @@ async function loadLive(){
 
     document.getElementById('lv-solar-w').textContent = fmt(solar);
     document.getElementById('lv-house-w').textContent = fmt(house);
-    document.getElementById('lv-bat-w').textContent   = fmt(Math.abs(bat));
+    const batSign = bat > 50 ? '+' : bat < -50 ? '-' : '';
+    document.getElementById('lv-bat-w').textContent   = batSign + fmt(Math.abs(bat));
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-dir').textContent  = bat>50?'Charging':bat<-50?'Discharging':'Idle';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'↑ carga':bat<-50?'↓ desc':'idle';
 
     const gridEl = document.getElementById('lv-grid-w');
-    gridEl.textContent = fmt(Math.abs(grid));
+    // Show signed value: + export (green), - import (red)
+    const gridSign = grid > 50 ? '+' : '';
+    gridEl.textContent = gridSign + fmt(Math.abs(grid));
     gridEl.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
-    document.getElementById('lv-grid-dir').textContent = grid>50?'Exporting':grid<-50?'Importing':'Idle';
+    document.getElementById('lv-grid-dir').textContent = grid>50?'↑ venta':grid<-50?'↓ compra':'idle';
 
     // SVG flow diagram
     const spd = p => Math.max(0.35, 2.4 - Math.abs(p)/1800)+'s';
@@ -2749,16 +2753,28 @@ async function loadLive(){
     if(maeEl) maeEl.textContent=sdat.mae!=null?`— MAE ${sdat.mae}%`:'';
 
     // 7-day averages row
+    // 7-day W-level averages — integrated into each card
     const av = cd.averages||{};
-    const fav = (v,u) => v!=null ? `${v} ${u}` : '—';
-    const d7  = av.days||7;
-    const favd = (v,u) => v!=null ? `Ø${d7}d: ${v} ${u}` : '—';
-    document.getElementById('avg-solar').textContent     = fav(av.solar_kwh,'kWh/d');
-    document.getElementById('avg-house').textContent     = fav(av.house_kwh,'kWh/d');
-    document.getElementById('avg-bat').textContent       = fav(av.bat_kwh,'kWh/d');
-    document.getElementById('avg-grid').textContent      = fav(av.import_kwh,'kWh/d');
-    const bsEl = document.getElementById('avg-bat-solar');
-    if(bsEl) bsEl.textContent = fav(av.bat_solar_kwh,'kWh/d');
+    const fmtW = w => w == null ? '—' : (Math.abs(w) >= 1000 ? (w/1000).toFixed(1)+' kW' : Math.round(w)+' W');
+    const fmtAvg = (v, suffix) => v != null ? `Ø7d ${fmtW(v)}${suffix||''}` : 'Ø7d —';
+    // SOL: avg during solar hours (non-zero samples)
+    const solAvgEl = document.getElementById('lv-solar-avg');
+    if(solAvgEl) solAvgEl.textContent = fmtAvg(av.avg_sol, ' (sol)');
+    // RED: net avg (+ export green, - import red)
+    const redAvgEl = document.getElementById('lv-grid-avg');
+    if(redAvgEl) {
+      redAvgEl.textContent = fmtAvg(av.avg_red);
+      redAvgEl.style.color = av.avg_red > 0 ? '#16a34a' : av.avg_red < 0 ? '#dc2626' : 'var(--m)';
+    }
+    // BAT: net avg (+ charge purple, - discharge light)
+    const batAvgEl = document.getElementById('lv-bat-avg');
+    if(batAvgEl) {
+      batAvgEl.textContent = fmtAvg(av.avg_bat);
+      batAvgEl.style.color = av.avg_bat > 0 ? '#7c3aed' : av.avg_bat < 0 ? '#a78bfa' : 'var(--m)';
+    }
+    // CASA: avg consumption
+    const hsAvgEl = document.getElementById('lv-house-avg');
+    if(hsAvgEl) hsAvgEl.textContent = fmtAvg(av.avg_casa);
   } catch(e){ console.warn('Live error',e); }
 }
 
@@ -4267,31 +4283,47 @@ def _hourly_from_decisions(date_str: str) -> dict:
 
 
 def _live_averages_7d() -> dict:
-    """Compute 7-day daily averages from decisions.json for the live view nodes."""
-    today = datetime.now().date()
-    buckets: dict = {"solar": [], "house": [], "import": [], "bat_kwh": [], "bat_solar_kwh": []}
-    for i in range(1, 8):
-        ds = (today - timedelta(days=i)).isoformat()
-        h = _hourly_from_decisions(ds)
-        kpi = h.get("kpi", {})
-        if kpi.get("solar_kwh", 0) > 0 or kpi.get("consumption_kwh", 0) > 0:
-            buckets["solar"].append(kpi.get("solar_kwh", 0))
-            buckets["house"].append(kpi.get("consumption_kwh", 0))
-            buckets["import"].append(kpi.get("import_kwh", 0))
-            bd = sum(v for v in h.get("bat_discharge", []) if v)
-            buckets["bat_kwh"].append(bd)
-            # discharge during solar hours (08:00–20:00 = indices 8–19)
-            sol_hrs = h.get("bat_discharge", [])
-            bd_sol = sum(v for v in sol_hrs[8:20] if v)
-            buckets["bat_solar_kwh"].append(bd_sol)
-    def avg(lst): return round(sum(lst) / len(lst), 1) if lst else None
+    """W-level 7-day averages from 15-min decision samples.
+
+    SOL: mean only when > 0  (real production during daylight hours)
+    RED: net mean  (+ = export, - = import)
+    BAT: net mean  (+ = charging, - = discharging)
+    CASA: mean of (sol - red - bat) for each sample
+    """
+    cutoff = datetime.now() - timedelta(days=7)
+    sol_v, red_v, bat_v, casa_v = [], [], [], []
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                s    = dec.get("sensors", {})
+                sol  = s.get("solar_power")  or 0
+                red  = s.get("grid_power")   or 0
+                bat  = s.get("battery_power") or 0
+                casa = sol - red - bat
+                if sol > 0:
+                    sol_v.append(sol)
+                red_v.append(red)
+                bat_v.append(bat)
+                if casa > 0:
+                    casa_v.append(casa)
+        except Exception:
+            pass
+    def avg(lst): return round(sum(lst) / len(lst)) if lst else None
     return {
-        "days":          len(buckets["solar"]),
-        "solar_kwh":     avg(buckets["solar"]),
-        "house_kwh":     avg(buckets["house"]),
-        "import_kwh":    avg(buckets["import"]),
-        "bat_kwh":       avg(buckets["bat_kwh"]),
-        "bat_solar_kwh": avg(buckets["bat_solar_kwh"]),
+        "samples":  len(red_v),
+        "avg_sol":  avg(sol_v),   # W, solar-hours only
+        "avg_red":  avg(red_v),   # W, net (+ export / - import)
+        "avg_bat":  avg(bat_v),   # W, net (+ charge / - discharge)
+        "avg_casa": avg(casa_v),  # W, house consumption
     }
 
 

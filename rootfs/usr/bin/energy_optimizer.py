@@ -3134,8 +3134,22 @@ async function loadWizard() {
     if (r.influxdb) wizCfg.influxdb = Object.assign(wizCfg.influxdb, r.influxdb);
     if (r.hvac_zones) wizCfg.hvac_zones = r.hvac_zones;
     if (r.grid_submeters) wizCfg.grid_submeters = r.grid_submeters;
-    _wizPopulateFields();
   } catch(e) {}
+  // Pre-fill influxdb from HA options when wizard config has no host
+  if (!wizCfg.influxdb?.host) {
+    try {
+      const opts = await fetch(BASE+'/api/options').then(r=>r.json());
+      const url = opts.influxdb_url || '';
+      const m = url.match(/https?:\/\/([^:\/]+)(?::(\d+))?/);
+      if (m) {
+        wizCfg.influxdb.host = m[1];
+        wizCfg.influxdb.port = m[2] ? parseInt(m[2]) : 8086;
+        wizCfg.influxdb.db   = opts.influxdb_db || 'homeassistant';
+        wizCfg.influxdb.username = opts.influxdb_user || '';
+      }
+    } catch(e) {}
+  }
+  _wizPopulateFields();
   try {
     const r = await fetch(BASE+'/api/ha/entities').then(r=>r.json());
     wizEntities = r.entities || [];
@@ -3580,7 +3594,6 @@ function _wizLoadsUpdateNav() {
   if (wizLoadsSub === 0) {
     if (grid) grid.style.display = '';
     if (ents) ents.innerHTML = '';
-    if (prog) prog.textContent = 'Step 6 of 8 — Select devices';
     nav.innerHTML = `
       <button class="comic-btn back" onclick="wizBack()">← Back</button>
       <span class="wiz-progress" id="wiz-loads-progress">Step 6 of 8 — Select devices</span>

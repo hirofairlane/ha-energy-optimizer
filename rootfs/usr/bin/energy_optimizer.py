@@ -1656,13 +1656,12 @@ th{color:var(--m);font-weight:500}
 .bub-text{flex:1}
 .bub-name{font-size:.6rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;margin-bottom:.25rem;opacity:.5}
 /* Bolt = default (yellow/green warm) */
-.bolt-bubble{display:flex}
-.nexus-bubble{display:none}
+.bolt-bubble{display:none!important}
+.nexus-bubble{display:flex}
 /* Nexus mode overrides */
-.mode-nexus .bolt-bubble{display:none}
-.mode-nexus .nexus-bubble{display:flex;background:#1e1b4b;color:#e0e7ff;border-color:#818cf8;box-shadow:4px 4px 0 #4c1d95}
-.mode-nexus .nexus-bubble::after{border-top-color:#818cf8}
-.mode-nexus .nexus-bubble::before{border-top-color:#1e1b4b}
+.nexus-bubble{display:flex;background:#1e1b4b;color:#e0e7ff;border-color:#818cf8;box-shadow:4px 4px 0 #4c1d95}
+.nexus-bubble::after{border-top-color:#818cf8}
+.nexus-bubble::before{border-top-color:#1e1b4b}
 /* Mode toggle bar */
 .wiz-mode-bar{display:flex;align-items:center;gap:.6rem;margin-bottom:.8rem;flex-wrap:wrap}
 .wiz-mode-label{font-size:.68rem;color:var(--m);text-transform:uppercase;letter-spacing:.06em}
@@ -1681,11 +1680,11 @@ th{color:var(--m);font-weight:500}
 .ent-samples{font-size:.62rem;color:var(--m);margin-left:.25rem;opacity:.75}
 /* Advanced-only visibility */
 .adv-only{display:none}
-.mode-nexus .adv-only{display:block}
+.adv-only{display:block}
 .adv-only-flex{display:none}
-.mode-nexus .adv-only-flex{display:flex}
+.adv-only-flex{display:flex}
 .adv-only-grid{display:none}
-.mode-nexus .adv-only-grid{display:grid}
+.adv-only-grid{display:grid}
 /* HVAC zone blocks */
 .hvac-zone{background:var(--bg);border:2px solid #334155;border-radius:.7rem;padding:.8rem;margin-bottom:.6rem;position:relative}
 .hvac-zone-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.5rem}
@@ -1830,17 +1829,12 @@ th{color:var(--m);font-weight:500}
     <!-- SVG energy flow diagram -->
     <div class="card" style="padding:.7rem 1rem">
       <svg id="flow-svg" viewBox="0 0 440 270" style="width:100%;max-height:230px;display:block">
-        <!-- Connection lines (behind nodes) -->
-        <!-- Solar → House (vertical) -->
-        <path id="fl-ln-sol-hse" class="fl-ln fl-dim" d="M220,72 L220,150" stroke="#facc15"/>
-        <!-- Solar → Battery (curve left) -->
-        <path id="fl-ln-sol-bat" class="fl-ln fl-dim" d="M183,70 C148,105 118,142 105,172" stroke="#facc15"/>
-        <!-- Solar → Grid (curve right) -->
-        <path id="fl-ln-sol-grd" class="fl-ln fl-dim" d="M257,70 C292,105 322,142 335,172" stroke="#4ade80"/>
-        <!-- Battery → House (diagonal) -->
-        <path id="fl-ln-bat-hse" class="fl-ln fl-dim" d="M128,185 L162,162" stroke="#a78bfa"/>
-        <!-- Grid → House (diagonal) -->
-        <path id="fl-ln-grd-hse" class="fl-ln fl-dim" d="M312,185 L278,162" stroke="#f87171"/>
+        <!-- Connection lines — endpoints stop at node borders (4px gap) -->
+        <path id="fl-ln-sol-hse" class="fl-ln fl-dim" d="M220,76 L220,146" stroke="#facc15"/>
+        <path id="fl-ln-sol-bat" class="fl-ln fl-dim" d="M187,76 C152,110 114,145 68,168" stroke="#facc15"/>
+        <path id="fl-ln-sol-grd" class="fl-ln fl-dim" d="M253,76 C288,110 326,145 372,168" stroke="#4ade80"/>
+        <path id="fl-ln-bat-hse" class="fl-ln fl-dim" d="M120,198 L148,193" stroke="#a78bfa"/>
+        <path id="fl-ln-grd-hse" class="fl-ln fl-dim" d="M320,198 L292,193" stroke="#f87171"/>
 
         <!-- Solar node (top center) -->
         <rect x="165" y="14" width="110" height="58" rx="11" class="fl-node-bg" stroke="#facc15" stroke-width="1.5"/>
@@ -1870,6 +1864,13 @@ th{color:var(--m);font-weight:500}
         <text id="sv-tariff" x="110" y="258" text-anchor="middle" fill="#475569" font-size="9" font-family="sans-serif">—</text>
         <text id="sv-ts"     x="330" y="258" text-anchor="middle" fill="#334155" font-size="9" font-family="sans-serif">—</text>
       </svg>
+    </div>
+    <!-- 7-day averages row -->
+    <div id="lv-avgs" style="display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem;margin-top:.4rem;text-align:center;font-size:.68rem;color:var(--m)">
+      <div>☀️ <span id="avg-solar">—</span></div>
+      <div>🏠 <span id="avg-house">—</span></div>
+      <div>🔋 <span id="avg-bat">—</span></div>
+      <div>⚡ <span id="avg-grid">—</span></div>
     </div>
     <!-- SOC bar -->
     <div class="card" style="margin-top:.7rem">
@@ -2058,8 +2059,7 @@ th{color:var(--m);font-weight:500}
     <!-- Mode toggle -->
     <div class="wiz-mode-bar">
       <span class="wiz-mode-label">Assistant:</span>
-      <button id="btn-mode-bolt" class="wiz-mode-btn bolt-active" onclick="wizSetMode('bolt')">🤖 Bolt — Quick setup</button>
-      <button id="btn-mode-nexus" class="wiz-mode-btn" onclick="wizSetMode('nexus')">⚡ Nexus — Full control</button>
+      <!-- Mode toggle removed: always full-control (Nexus) mode -->
     </div>
 
     <!-- Data Quality thermometer -->
@@ -2100,7 +2100,15 @@ th{color:var(--m);font-weight:500}
             <div class="hw-desc">Up to 14 days, always available</div>
           </div>
         </div>
-        <div id="wiz-influx-fields">
+        <!-- Already-connected banner (shown when host is saved + tested OK) -->
+        <div id="wiz-influx-ok" style="display:none;background:rgba(74,222,128,.08);border:1px solid rgba(74,222,128,.3);border-radius:.5rem;padding:.6rem .8rem;margin-bottom:.6rem;display:flex;align-items:center;justify-content:space-between;gap:.6rem">
+          <div>
+            <span style="color:var(--g);font-weight:600">✓ Connected</span>
+            <span id="wiz-influx-ok-detail" style="font-size:.72rem;color:var(--m);margin-left:.5rem">—</span>
+          </div>
+          <button class="btn btn-sm" onclick="wizInfluxEdit()" style="flex-shrink:0">✏️ Edit</button>
+        </div>
+        <div id="wiz-influx-fields" style="display:none">
           <div style="display:grid;grid-template-columns:1fr auto;gap:.5rem;margin-bottom:.4rem">
             <div class="wiz-field"><label>Host / IP</label><input type="text" id="wiz-influx-host" placeholder="172.30.32.1"></div>
             <div class="wiz-field"><label>Port</label><input type="number" id="wiz-influx-port" value="8086" style="width:80px"></div>
@@ -2357,10 +2365,10 @@ th{color:var(--m);font-weight:500}
         </div>
       </div>
       <div id="wiz-loads-entities"></div>
-      <div class="wiz-nav">
+      <div class="wiz-nav" id="wiz-loads-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 6 of 8</span>
-        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+        <span class="wiz-progress" id="wiz-loads-progress">Step 6 of 8</span>
+        <button class="comic-btn next" onclick="wizLoadsNext()">Next →</button>
       </div>
     </div>
 
@@ -2436,6 +2444,11 @@ th{color:var(--m);font-weight:500}
         <div class="wiz-card-title">📋 Summary</div>
         <div class="wiz-robot">📋</div>
         <table class="summary-table" id="wiz-summary-table"></table>
+        <!-- Data quality & prediction forecast -->
+        <div id="wiz-dq-summary" style="margin-top:.8rem;padding:.7rem;background:rgba(56,189,248,.04);border:1px solid rgba(56,189,248,.15);border-radius:.5rem;font-size:.75rem;display:none">
+          <div style="font-weight:600;color:var(--a);margin-bottom:.4rem">📊 Data quality & prediction estimate</div>
+          <div id="wiz-dq-detail" style="color:var(--m);line-height:1.6"></div>
+        </div>
         <div id="wiz-save-status" style="font-size:.78rem;margin-top:.8rem;color:var(--m)"></div>
       </div>
       <div class="wiz-nav">
@@ -2708,6 +2721,14 @@ async function loadLive(){
     });
     const maeEl=document.getElementById('soc-mae');
     if(maeEl) maeEl.textContent=sdat.mae!=null?`— MAE ${sdat.mae}%`:'';
+
+    // 7-day averages row
+    const av = cd.averages||{};
+    const fav = (v,u) => v!=null ? `Ø${av.days||7}d: ${v} ${u}` : '—';
+    document.getElementById('avg-solar').textContent = fav(av.solar_kwh,'kWh/d');
+    document.getElementById('avg-house').textContent = fav(av.house_kwh,'kWh/d');
+    document.getElementById('avg-bat').textContent   = fav(av.bat_kwh,'kWh/d');
+    document.getElementById('avg-grid').textContent  = fav(av.import_kwh,'kWh imp/d');
   } catch(e){ console.warn('Live error',e); }
 }
 
@@ -3054,7 +3075,7 @@ async function loadWeather(){
 }
 
 // ── Wizard state ──────────────────────────────────────────────────────────────
-let wizMode = 'bolt';
+let wizMode = 'nexus';  // always advanced mode
 let wizStep = 0;
 let wizEntities = [];
 let wizDQSamples = {};
@@ -3074,7 +3095,7 @@ function wizSetMode(mode) {
   wrap.className = 'wiz-wrap' + (mode==='nexus' ? ' mode-nexus' : '');
   document.getElementById('btn-mode-bolt').className = 'wiz-mode-btn' + (mode==='bolt' ? ' bolt-active' : '');
   document.getElementById('btn-mode-nexus').className = 'wiz-mode-btn' + (mode==='nexus' ? ' nexus-active' : '');
-  if (wizStep === 5) wizRenderLoadsEntities();
+  if (wizStep === 5) wizLoadsEnter();
 }
 
 // ── Data Quality bar ───────────────────────────────────────────────────────────
@@ -3200,7 +3221,33 @@ function wizSelectDS(ds) {
   const id = ds === 'influxdb' ? 'ds-card-influx' : 'ds-card-ha';
   const card = document.getElementById(id);
   if (card) { card.style.borderColor = 'var(--g)'; card.style.background = 'rgba(74,222,128,.06)'; }
-  document.getElementById('wiz-influx-fields').style.display = ds === 'influxdb' ? '' : 'none';
+  if (ds === 'influxdb') {
+    // If already have a tested connection, show banner; else show form
+    const host = wizCfg.influxdb?.host;
+    const ft   = wizCfg.influxdb?.first_ts;
+    if (host && ft) {
+      document.getElementById('wiz-influx-ok').style.display = 'flex';
+      document.getElementById('wiz-influx-ok-detail').textContent =
+        `${host} · data from ${ft}`;
+      document.getElementById('wiz-influx-fields').style.display = 'none';
+    } else {
+      document.getElementById('wiz-influx-ok').style.display = 'none';
+      document.getElementById('wiz-influx-fields').style.display = '';
+      if (host) document.getElementById('wiz-influx-host').value = host;
+    }
+  } else {
+    document.getElementById('wiz-influx-ok').style.display = 'none';
+    document.getElementById('wiz-influx-fields').style.display = 'none';
+  }
+}
+function wizInfluxEdit() {
+  document.getElementById('wiz-influx-ok').style.display = 'none';
+  document.getElementById('wiz-influx-fields').style.display = '';
+  const inf = wizCfg.influxdb||{};
+  if (inf.host) document.getElementById('wiz-influx-host').value = inf.host;
+  if (inf.port) document.getElementById('wiz-influx-port').value = inf.port;
+  if (inf.db)   document.getElementById('wiz-influx-db').value   = inf.db;
+  if (inf.username) document.getElementById('wiz-influx-user').value = inf.username;
 }
 
 async function wizTestInflux() {
@@ -3224,6 +3271,14 @@ async function wizTestInflux() {
       st.textContent = `✓ Connected — ${r.total_samples||0} samples found`;
       wizUpdateDQ(r.score||0);
       wizDQSamples = r.samples||{};
+      wizCfg.influxdb.first_ts = r.first_ts || null;
+      // Switch to "already connected" banner
+      if (wizCfg.influxdb.first_ts) {
+        document.getElementById('wiz-influx-ok-detail').textContent =
+          `${wizCfg.influxdb.host} · data from ${wizCfg.influxdb.first_ts}`;
+        document.getElementById('wiz-influx-ok').style.display = 'flex';
+        document.getElementById('wiz-influx-fields').style.display = 'none';
+      }
     } else {
       st.style.color = '#ef4444'; st.textContent = '✗ ' + (r.error||'Connection failed');
     }
@@ -3246,13 +3301,16 @@ async function wizDetectLocation() {
 // ── Entity typed / selected ────────────────────────────────────────────────────
 function wizEntityTyped(role, inputId, statusId, stateId) {
   const val = document.getElementById(inputId)?.value.trim() || '';
-  wizCfg.sensors[role] = val;
-  _wizUpdateStatusBadge(statusId, role, val);
+  const exactMatch = wizEntities.find(e=>e.entity_id===val);
+  wizCfg.sensors[role] = exactMatch ? val : (val === '' ? '' : wizCfg.sensors[role]||'');
+  _wizUpdateStatusBadge(statusId, role, exactMatch ? val : '');
   if (stateId) {
-    const ent = wizEntities.find(e=>e.entity_id===val);
     const el = document.getElementById(stateId);
-    if (el) el.textContent = ent ? `Current: ${ent.state} ${ent.unit||''}` : '';
+    if (el) el.textContent = exactMatch ? `Current: ${exactMatch.state} ${exactMatch.unit||''}` : '';
   }
+  // Live-filter candidates as user types
+  const m = WIZ_CANDS_MAP[role];
+  if (m?.candsId) _wizRenderCands(role, inputId, m.candsId, stateId||m.stateId, statusId||m.statusId);
 }
 
 function _wizUpdateStatusBadge(statusId, role, val) {
@@ -3380,41 +3438,48 @@ function _wizCandHtml(e, i, isFallback, inputId, candsId, role, stateId, statusI
   </span>`;
 }
 
+// Module-level role→candsId map used by wizEntityTyped for live search
+const WIZ_CANDS_MAP = {
+  grid_power:           {candsId:'wiz-grid-cands',          stateId:'wiz-grid-state',     statusId:'wiz-grid-status'},
+  solar_power:          {candsId:'wiz-solar-cands',         stateId:'wiz-solar-state',    statusId:'wiz-solar-status'},
+  solar_fc_today:       {candsId:'wiz-fc-today-cands',      stateId:null,                 statusId:null},
+  solar_fc_tomorrow:    {candsId:'wiz-fc-tomorrow-cands',   stateId:null,                 statusId:null},
+  solar_fc_h0:          {candsId:'wiz-fc-h0-cands',         stateId:null,                 statusId:null},
+  solar_fc_h1:          {candsId:'wiz-fc-h1-cands',         stateId:null,                 statusId:null},
+  battery_soc:          {candsId:'wiz-batt-soc-cands',      stateId:'wiz-batt-soc-state', statusId:'wiz-batt-soc-status'},
+  battery_power:        {candsId:'wiz-batt-power-cands',    stateId:null,                 statusId:'wiz-batt-pow-status'},
+  battery_mode_select:  {candsId:'wiz-batt-mode-cands',     stateId:null,                 statusId:'wiz-batt-mode-status'},
+  battery_cutoff_soc:   {candsId:'wiz-batt-cutoff-cands',   stateId:null,                 statusId:'wiz-batt-cutoff-status'},
+  battery_backup_soc:   {candsId:'wiz-batt-backup-cands',   stateId:null,                 statusId:'wiz-batt-backup-status'},
+  battery_force_charge: {candsId:'wiz-batt-force-cands',    stateId:null,                 statusId:'wiz-batt-force-status'},
+  weather:              {candsId:'wiz-weather-cands',        stateId:null,                 statusId:null},
+};
+
 function _wizRenderCands(role, inputId, candsId, stateId, statusId) {
   const candsEl = document.getElementById(candsId);
   if (!candsEl) return;
+  const inputEl = document.getElementById(inputId);
+  const q = (inputEl?.value||'').trim();
+  // If user is typing a search query, filter all entities
+  if (q && !wizEntities.find(e=>e.entity_id===q)) {
+    const ql = q.toLowerCase();
+    const matches = wizEntities.filter(e=>
+      (e.entity_id||'').toLowerCase().includes(ql)||(e.name||'').toLowerCase().includes(ql)
+    ).slice(0,20);
+    candsEl.innerHTML = matches.length
+      ? matches.map((e,i)=>_wizCandHtml(e,i,false,inputId,candsId,role,stateId,statusId)).join('')
+      : '<span style="font-size:.68rem;color:var(--m)">No results</span>';
+    return;
+  }
+  // Default: show top scored suggestions
   const isForceSw = role === 'battery_force_charge';
   const scored = _wizScoreEntities(role, isForceSw);
   const isFallback = scored.length && scored[0]._fallback;
   const topLabel = isFallback ? '<span style="font-size:.62rem;color:var(--y);margin-bottom:.2rem;display:block">⚠ No auto-match — all switches listed:</span>' : '';
-  const topHtml = scored.length
-    ? topLabel + scored.slice(0, isFallback ? 15 : 5).map((e,i) => _wizCandHtml(e,i,isFallback,inputId,candsId,role,stateId,statusId)).join('')
-    : '<span style="font-size:.68rem;color:var(--m)">No suggestions — use search below</span>';
-  const searchId  = candsId+'-srch';
-  const resultsId = candsId+'-res';
-  candsEl.innerHTML = topHtml +
-    `<div style="margin-top:.4rem">
-      <input id="${searchId}" type="search" placeholder="🔍 Search all entities…"
-        style="width:100%;padding:.28rem .5rem;font-size:.72rem;border:1px solid var(--b);border-radius:.35rem;background:var(--bg);color:var(--t);margin-top:.2rem"
-        oninput="_wizSearchFilter('${searchId}','${resultsId}','${inputId}','${candsId}','${role}','${stateId||''}','${statusId||''}')">
-      <div id="${resultsId}" class="entity-cands" style="margin-top:.2rem"></div>
-    </div>`;
-  const inputEl = document.getElementById(inputId);
+  candsEl.innerHTML = scored.length
+    ? topLabel + scored.slice(0, isFallback ? 15 : 5).map((e,i)=>_wizCandHtml(e,i,isFallback,inputId,candsId,role,stateId,statusId)).join('')
+    : '<span style="font-size:.68rem;color:var(--m)">Type to search entities…</span>';
   if (inputEl && statusId) _wizUpdateStatusBadge(statusId, role, inputEl.value);
-}
-
-function _wizSearchFilter(searchId, resultsId, inputId, candsId, role, stateId, statusId) {
-  const q = (document.getElementById(searchId)?.value || '').trim().toLowerCase();
-  const el = document.getElementById(resultsId);
-  if (!el) return;
-  if (!q) { el.innerHTML = ''; return; }
-  const matches = wizEntities.filter(e => {
-    const id   = (e.entity_id||'').toLowerCase();
-    const name = (e.name||'').toLowerCase();
-    return id.includes(q) || name.includes(q);
-  }).slice(0, 25);
-  if (!matches.length) { el.innerHTML = '<span style="font-size:.68rem;color:var(--m)">No results</span>'; return; }
-  el.innerHTML = matches.map((e,i) => _wizCandHtml(e,i,false,inputId,candsId,role,stateId,statusId)).join('');
 }
 
 function _wizSelectCand(entityId, inputId, candsId, role, stateId, statusId) {
@@ -3456,6 +3521,120 @@ function wizDelSubmeter(i) {
 }
 
 // ── Loads step ─────────────────────────────────────────────────────────────────
+let wizLoadsSub = 0;  // 0=selection screen, ≥1=device config index
+
+function wizLoadsEnter() {
+  wizLoadsSub = 0;
+  _wizLoadsUpdateNav();
+}
+
+function _wizLoadsUpdateNav() {
+  const devices = wizCfg.hardware.filter(h=>h!=='');
+  const prog = document.getElementById('wiz-loads-progress');
+  const nav  = document.getElementById('wiz-loads-nav');
+  if (!nav) return;
+  const grid = document.getElementById('wiz-hw-grid');
+  const ents = document.getElementById('wiz-loads-entities');
+  if (wizLoadsSub === 0) {
+    if (grid) grid.style.display = '';
+    if (ents) ents.innerHTML = '';
+    if (prog) prog.textContent = 'Step 6 of 8 — Select devices';
+    nav.innerHTML = `
+      <button class="comic-btn back" onclick="wizBack()">← Back</button>
+      <span class="wiz-progress" id="wiz-loads-progress">Step 6 of 8 — Select devices</span>
+      <button class="comic-btn next" onclick="wizLoadsNext()">Configure →</button>`;
+  } else {
+    const dev = devices[wizLoadsSub-1];
+    const label = {hvac:'HVAC',pool:'Pool',dishwasher:'Dishwasher',washer:'Washer',dryer:'Dryer',ev:'EV Charger'}[dev]||dev;
+    if (grid) grid.style.display = 'none';
+    _wizRenderSingleDevice(dev, ents);
+    const isLast = wizLoadsSub >= devices.length;
+    nav.innerHTML = `
+      <button class="comic-btn back" onclick="wizLoadsBack()">← Back</button>
+      <span class="wiz-progress">${label} — ${wizLoadsSub}/${devices.length}</span>
+      ${isLast
+        ? `<button class="comic-btn next" onclick="wizNext()">Next →</button>`
+        : `<button class="comic-btn next" onclick="wizLoadsNext()">${{hvac:'Pool',pool:'Dishwasher',dishwasher:'Washer',washer:'Dryer',dryer:'EV',ev:'Done'}[dev]||'Next'} →</button>`}`;
+    setTimeout(()=>_wizLoadsRenderCands(), 50);
+  }
+}
+
+function wizLoadsNext() {
+  const devices = wizCfg.hardware.filter(h=>h!=='');
+  if (wizLoadsSub === 0 && devices.length === 0) { wizNext(); return; }
+  if (wizLoadsSub < devices.length) { wizLoadsSub++; _wizLoadsUpdateNav(); }
+  else { wizNext(); }
+}
+
+function wizLoadsBack() {
+  if (wizLoadsSub > 0) { wizLoadsSub--; _wizLoadsUpdateNav(); }
+  else wizBack();
+}
+
+function _wizRenderSingleDevice(hw, container) {
+  if (!container) return;
+  const isAdv = wizMode === 'nexus';
+  let html = '';
+  if (hw === 'hvac') {
+    const zones = wizCfg.hvac_zones.length ? wizCfg.hvac_zones : [{name:'Zone 1',climate:'',temp_heat:'',temp_cool:'',temp_sensor:'',sched:{}}];
+    if (!wizCfg.hvac_zones.length) wizCfg.hvac_zones = zones;
+    html = `<div class="wiz-card"><div class="wiz-card-title">🌡️ HVAC Zones</div>
+      ${zones.map((z,zi)=>{
+        const schedHtml = isAdv ? `
+          <div style="font-size:.65rem;color:var(--m);margin-top:.4rem">24h — click to cycle: <span style="color:#4ade80">■ Comfort</span> <span style="color:var(--a)">■ Surplus</span> <span style="color:#94a3b8">■ Min</span></div>
+          <div class="hvac-sched">${Array.from({length:24},(_,h)=>{const mode=(z.sched||{})[h]||'minimum';return `<div class="hvac-sched-cell ${mode}" title="${h}:00" onclick="wizCycleSched(${zi},${h})">${h}</div>`;}).join('')}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4rem;margin-top:.4rem">
+            <div class="wiz-field"><label>Comfort °C</label><input type="number" value="${z.temp_comfort||21}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_comfort=+this.value"></div>
+            <div class="wiz-field"><label>Surplus °C</label><input type="number" value="${z.temp_surplus||23}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_surplus=+this.value"></div>
+            <div class="wiz-field"><label>Minimum °C</label><input type="number" value="${z.temp_min||18}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_min=+this.value"></div>
+          </div>` : '';
+        return `<div class="hvac-zone">
+          <div class="hvac-zone-hdr"><span class="hvac-zone-title">🌡️ ${z.name||'Zone '+(zi+1)}</span>${zi>0?`<button class="hvac-zone-del" onclick="wizDelHvacZone(${zi})">Remove</button>`:''}</div>
+          <input class="entity-select" value="${z.name||''}" placeholder="Zone name" style="margin-bottom:.4rem" oninput="wizCfg.hvac_zones[${zi}].name=this.value">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
+            <div class="entity-picker"><div class="entity-picker-label">Climate entity</div>
+              <input class="entity-select" id="wiz-hvac-cli-${zi}" value="${z.climate||''}" placeholder="climate.aerotermia" oninput="wizCfg.hvac_zones[${zi}].climate=this.value;wizEntityTyped('hvac_mode','wiz-hvac-cli-${zi}',null,null)">
+              <div id="wiz-hvac-cli-${zi}-cands" class="entity-cands"></div></div>
+            <div class="entity-picker"><div class="entity-picker-label">Temp sensor</div>
+              <input class="entity-select" id="wiz-hvac-ts-${zi}" value="${z.temp_sensor||''}" placeholder="sensor.indoor_temp" oninput="wizCfg.hvac_zones[${zi}].temp_sensor=this.value;wizEntityTyped('temp_indoor','wiz-hvac-ts-${zi}',null,null)">
+              <div id="wiz-hvac-ts-${zi}-cands" class="entity-cands"></div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.3rem">
+            <div class="entity-picker"><div class="entity-picker-label">Heat setpoint</div>
+              <input class="entity-select" id="wiz-hvac-ht-${zi}" value="${z.temp_heat||''}" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_heat=this.value;wizEntityTyped('hvac_temp_heat','wiz-hvac-ht-${zi}',null,null)">
+              <div id="wiz-hvac-ht-${zi}-cands" class="entity-cands"></div></div>
+            <div class="entity-picker"><div class="entity-picker-label">Cool setpoint</div>
+              <input class="entity-select" id="wiz-hvac-cl-${zi}" value="${z.temp_cool||''}" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_cool=this.value;wizEntityTyped('hvac_temp_cool','wiz-hvac-cl-${zi}',null,null)">
+              <div id="wiz-hvac-cl-${zi}-cands" class="entity-cands"></div></div>
+          </div>${schedHtml}</div>`;
+      }).join('')}
+      <button class="btn btn-sm" onclick="wizAddHvacZone()" style="margin-top:.4rem">+ Add zone</button>
+    </div>`;
+  } else if (hw === 'pool') {
+    html = `<div class="wiz-card"><div class="wiz-card-title">🏊 Pool</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+        <div class="entity-picker"><div class="entity-picker-label">Filter pump switch</div>
+          <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="switch.depuradora" oninput="wizCfg.sensors.pool_switch=this.value;wizEntityTyped('pool_switch','wiz-pool-sw',null,null)">
+          <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
+        <div class="entity-picker"><div class="entity-picker-label">Cleaner switch (optional)</div>
+          <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="switch.limpiafondos" oninput="wizCfg.sensors.pool_cleaner=this.value;wizEntityTyped('pool_cleaner','wiz-pool-cl',null,null)">
+          <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
+      </div></div>`;
+  } else if (hw === 'dishwasher') {
+    html = _wizApplianceSection('dishwasher','🍽️','Dishwasher','dishwasher_state','washer_power');
+  } else if (hw === 'washer') {
+    html = _wizApplianceSection('washer','👕','Washing Machine','washer_state','washer_power');
+  } else if (hw === 'dryer') {
+    html = _wizApplianceSection('dryer','🌀','Dryer','dryer_state','dryer_power');
+  } else if (hw === 'ev') {
+    html = `<div class="wiz-card"><div class="wiz-card-title">🚗 EV Charger</div>
+      <div class="entity-picker"><div class="entity-picker-label">EV charger entity</div>
+        <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value;wizEntityTyped('ev_charger','wiz-ev',null,null)">
+        <div id="wiz-ev-cands" class="entity-cands"></div></div></div>`;
+  }
+  container.innerHTML = html;
+}
+
 function wizToggleHw(card) {
   card.classList.toggle('selected');
   const hw = card.dataset.hw;
@@ -3464,7 +3643,7 @@ function wizToggleHw(card) {
   } else {
     wizCfg.hardware = wizCfg.hardware.filter(h=>h!==hw);
   }
-  wizRenderLoadsEntities();
+  // Stay on selection screen; don't auto-navigate
 }
 
 function wizRenderLoadsEntities() {
@@ -3641,6 +3820,29 @@ function wizBuildSummary() {
   ];
   document.getElementById('wiz-summary-table').innerHTML =
     rows.map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+
+  // Data quality summary panel
+  const totalSamples = Object.values(wizDQSamples).reduce((a,b)=>a+(b||0),0);
+  const src = wizCfg.data_source === 'influxdb' ? 'InfluxDB' : 'HA Recorder';
+  const days = wizCfg.data_source === 'influxdb' ? 90 : 14;
+  const keySensors = ['grid_power','solar_power','battery_soc','battery_power'];
+  const missing = keySensors.filter(r=>!wizCfg.sensors[r]);
+  const hasAll = missing.length === 0;
+  const qualLabel = totalSamples > 20000 ? ['Excellent 🟢','R² likely > 0.90 — highly accurate forecasts']
+                  : totalSamples > 5000  ? ['Good 🟡','R² likely 0.75–0.90 — solid predictions']
+                  : totalSamples > 500   ? ['Fair 🟠','R² likely 0.50–0.75 — usable but will improve over time']
+                  :                        ['Learning 🔴','Not enough data yet — model will improve as data accumulates'];
+  const dqEl = document.getElementById('wiz-dq-summary');
+  const detEl = document.getElementById('wiz-dq-detail');
+  if (dqEl && detEl) {
+    dqEl.style.display = '';
+    detEl.innerHTML = `
+      <b>Source:</b> ${src} (up to ${days} days of history)<br>
+      <b>Samples found:</b> ${totalSamples.toLocaleString()} across ${Object.keys(wizDQSamples).length} entities<br>
+      <b>Prediction quality:</b> ${qualLabel[0]} — ${qualLabel[1]}<br>
+      ${!hasAll ? `<span style="color:var(--y)">⚠ Missing sensors: ${missing.join(', ')} — accuracy will be lower</span><br>` : ''}
+      <span style="color:var(--m);font-size:.68rem">Model trains automatically tonight at 03:00. More history = better predictions.</span>`;
+  }
 }
 
 async function wizSave() {
@@ -3862,6 +4064,30 @@ def _hourly_from_decisions(date_str: str) -> dict:
         "solar_self_consumed_pct": solar_sc,
     }
     return res
+
+
+def _live_averages_7d() -> dict:
+    """Compute 7-day daily averages from decisions.json for the live view nodes."""
+    today = datetime.now().date()
+    buckets: dict = {"solar": [], "house": [], "import": [], "bat_kwh": []}
+    for i in range(1, 8):
+        ds = (today - timedelta(days=i)).isoformat()
+        h = _hourly_from_decisions(ds)
+        kpi = h.get("kpi", {})
+        if kpi.get("solar_kwh", 0) > 0 or kpi.get("consumption_kwh", 0) > 0:
+            buckets["solar"].append(kpi.get("solar_kwh", 0))
+            buckets["house"].append(kpi.get("consumption_kwh", 0))
+            buckets["import"].append(kpi.get("import_kwh", 0))
+            bd = sum(v for v in h.get("bat_discharge", []) if v)
+            buckets["bat_kwh"].append(bd)
+    def avg(lst): return round(sum(lst) / len(lst), 1) if lst else None
+    return {
+        "days":       len(buckets["solar"]),
+        "solar_kwh":  avg(buckets["solar"]),
+        "house_kwh":  avg(buckets["house"]),
+        "import_kwh": avg(buckets["import"]),
+        "bat_kwh":    avg(buckets["bat_kwh"]),
+    }
 
 
 @app.route("/api/chart-data")
@@ -4191,6 +4417,7 @@ def api_chart_data():
         "power_flow":    {"labels": pf_labels, "solar": pf_solar,
                           "grid": pf_grid, "battery": pf_battery},
         "hourly":        _hourly_from_decisions(date_param),
+        "averages":      _live_averages_7d(),
         "date":          date_param,
     })
 

@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.2.7"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.2.8"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -4154,6 +4154,39 @@ def api_status():
     storm   = is_storm_forecast()
     return jsonify({"sensors": sensors, "tariff": tariff, "model": model,
                     "optimal": optimal, "storm": storm})
+
+@app.route("/api/debug/sensors")
+def api_debug_sensors():
+    """Show resolved entity IDs and raw HA values for every key sensor role."""
+    roles = {
+        "solar_power":        ("sensor_solar_power",       "sensor.produccion_placas_power"),
+        "grid_power":         ("sensor_grid_power",        "sensor.acometida_general_power"),
+        "battery_power":      ("sensor_battery_power",     "sensor.battery_charge_discharge_power"),
+        "battery_soc":        ("sensor_battery_soc",       "sensor.battery_state_of_capacity"),
+        "temp_outdoor":       ("sensor_temp_outdoor",      "sensor.ebusd_broadcast_outsidetemp_temp2"),
+        "temp_indoor":        ("sensor_temp_salon",        "sensor.media_salon"),
+        "solar_fc_today":     ("sensor_solar_today",       "sensor.energy_production_today"),
+        "solar_fc_tomorrow":  ("sensor_solar_tomorrow",    "sensor.energy_production_tomorrow"),
+        "pool_switch":        ("switch_pool",              "switch.depuradora"),
+    }
+    result = {}
+    for role, (cfg_key, fallback) in roles.items():
+        entity_id = _wiz(role, cfg_key, fallback)
+        state_obj = ha_state(entity_id)
+        raw_state  = state_obj.get("state") if state_obj else None
+        try:
+            parsed = float(raw_state) if raw_state not in (None, "unavailable", "unknown") else None
+        except (ValueError, TypeError):
+            parsed = None
+        result[role] = {
+            "entity_id": entity_id,
+            "source": ("wizard" if _WIZARD.get("sensors", {}).get(role)
+                       else "options" if cfg(cfg_key, "")
+                       else "fallback"),
+            "raw_state": raw_state,
+            "parsed_float": parsed,
+        }
+    return jsonify(result)
 
 @app.route("/api/decisions")
 def api_decisions():

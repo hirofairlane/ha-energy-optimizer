@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.2.9"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.3.0"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -2680,17 +2680,18 @@ async function loadLive(){
     const grid   = ss.grid_power   ?? 0;
     const bat    = ss.battery_power?? 0;
     const soc    = ss.battery_soc  ?? 0;
-    const house  = Math.max(0, solar + bat - grid);
+    const house  = Math.max(0, solar - grid - bat);  // bat>0=charging, grid>0=export
 
     const fmt = w => Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W';
 
     document.getElementById('lv-solar-w').textContent = fmt(solar);
     document.getElementById('lv-house-w').textContent = fmt(house);
-    // Negated display: -1300 when discharging (+bat sensor), +500 when charging (-bat sensor)
-    document.getElementById('lv-bat-w').textContent   = (bat>50?'-':bat<-50?'+':'') + fmt(Math.abs(bat));
+    // bat>0=charging(green/+), bat<0=discharging(red/-). Show signed value directly.
+    const batSign = bat > 50 ? '+' : bat < -50 ? '-' : '';
+    document.getElementById('lv-bat-w').textContent   = batSign + fmt(Math.abs(bat));
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-w').style.color = bat>50?'#f87171':bat<-50?'#4ade80':'#a78bfa';
-    document.getElementById('lv-bat-dir').textContent  = bat>50?'↓ desc':bat<-50?'↑ carga':'idle';
+    document.getElementById('lv-bat-w').style.color = bat>50?'#4ade80':bat<-50?'#f87171':'#a78bfa';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'↑ carga':bat<-50?'↓ desc':'idle';
 
     const gridEl = document.getElementById('lv-grid-w');
     // Show signed value: + export (green), - import (red)
@@ -2708,21 +2709,24 @@ async function loadLive(){
       el.classList.remove('fl-dim'); el.classList.add('fl-active');
       el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
     }
-    // Physics — Huawei convention: bat>0=discharging, bat<0=charging, grid>0=export, grid<0=import
-    const NOISE   = 10;
-    const P_casa  = Math.max(0, solar + bat - grid);  // house balance (same as house var above)
-    const bat_dis = Math.max(0, bat);   // discharge power (positive when discharging)
-    const bat_chg = Math.max(0, -bat);  // charge power (positive when charging)
-    // Flow vectors
-    const f_sol_casa = Math.min(solar, Math.max(0, P_casa));
-    const f_sol_bat  = Math.min(Math.max(0, solar - f_sol_casa), bat_chg);
+    // Convention: bat>0=charging, bat<0=discharging, grid>0=export, grid<0=import
+    const NOISE    = 10;
+    const P_casa   = Math.max(0, solar - grid - bat);
+    const bat_chg  = Math.max(0, bat);   // charge power  (bat > 0)
+    const bat_dis  = Math.max(0, -bat);  // discharge power (bat < 0)
+    const grid_imp = Math.max(0, -grid); // import power (grid < 0)
+    // A. Solar flows (priority: casa first, then battery, then export)
+    const f_sol_casa = Math.min(solar, P_casa);
+    const f_sol_bat  = Math.max(0, Math.min(solar - f_sol_casa, bat_chg));
     const f_sol_red  = Math.max(0, solar - f_sol_casa - f_sol_bat);
-    const f_bat_casa = Math.min(bat_dis, Math.max(0, P_casa - f_sol_casa));
+    // B. Battery flows (if discharging: bat < 0)
+    const f_bat_casa = P_casa > f_sol_casa ? bat_dis : 0;
     const f_bat_red  = Math.max(0, bat_dis - f_bat_casa);
-    const f_red_bat  = Math.max(0, bat_chg - f_sol_bat);
-    const f_red_casa = Math.max(0, P_casa - f_sol_casa - f_bat_casa);
-    // Derived state (correct convention: bat>0=discharging)
-    const discharging = bat > 50, charging = bat < -50;
+    // C. Grid flows (if importing: grid < 0)
+    const f_red_bat  = Math.max(0, bat_chg - f_sol_bat);  // emergency charge from grid
+    const f_red_casa = Math.max(0, grid_imp - f_red_bat);
+    // Derived state
+    const charging = bat > 50, discharging = bat < -50;
     const importing = grid < -50, exporting = grid > 50;
     // Animate — fl-ln-sol-grd also carries battery→grid export (f_bat_red)
     setLine('fl-ln-sol-hse', f_sol_casa > NOISE, false, spd(f_sol_casa));
@@ -2782,10 +2786,8 @@ async function loadLive(){
     // BAT: net avg (+ charge purple, - discharge light)
     const batAvgEl = document.getElementById('lv-bat-avg');
     if(batAvgEl) {
-      // avg_bat from sensor: >0=discharging tendency, <0=charging. Flip for display.
-      const avgBatDisp = av.avg_bat != null ? -av.avg_bat : null;
-      batAvgEl.textContent = fmtAvg(avgBatDisp);
-      batAvgEl.style.color = av.avg_bat > 0 ? '#f87171' : av.avg_bat < 0 ? '#4ade80' : 'var(--m)';
+      batAvgEl.textContent = fmtAvg(av.avg_bat);
+      batAvgEl.style.color = av.avg_bat > 0 ? '#4ade80' : av.avg_bat < 0 ? '#f87171' : 'var(--m)';
     }
     // CASA: avg consumption
     const hsAvgEl = document.getElementById('lv-house-avg');
@@ -4396,8 +4398,8 @@ def _live_averages_7d() -> dict:
 
     SOL: mean only when > 0  (real production during daylight hours)
     RED: net mean  (+ = export, - = import)
-    BAT: net mean  (+ = charging, - = discharging)
-    CASA: mean of (sol - red - bat) for each sample
+    BAT: net mean  (+ = charging / bat>0, - = discharging / bat<0)
+    CASA: mean of (solar - grid - bat) per sample
     """
     cutoff = datetime.now() - timedelta(days=7)
     sol_v, red_v, bat_v, casa_v = [], [], [], []

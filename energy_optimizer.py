@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.2.8"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.2.9"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -2059,6 +2059,17 @@ th{color:var(--m);font-weight:500}
     <button class="btn btn-sm" id="btn-ds-test" onclick="testDataSources()">🔍 Test connections</button>
     <div id="ds-result" style="margin-top:.7rem;font-size:.78rem;line-height:1.7"></div>
   </div>
+
+  <!-- DEBUG SECTION -->
+  <div class="setup-section" style="margin-top:1rem" id="dbg-section">
+    <h3>🐛 Debug — sensor resolution</h3>
+    <div style="font-size:.72rem;color:var(--m);margin-bottom:.5rem">
+      Shows how each sensor role resolves: wizard config → addon options → hardcoded fallback.
+      Use this to diagnose why a sensor shows 0 or unavailable.
+    </div>
+    <button class="btn btn-sm" onclick="loadDebugSensors()">🔄 Refresh</button>
+    <div id="dbg-result" style="margin-top:.7rem;overflow-x:auto"></div>
+  </div>
 </div>
 
 <!-- WIZARD -->
@@ -2488,7 +2499,7 @@ function showTab(name) {
   document.getElementById('tab-'+name).classList.add('active');
   if (name==='charts') chartView('live');
   if (name==='tariff') loadTariff();
-  if (name==='setup')  loadSetup();
+  if (name==='setup')  { loadSetup(); loadDebugSensors(); }
   if (name==='wizard') loadWizard();
 }
 
@@ -3026,6 +3037,67 @@ async function sendSummary(){
     notify('✓ Summary sent — '+r.cycles+' cycles, €'+(r.savings_eur||0).toFixed(2)+' saved','ok',5000);
   }catch(e){notify('✗ Error sending summary','err');}
   finally{btn.disabled=false;btn.textContent='📧 Send daily summary';}
+}
+
+// ── Sensor resolution debug ──────────────────────────────────────────────────
+function loadDebugSensors() {
+  const el = document.getElementById('dbg-result');
+  el.innerHTML = '<span style="color:var(--m);font-size:.75rem">Loading…</span>';
+  fetch(BASE+'/api/debug/sensors')
+    .then(r => r.json())
+    .then(data => {
+      const ROLE_LABEL = {
+        solar_power:       'Solar',
+        grid_power:        'Grid (Red)',
+        battery_power:     'Battery',
+        battery_soc:       'Battery SoC',
+        temp_outdoor:      'Temp outdoor',
+        temp_indoor:       'Temp indoor',
+        solar_fc_today:    'Solar FC today',
+        solar_fc_tomorrow: 'Solar FC tomorrow',
+        pool_switch:       'Pool switch',
+      };
+      const srcColor = {wizard:'#4ade80', options:'#60a5fa', fallback:'#facc15'};
+      let rows = '';
+      for (const [role, info] of Object.entries(data)) {
+        const lbl = ROLE_LABEL[role] || role;
+        const raw = info.raw_state;
+        const val = info.parsed_float;
+        const src = info.source;
+        const eid = info.entity_id;
+        let statusIcon, statusColor;
+        if (raw === null || raw === 'unavailable' || raw === 'unknown') {
+          statusIcon = '✗'; statusColor = '#f87171';
+        } else if (val === null) {
+          statusIcon = '⚠'; statusColor = '#fb923c';
+        } else {
+          statusIcon = '✓'; statusColor = '#4ade80';
+        }
+        const dispVal = val !== null
+          ? (Math.abs(val) >= 1000 ? (val/1000).toFixed(2)+' k' : val.toFixed(1))
+          : (raw || '—');
+        rows += `<tr>
+          <td style="padding:.3rem .5rem;white-space:nowrap">${lbl}</td>
+          <td style="padding:.3rem .5rem;font-size:.68rem;color:#94a3b8;word-break:break-all">${eid}</td>
+          <td style="padding:.3rem .5rem;text-align:center"><span style="color:${srcColor[src]||'#fff'};font-size:.7rem">${src}</span></td>
+          <td style="padding:.3rem .5rem;text-align:right;font-weight:600">${dispVal}</td>
+          <td style="padding:.3rem .5rem;text-align:center;font-size:1rem;color:${statusColor}">${statusIcon}</td>
+        </tr>`;
+      }
+      el.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:.75rem">
+        <thead><tr style="color:var(--m);font-size:.65rem;border-bottom:1px solid #334155">
+          <th style="padding:.3rem .5rem;text-align:left">Role</th>
+          <th style="padding:.3rem .5rem;text-align:left">Entity ID</th>
+          <th style="padding:.3rem .5rem;text-align:center">Source</th>
+          <th style="padding:.3rem .5rem;text-align:right">Value</th>
+          <th style="padding:.3rem .5rem;text-align:center">OK</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    })
+    .catch(err => {
+      el.innerHTML = `<span style="color:#f87171;font-size:.75rem">Error: ${err.message}</span>`;
+    });
 }
 
 // ── Data sources debug ───────────────────────────────────────────────────────

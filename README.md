@@ -1,6 +1,6 @@
 # Energy Optimizer — Home Assistant Add-on
 
-Smart energy management add-on for Home Assistant OS. Combines a **scikit-learn ML model** with dynamic electricity tariff rules to automatically control a solar battery (Huawei Luna2000), heat pump, pool pump, pool cleaner, and dishwasher.
+Smart energy management add-on for Home Assistant OS. Its primary goal is to **minimise your electricity bill** — whether you have a solar battery, a set of schedulable loads (heat pump, EV charger, pool pump, irrigation…), or both. A **scikit-learn ML model** combined with dynamic tariff rules decides in real time when to charge or discharge the battery, when to shift loads to cheap/solar windows, and how much to pre-charge at night — so you import as little peak-rate energy as possible and export as little solar as possible.
 
 > 🔒 **100% local — no cloud, no telemetry.** Everything runs inside the Docker container on your own hardware. Your energy data, sensor readings, and ML model never leave your home network. The add-on only communicates with your local Home Assistant instance and, optionally, a local InfluxDB instance.
 
@@ -20,19 +20,46 @@ Smart energy management add-on for Home Assistant OS. Combines a **scikit-learn 
 
 ## Table of contents
 
-1. [Features](#features)
-2. [Setup Wizard](#setup-wizard)
-3. [Web panel](#web-panel)
-4. [Energy flow diagram](#energy-flow-diagram)
-5. [Battery charging logic](#battery-charging-logic)
-6. [Savings calculation](#savings-calculation)
-7. [ML model](#ml-model)
-8. [Solar terrain correction](#solar-terrain-correction)
-9. [InfluxDB integration](#influxdb-integration)
-10. [Configuration reference](#configuration-reference)
-11. [Electricity tariff](#electricity-tariff)
-12. [Persistent data](#persistent-data)
-13. [Changelog](#changelog)
+1. [Installation](#installation)
+2. [Features](#features)
+3. [Setup Wizard](#setup-wizard)
+4. [Web panel](#web-panel)
+5. [Energy flow diagram](#energy-flow-diagram)
+6. [Battery charging logic](#battery-charging-logic)
+7. [Savings calculation](#savings-calculation)
+8. [ML model](#ml-model)
+9. [Solar terrain correction](#solar-terrain-correction)
+10. [InfluxDB integration](#influxdb-integration)
+11. [Configuration reference](#configuration-reference)
+12. [Electricity tariff](#electricity-tariff)
+13. [Persistent data](#persistent-data)
+14. [Changelog](#changelog)
+
+---
+
+## Installation
+
+**Requirements:** Home Assistant OS or Supervised (any architecture: amd64, aarch64, armv7).
+
+1. In HA go to **Settings → Add-ons → Add-on store → ⋮ menu → Repositories** and add:
+   ```
+   https://github.com/hirofairlane/ha-energy-optimizer
+   ```
+2. Find **Energy Optimizer** in the store and click **Install**.
+3. Start the add-on and open the web panel — the **Setup Wizard** will guide you through the rest.
+
+No YAML editing required. All configuration is done through the wizard and the web panel.
+
+### What you need
+
+| | Required | Optional but recommended |
+|---|---|---|
+| **Battery** | Any smart battery with HA entities for SOC + charge/discharge power | Working mode select, cutoff SOC, force-charge switch (Huawei Luna2000 natively supported) |
+| **Solar** | Forecast.Solar or PVforecast integration | Real-time production sensor |
+| **History** | HA Recorder (14-day window) | InfluxDB for 90-day ML training window |
+| **Schedulable loads** | At least one (heat pump, pool pump, EV charger, or any `switch.*`) | Multiple loads — each adds a scheduling optimisation layer |
+
+The add-on is useful even with **no battery** if you have loads you can shift: it will schedule them to coincide with solar surplus or valley-tariff windows.
 
 ---
 

@@ -4,6 +4,16 @@ Smart energy management add-on for Home Assistant OS. Combines a **scikit-learn 
 
 > **Installation:** Settings → Add-ons → Add-on store → ⋮ → Repositories → add `https://github.com/hirofairlane/ha-energy-optimizer`
 
+### Python dependencies (bundled in Docker image)
+
+| Library | Version | Purpose |
+|---|---|---|
+| **scikit-learn** | ≥ 1.3 | `GradientBoostingRegressor` + `Pipeline` + `StandardScaler` for SOC prediction |
+| Flask | ≥ 3.0 | Internal API and web panel (port 8765) |
+| APScheduler | ≥ 3.10 | Decision cycle and retrain scheduling |
+| requests | — | Home Assistant REST API client |
+| numpy / pandas | — | Feature engineering and time-series resampling |
+
 ---
 
 ## Table of contents
@@ -262,11 +272,13 @@ Daily savings are the sum of all interval savings.
 
 ---
 
-## ML model
+## ML model (scikit-learn)
+
+**scikit-learn** is bundled inside the Docker image — no manual installation needed.
 
 ### What it predicts
 
-A **GradientBoostingRegressor** predicts the battery SOC for the current moment from recent sensor readings. Used as a sanity check and to populate the predicted-SOC line in Charts.
+A `GradientBoostingRegressor` wrapped in a scikit-learn `Pipeline(StandardScaler → GBR)` predicts the battery SOC for the current moment from recent sensor readings. Used as a sanity check and to populate the predicted-SOC line in Charts.
 
 ### Dynamic features
 

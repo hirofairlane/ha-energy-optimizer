@@ -218,13 +218,8 @@ Four cards updated every 30 seconds, each showing instantaneous value + Ø7d rol
 
 An animated SVG diagram shows real-time power flows between four nodes:
 
-```
-        ☀️ Solar
-       /    \
-   🔋 Bat  ⚡ Grid
-       \    /
-        🏠 Casa
-```
+<img width="507" height="295" alt="image" src="https://github.com/user-attachments/assets/e7306a9c-eda7-4647-a7dd-02e24281e2d1" />
+
 
 ### Sensor conventions
 

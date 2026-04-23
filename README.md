@@ -92,9 +92,9 @@ The add-on is useful even with **no battery** if you have loads you can shift: i
 
 The wizard is the recommended way to configure the add-on. It runs through 8 steps and auto-discovers your HA entities using a keyword + device class + unit scoring algorithm.
 
-```
-Data → Location → Grid → Solar → Battery → Loads → Tariff → Done
-```
+
+<img width="969" height="267" alt="Data → Location → Grid → Solar → Battery → Loads → Tariff → Done" src="https://github.com/user-attachments/assets/ca98e827-4d50-4e98-99ca-a615ee265e30" />
+
 
 ### Steps
 

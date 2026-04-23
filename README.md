@@ -2,6 +2,8 @@
 
 Smart energy management add-on for Home Assistant OS. Combines a **scikit-learn ML model** with dynamic electricity tariff rules to automatically control a solar battery (Huawei Luna2000), heat pump, pool pump, pool cleaner, and dishwasher.
 
+> 🔒 **100% local — no cloud, no telemetry.** Everything runs inside the Docker container on your own hardware. Your energy data, sensor readings, and ML model never leave your home network. The add-on only communicates with your local Home Assistant instance and, optionally, a local InfluxDB instance.
+
 > **Installation:** Settings → Add-ons → Add-on store → ⋮ → Repositories → add `https://github.com/hirofairlane/ha-energy-optimizer`
 
 ### Python dependencies (bundled in Docker image)

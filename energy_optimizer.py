@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.3.0"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.3.1"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -527,17 +527,17 @@ def read_sensors() -> dict:
     s: dict = {
         "battery_soc":        ha_float(_wiz("battery_soc",        "sensor_battery_soc",       "sensor.battery_state_of_capacity")),
         "battery_power":      ha_float(_wiz("battery_power",      "sensor_battery_power",      "sensor.battery_charge_discharge_power")),
-        "grid_power":         ha_float(_wiz("grid_power",         "sensor_grid_power",         "sensor.acometida_general_power")),
-        "solar_power":        ha_float(_wiz("solar_power",        "sensor_solar_power",        "sensor.produccion_placas_power")),
+        "grid_power":         ha_float(_wiz("grid_power",         "sensor_grid_power",         "")),
+        "solar_power":        ha_float(_wiz("solar_power",        "sensor_solar_power",        "")),
         "solar_current_hour": ha_float(_wiz("solar_fc_h0",        "sensor_solar_current_hour", "sensor.energy_current_hour")),
         "solar_next_hour":    ha_float(_wiz("solar_fc_h1",        "sensor_solar_next_hour",    "sensor.energy_next_hour")),
         "solar_today":        ha_float(_wiz("solar_fc_today",     "sensor_solar_today",        "sensor.energy_production_today")),
         "solar_tomorrow":     ha_float(_wiz("solar_fc_tomorrow",  "sensor_solar_tomorrow",     "sensor.energy_production_tomorrow")),
-        "temp_outdoor":       ha_float(_wiz("temp_outdoor",       "sensor_temp_outdoor",       "sensor.ebusd_broadcast_outsidetemp_temp2")),
-        "temp_indoor":        ha_float(_wiz("temp_indoor",        "sensor_temp_salon",         "sensor.media_salon")),
+        "temp_outdoor":       ha_float(_wiz("temp_outdoor",       "sensor_temp_outdoor",       "")),
+        "temp_indoor":        ha_float(_wiz("temp_indoor",        "sensor_temp_salon",         "")),
         "pool_hours_day":     ha_float(cfg("sensor_pool_hours_day",  "sensor.depuradora_encendida_24h")),
         "pool_hours_week":    ha_float(cfg("sensor_pool_hours_week", "sensor.depuradora_encendida_semana")),
-        "dishwasher_state":   ha_str(_wiz("dishwasher_state",     "sensor_dishwasher_state",   "sensor.lavavajillas_operation_state")),
+        "dishwasher_state":   ha_str(_wiz("dishwasher_state",     "sensor_dishwasher_state",   "")),
         "ts":                 datetime.now().isoformat(),
     }
 
@@ -571,15 +571,15 @@ def _batt(role: str, cfg_key: str, hardcoded: str) -> str:
 def set_battery_charge_target(target_soc: int, charge_power_w: int = 3000) -> bool:
     ops = [
         ha_set_number(_batt("battery_cutoff_soc",   "number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), target_soc),
-        ha_set_number(_batt("battery_backup_soc",   "number_battery_backup_soc",   "de4a2bf18222f354228cdb112b65e882"),       target_soc),
+        ha_set_number(_batt("battery_backup_soc",   "number_battery_backup_soc",   ""),       target_soc),
         ha_set_select(_batt("battery_mode_select",  "select_battery_mode",         "select.battery_working_mode"), "time_of_use_luna2000"),
     ]
     # Charge power — only if entity is available
-    pwr_entity = _batt("battery_charge_power", "number_battery_charge_power", "a186f9599e9cad7127bca381f7a8bfb2")
+    pwr_entity = _batt("battery_charge_power", "number_battery_charge_power", "")
     if pwr_entity:
         ops.append(ha_set_number(pwr_entity, charge_power_w))
     # Force charge switch
-    force_entity = _batt("battery_force_charge", "switch_battery_force_charge", "02db00e10018b01211507db92819a25a")
+    force_entity = _batt("battery_force_charge", "switch_battery_force_charge", "")
     if force_entity:
         ops.append(ha_switch(force_entity, True))
     ok = all(ops)
@@ -603,7 +603,7 @@ _consumption_cache: dict = {"kw": 0.5, "updated": None}
 
 def _refresh_consumption_cache():
     global _consumption_cache
-    entity = cfg("sensor_grid_power", "sensor.acometida_general_power")
+    entity = cfg("sensor_grid_power", "")
 
     # Prefer InfluxDB (years of data); fall back to HA recorder
     rows = []
@@ -701,7 +701,7 @@ def calculate_optimal_soc(sensors: dict) -> dict:
 STORM_CONDITIONS = {"lightning", "lightning-rainy", "exceptional", "hail", "pouring"}
 
 def is_storm_forecast() -> bool:
-    entity = cfg("sensor_weather", "weather.aemet")
+    entity = cfg("sensor_weather", "")
     s = ha_state(entity)
     if not s:
         return False
@@ -838,7 +838,7 @@ def _build_training_df(days: int = 90) -> "tuple[pd.DataFrame, list[str]] | tupl
 
     # Outdoor temperature → accounts for HVAC-driven SOC swings
     temp_entity = _wiz("temp_outdoor", "sensor_temp_outdoor",
-                       "sensor.ebusd_broadcast_outsidetemp_temp2")
+                       "")
     if wiz_sensors.get("temp_outdoor") or cfg("sensor_temp_outdoor", ""):
         temp_rows = _load_history_best_effort(temp_entity, days)
         if temp_rows:
@@ -849,7 +849,7 @@ def _build_training_df(days: int = 90) -> "tuple[pd.DataFrame, list[str]] | tupl
             log.info(f"  Feature added: temp_outdoor ({len(temp_rows)} rows)")
 
     # Solar production lags → captures daytime energy availability
-    solar_entity = _wiz("solar_power", "sensor_solar_power", "sensor.produccion_placas_power")
+    solar_entity = _wiz("solar_power", "sensor_solar_power", "")
     if wiz_sensors.get("solar_power") or cfg("sensor_solar_power", ""):
         solar_rows = _load_history_best_effort(solar_entity, days)
         if solar_rows:
@@ -862,7 +862,7 @@ def _build_training_df(days: int = 90) -> "tuple[pd.DataFrame, list[str]] | tupl
             log.info(f"  Features added: solar_lag1, solar_roll4 ({len(solar_rows)} rows)")
 
     # Grid power lags (unsigned magnitude) → captures household consumption pattern
-    grid_entity = _wiz("grid_power", "sensor_grid_power", "sensor.acometida_general_power")
+    grid_entity = _wiz("grid_power", "sensor_grid_power", "")
     if wiz_sensors.get("grid_power") or cfg("sensor_grid_power", ""):
         grid_rows = _load_history_best_effort(grid_entity, days)
         if grid_rows:
@@ -1022,7 +1022,7 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
 
     if summer:
         entity = (zone.get("temp_cool") or
-                  _wiz("hvac_temp_cool", "number_hvac_cool", "number.ebusd_ctls2_z1coolingtemp_tempv"))
+                  _wiz("hvac_temp_cool", "number_hvac_cool", ""))
         if free_power or sched_mode == "surplus":
             target, reason = max(16.0, t_comfort - 3), f"Surplus cooling [{zone_name}]"
         elif sched_mode == "comfort":
@@ -1032,7 +1032,7 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
             reason = f"Minimum economy [{zone_name}]"
     else:
         entity = (zone.get("temp_heat") or
-                  _wiz("hvac_temp_heat", "number_hvac_heat", "number.ebusd_ctls2_z1manualtemp_tempv"))
+                  _wiz("hvac_temp_heat", "number_hvac_heat", ""))
         if free_power or sched_mode == "surplus":
             target, reason = t_surplus, f"Surplus heating [{zone_name}]"
         elif sched_mode == "comfort":
@@ -1053,7 +1053,7 @@ def _hp_legacy_decision(sensors: dict) -> dict:
     daytime    = sun["is_day"]
     free_power = (soc >= 99 and batt_power > 0)
     if _is_summer():
-        entity = _wiz("hvac_temp_cool", "number_hvac_cool", "number.ebusd_ctls2_z1coolingtemp_tempv")
+        entity = _wiz("hvac_temp_cool", "number_hvac_cool", "")
         if free_power:
             target, reason = 16.0, "Free solar power (SOC≥99%)"
         elif temp_in > 26 and daytime:
@@ -1061,7 +1061,7 @@ def _hp_legacy_decision(sensors: dict) -> dict:
         else:
             target, reason = 25.0, "Summer base setpoint"
     else:
-        entity = _wiz("hvac_temp_heat", "number_hvac_heat", "number.ebusd_ctls2_z1manualtemp_tempv")
+        entity = _wiz("hvac_temp_heat", "number_hvac_heat", "")
         if free_power:
             target, reason = 18.5, "Free solar power (SOC≥99%)"
         elif temp_in < 16 and daytime:
@@ -1308,8 +1308,8 @@ def run_cycle() -> dict:
 
     # 3. Pool pump + cleaner
     pool     = decide_pool(sensors, tariff)
-    pool_sw  = _wiz("pool_switch",  "switch_pool",         "switch.depuradora")
-    clean_sw = _wiz("pool_cleaner", "switch_pool_cleaner", "switch.limpiafondos")
+    pool_sw  = _wiz("pool_switch",  "switch_pool",         "")
+    clean_sw = _wiz("pool_cleaner", "switch_pool_cleaner", "")
     if pool["action"]:
         _start_pool_with_cleaner(pool_sw, clean_sw)
         decision["actions"].append({"type": "pool", "action": True,
@@ -2442,7 +2442,7 @@ th{color:var(--m);font-weight:500}
         </div>
         <div>
           <label style="font-size:.72rem;color:var(--m)">Weather entity (storm protection)</label>
-          <input class="entity-select" id="wiz-weather" placeholder="weather.aemet" oninput="wizEntityTyped('weather','wiz-weather',null,null)" style="margin-top:.3rem">
+          <input class="entity-select" id="wiz-weather" placeholder="" oninput="wizEntityTyped('weather','wiz-weather',null,null)" style="margin-top:.3rem">
           <div id="wiz-weather-cands" class="entity-cands" style="margin-top:.3rem"></div>
         </div>
       </div>
@@ -3819,10 +3819,10 @@ function _wizRenderSingleDevice(hw, container) {
     html = `<div class="wiz-card"><div class="wiz-card-title">🏊 Pool</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
         <div class="entity-picker"><div class="entity-picker-label">Filter pump switch</div>
-          <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="switch.depuradora" oninput="wizCfg.sensors.pool_switch=this.value;wizEntityTyped('pool_switch','wiz-pool-sw',null,null)">
+          <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="" oninput="wizCfg.sensors.pool_switch=this.value;wizEntityTyped('pool_switch','wiz-pool-sw',null,null)">
           <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
         <div class="entity-picker"><div class="entity-picker-label">Cleaner switch (optional)</div>
-          <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="switch.limpiafondos" oninput="wizCfg.sensors.pool_cleaner=this.value;wizEntityTyped('pool_cleaner','wiz-pool-cl',null,null)">
+          <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="" oninput="wizCfg.sensors.pool_cleaner=this.value;wizEntityTyped('pool_cleaner','wiz-pool-cl',null,null)">
           <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
       </div></div>`;
   } else if (hw === 'dishwasher') {
@@ -3914,10 +3914,10 @@ function wizRenderLoadsEntities() {
     <div class="wiz-card-title" style="font-size:1rem">🏊 Pool</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
       <div class="entity-picker"><div class="entity-picker-label">Filter pump switch</div>
-        <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="switch.depuradora" oninput="wizCfg.sensors.pool_switch=this.value;_wizRenderCands('pool_switch','wiz-pool-sw','wiz-pool-sw-cands',null,null)">
+        <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="" oninput="wizCfg.sensors.pool_switch=this.value;_wizRenderCands('pool_switch','wiz-pool-sw','wiz-pool-sw-cands',null,null)">
         <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
       <div class="entity-picker"><div class="entity-picker-label">Cleaner switch (optional)</div>
-        <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="switch.limpiafondos" oninput="wizCfg.sensors.pool_cleaner=this.value;_wizRenderCands('pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands',null,null)">
+        <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="" oninput="wizCfg.sensors.pool_cleaner=this.value;_wizRenderCands('pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands',null,null)">
         <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
     </div></div>`);
 
@@ -4233,15 +4233,15 @@ def api_status():
 def api_debug_sensors():
     """Show resolved entity IDs and raw HA values for every key sensor role."""
     roles = {
-        "solar_power":        ("sensor_solar_power",       "sensor.produccion_placas_power"),
-        "grid_power":         ("sensor_grid_power",        "sensor.acometida_general_power"),
+        "solar_power":        ("sensor_solar_power",       ""),
+        "grid_power":         ("sensor_grid_power",        ""),
         "battery_power":      ("sensor_battery_power",     "sensor.battery_charge_discharge_power"),
         "battery_soc":        ("sensor_battery_soc",       "sensor.battery_state_of_capacity"),
-        "temp_outdoor":       ("sensor_temp_outdoor",      "sensor.ebusd_broadcast_outsidetemp_temp2"),
-        "temp_indoor":        ("sensor_temp_salon",        "sensor.media_salon"),
+        "temp_outdoor":       ("sensor_temp_outdoor",      ""),
+        "temp_indoor":        ("sensor_temp_salon",        ""),
         "solar_fc_today":     ("sensor_solar_today",       "sensor.energy_production_today"),
         "solar_fc_tomorrow":  ("sensor_solar_tomorrow",    "sensor.energy_production_tomorrow"),
-        "pool_switch":        ("switch_pool",              "switch.depuradora"),
+        "pool_switch":        ("switch_pool",              ""),
     }
     result = {}
     for role, (cfg_key, fallback) in roles.items():
@@ -4891,7 +4891,7 @@ def api_influx_debug():
 
 @app.route("/api/weather")
 def api_weather():
-    entity = cfg("sensor_weather", "weather.aemet")
+    entity = cfg("sensor_weather", "")
     s = ha_state(entity)
     if not s:
         return jsonify({"ok": False, "error": "weather entity unavailable"})

@@ -94,11 +94,6 @@ The wizard header shows a live quality score (0–100%):
 
 Score factors: history source (30 pts) + key sensor coverage (25 pts) + sample count bonus (30 pts) + optional sensors (15 pts).
 
-### Bolt vs Nexus mode
-
-- **Bolt 🤖** — basic mode: only essential fields, friendly step-by-step guidance
-- **Nexus ⚡** — advanced mode: all fields including HVAC multi-zone schedules, grid sub-meters, per-tier temperature setpoints
-
 ### Entity auto-discovery
 
 For each sensor role, the wizard queries all HA entities and scores them:
@@ -117,7 +112,7 @@ The Loads step shows a card for each appliance type. Select the ones present in 
 
 | Load | Icon | What you configure | What the engine does |
 |---|---|---|---|
-| **HVAC** | 🌡️ | Climate entity or heat/cool setpoint numbers per zone. Nexus mode: 24h schedule with Comfort 🟢 / Surplus 🔵 / Minimum ⚫ temperature tiers | Raises/lowers setpoints based on tariff period, solar surplus (SOC ≥ 99%), and indoor temperature. Multi-zone supported |
+| **HVAC** | 🌡️ | Climate entity or heat/cool setpoint numbers per zone. 24h schedule with Comfort 🟢 / Surplus 🔵 / Minimum ⚫ temperature tiers | Raises/lowers setpoints based on tariff period, solar surplus (SOC ≥ 99%), and indoor temperature. Multi-zone supported |
 | **Pool pump** | 🏊 | Pool switch + optional runtime sensors (daily/weekly hours) | Runs during solar surplus (SOC ≥ 99%) or valley tariff to meet runtime targets |
 | **Pool cleaner** | 🤿 | Cleaner switch entity | Auto-starts with the pool pump, auto-stops after 15 min (~1.5 kWh) |
 | **Dishwasher** | 🍽️ | State sensor + optional switch | Monitors cycle state; recommends (or triggers) start during solar surplus or valley |
@@ -152,6 +147,32 @@ Five tabs, accessible via HA ingress (port 8765, no external port needed):
 | ⚡ **Tariff** | Per-day weekend config · per-hour timeline · price editor · Reset to defaults |
 | ⚙️ **Setup (Tweaks)** | Notification toggles · battery threshold sliders · decision interval · Data Sources connectivity test · **Debug: sensor resolution table** |
 | 🧙 **Wizard** | Full setup wizard (see above) |
+
+### Setup (Tweaks) tab
+
+The Tweaks tab is the runtime control panel — all changes take effect immediately without restarting the add-on.
+
+| Section | What it does |
+|---|---|
+| **Notifications** | Enable/disable email daily summary, Telegram daily summary, and instant Telegram alerts individually. |
+| **Battery thresholds** | Sliders for emergency, low, medium, and storm SOC thresholds. Adjust without editing `config.yaml`. |
+| **Decision interval** | How often (in minutes) the optimization engine runs. Default 15 min. |
+| **Data Sources** | Connectivity test for InfluxDB and HA Recorder — shows last-read timestamp, row count, and active/fallback status. |
+| **Debug: sensor resolution** | Table that auto-loads when you open the tab and shows exactly how every sensor role was resolved. A **Refresh** button re-reads live HA values. |
+
+#### Debug sensor resolution table
+
+| Column | Meaning |
+|---|---|
+| **Role** | Internal name (e.g. `solar_power`, `battery_soc`) |
+| **Entity ID** | The HA entity resolved for this role |
+| **Source** | `wizard` (wizard_config.json) · `options` (config.yaml) · `fallback` (built-in default) |
+| **Value** | Current state read from HA at refresh time |
+| **Status** | ✓ valid reading · ⚠ entity exists but value is unexpected · ✗ not found or unavailable |
+
+This is the first place to look when a Dashboard card shows 0 W or "unavailable" — it shows whether the problem is entity resolution or a real sensor issue.
+
+---
 
 ### Live power panel
 
@@ -494,7 +515,7 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 - Physics-based flow animation: 7 computed flow vectors, speed proportional to power.
 
 ### v3.0.0
-- **Setup Wizard:** 8-step guided configuration with entity auto-discovery, data quality thermometer, Bolt/Nexus modes, HVAC multi-zone, device sub-dots in nav bar.
+- **Setup Wizard:** 8-step guided configuration with entity auto-discovery, data quality thermometer, HVAC multi-zone scheduling, device sub-dots in nav bar.
 - **Dynamic ML features:** feature set built from wizard-configured sensors, saved alongside model.
 - **Multi-source history:** InfluxDB v2 → InfluxDB v1 → HA Recorder cascade.
 - **`_wiz()` resolution:** wizard_config.json → options.json → hardcoded fallback for every sensor role.

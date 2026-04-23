@@ -78,7 +78,7 @@ Data → Location → Grid → Solar → Battery → Loads → Tariff → Done
 | **Grid** | Grid meter sensor (import/export) |
 | **Solar** | Production sensor + Forecast.Solar sensors (today/tomorrow/hourly) |
 | **Battery** | SOC sensor, charge/discharge power, working mode select, charge cutoff, backup SOC, force charge switch |
-| **Loads** | Per-device sub-wizards for each enabled appliance: HVAC zones, pool pump, pool cleaner, dishwasher, washer, dryer, EV |
+| **Loads** | Per-device sub-wizards for each enabled appliance (see [Supported loads](#supported-loads)) |
 | **Tariff** | Contracted power, tariff type, peak/shoulder/valley prices |
 | **Done** | Data quality score summary and save |
 
@@ -110,6 +110,34 @@ For each sensor role, the wizard queries all HA entities and scores them:
 | Each matching keyword in entity ID | +25 |
 
 Top candidates are shown as clickable cards. The selected entity is saved to `wizard_config.json` and takes precedence over `options.json` for all decisions.
+
+### Supported loads
+
+The Loads step shows a card for each appliance type. Select the ones present in your installation — the wizard then walks through a sub-wizard for each one. Each selected device also appears as a small emoji dot in the wizard navigation bar.
+
+| Load | Icon | What you configure | What the engine does |
+|---|---|---|---|
+| **HVAC** | 🌡️ | Climate entity or heat/cool setpoint numbers per zone. Nexus mode: 24h schedule with Comfort 🟢 / Surplus 🔵 / Minimum ⚫ temperature tiers | Raises/lowers setpoints based on tariff period, solar surplus (SOC ≥ 99%), and indoor temperature. Multi-zone supported |
+| **Pool pump** | 🏊 | Pool switch + optional runtime sensors (daily/weekly hours) | Runs during solar surplus (SOC ≥ 99%) or valley tariff to meet runtime targets |
+| **Pool cleaner** | 🤿 | Cleaner switch entity | Auto-starts with the pool pump, auto-stops after 15 min (~1.5 kWh) |
+| **Dishwasher** | 🍽️ | State sensor + optional switch | Monitors cycle state; recommends (or triggers) start during solar surplus or valley |
+| **Washing machine** | 👕 | State sensor + power meter | Monitors cycle; recommends start during cheapest/greenest window |
+| **Dryer** | 🌀 | State sensor + power meter | Same as washing machine |
+| **EV Charger** | 🚗 | Switch or number entity (Wallbox, OCPP, Zappi…) | Schedules charging during valley tariff or solar surplus |
+| **Custom** | ⚙️ | Any `switch.*` entity + estimated watts + schedule preference | Schedules any switch-controlled load (irrigation pump, water heater, etc.) according to the selected window |
+
+#### Custom load scheduling options
+
+When adding a Custom load you choose one of four scheduling modes:
+
+| Mode | When the switch is turned on |
+|---|---|
+| 🌙 **Valley tariff only** | During the cheapest grid tariff window (typically 00:00–08:00) |
+| ☀️ **Solar surplus only** | When solar production exceeds house consumption (SOC ≥ 99%) |
+| ☀️🌙 **Solar + Valley** | Either of the above |
+| ⏱ **Custom hours** | A fixed time range you specify (e.g. `10-14,22-06`) |
+
+Multiple Custom loads can be added (e.g. irrigation pump + water heater), each with its own entity, wattage, and schedule.
 
 ---
 

@@ -3,6 +3,7 @@
 Smart energy management add-on for Home Assistant OS. Its primary goal is to **minimise your electricity bill** — whether you have a solar battery, a set of schedulable loads (heat pump, EV charger, pool pump, irrigation…), or both. A **scikit-learn ML model** combined with dynamic tariff rules decides in real time when to charge or discharge the battery, when to shift loads to cheap/solar windows, and how much to pre-charge at night — so you import as little peak-rate energy as possible and export as little solar as possible.
 
 > 🔒 **100% local — no cloud, no telemetry.** Everything runs inside the Docker container on your own hardware. Your energy data, sensor readings, and ML model never leave your home network. The add-on only communicates with your local Home Assistant instance and, optionally, a local InfluxDB instance.
+<img width="1157" height="1113" alt="image" src="https://github.com/user-attachments/assets/f2235103-6d81-4d58-b8ca-00148d9acd58" />
 
 > **Installation:** Settings → Add-ons → Add-on store → ⋮ → Repositories → add `https://github.com/hirofairlane/ha-energy-optimizer`
 
@@ -68,8 +69,11 @@ The add-on is useful even with **no battery** if you have loads you can shift: i
 | Feature | Description |
 |---|---|
 | **Setup Wizard** | 8-step guided configuration — auto-discovers your HA entities with ML-based scoring. No YAML editing required |
+<img width="952" height="862" alt="image" src="https://github.com/user-attachments/assets/92348e09-e4ba-4a80-b406-7add53b455a5" />
 | **Smart valley charging** | Calculates exactly how much battery to charge from the grid at night to cover tomorrow's peak demand — no more, no less |
 | **Energy flow diagram** | Animated SVG showing real-time power flows between Solar, Battery, Grid, and House nodes |
+<img width="556" height="312" alt="image" src="https://github.com/user-attachments/assets/0d08be64-683c-4aac-a5c1-02898d194154" />
+
 | **Live 7-day averages** | Each sensor card shows instantaneous value + Ø7d rolling average (solar: daylight hours only) |
 | **Solar terrain correction** | Learns your real production vs HA forecast from InfluxDB history — corrects for local shading automatically |
 | **Temperature-aware target** | Cold days = more heat pump during peak hours → charges more battery |

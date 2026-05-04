@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.3.1"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.4.0"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -92,6 +92,14 @@ def cfg(key: str, default=None):
     if key in _SETUP:
         return _SETUP[key]
     return OPT.get(key, default)
+
+def _health_mode_limits() -> tuple:
+    """Return (min_soc, max_soc) for charging based on battery_health_mode setting."""
+    return {
+        "bill_reducer":  (10, 95),
+        "optimized":     (20, 90),
+        "battery_guard": (25, 85),
+    }.get(cfg("battery_health_mode", "bill_reducer"), (10, 95))
 
 # ── Wizard config (from GUI wizard — stored in /data/wizard_config.json) ──────
 _WIZARD: dict = {}
@@ -681,8 +689,9 @@ def calculate_optimal_soc(sensors: dict) -> dict:
     battery_needed = max(0.0, peak_total_kwh - solar_during_peak)
     soc_needed = (battery_needed / battery_kwh) * 100
 
-    # +5% safety buffer, clamp 30–95%
-    target = max(30, min(95, round(soc_needed + 5)))
+    # +5% safety buffer, clamp to health-mode SOC limits (floor at 30% for safe operation)
+    _hmin, _hmax = _health_mode_limits()
+    target = max(max(30, _hmin), min(_hmax, round(soc_needed + 5)))
 
     return {
         "target_soc":         target,
@@ -1558,6 +1567,8 @@ h2{font-size:.7rem;color:var(--m);text-transform:uppercase;letter-spacing:.08em;
 .btn{background:var(--a);color:#0f172a;border:none;padding:.45rem 1rem;border-radius:.5rem;font-weight:700;cursor:pointer;font-size:.8rem;transition:.15s opacity,.1s transform;display:inline-flex;align-items:center;gap:.35rem}
 .btn:hover{opacity:.85}.btn:active{transform:scale(.97)}.btn:disabled{opacity:.4;cursor:default}
 .btn-y{background:var(--y)}.btn-g{background:var(--g)}.btn-r{background:var(--r)}.btn-p{background:var(--p)}.btn-sm{padding:.3rem .7rem;font-size:.72rem}
+.hm-btn{background:var(--b);color:var(--t);border:1px solid #334155;flex-direction:column;padding:.55rem .4rem;text-align:center;justify-content:center;width:100%;transition:.15s all}
+.hm-btn.active{background:rgba(56,189,248,.15);border-color:var(--a);color:var(--a)}
 .actions{display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap}
 .batt-card{background:var(--s);border-radius:.75rem;padding:.9rem;border:1px solid var(--b);margin-bottom:1rem}
 .batt-header{display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.8rem}
@@ -1880,6 +1891,8 @@ th{color:var(--m);font-weight:500}
         <!-- Footer: tariff + timestamp -->
         <text id="sv-tariff" x="110" y="258" text-anchor="middle" fill="#475569" font-size="9" font-family="sans-serif">—</text>
         <text id="sv-ts"     x="330" y="258" text-anchor="middle" fill="#334155" font-size="9" font-family="sans-serif">—</text>
+        <!-- Imbalance warning (only shown when sensors out of sync) -->
+        <text id="sv-warn"   x="220" y="246" text-anchor="middle" fill="#fb923c" font-size="9" font-weight="600" font-family="sans-serif"></text>
       </svg>
     </div>
     <!-- 7-day averages integrated into cards above -->
@@ -1901,24 +1914,29 @@ th{color:var(--m);font-weight:500}
     </div>
     <!-- KPI row -->
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;margin-bottom:.8rem" id="day-kpis">
-      <div class="card" style="text-align:center;padding:.6rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="Total solar energy captured today.&#10;Ø = all-time daily average (daylight hours only).">
         <div id="kpi-solar" style="font-size:1.1rem;font-weight:700;color:#facc15">—</div>
+        <div id="kpi-solar-avg" style="font-size:.6rem;color:#a16207;min-height:.8rem"></div>
         <div style="font-size:.65rem;color:var(--m)">☀️ Solar</div>
       </div>
-      <div class="card" style="text-align:center;padding:.6rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="Total house consumption today (solar + battery discharge + grid import).&#10;Ø = all-time daily average.">
         <div id="kpi-cons" style="font-size:1.1rem;font-weight:700;color:#f97316">—</div>
+        <div id="kpi-cons-avg" style="font-size:.6rem;color:#c2410c;min-height:.8rem"></div>
         <div style="font-size:.65rem;color:var(--m)">🏠 Consumed</div>
       </div>
-      <div class="card" style="text-align:center;padding:.6rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="Solar energy sold to the grid today.&#10;Ø = all-time daily average. High export = room to schedule more loads or charge battery more.">
         <div id="kpi-exp" style="font-size:1.1rem;font-weight:700;color:#4ade80">—</div>
+        <div id="kpi-exp-avg" style="font-size:.6rem;color:#16a34a;min-height:.8rem"></div>
         <div style="font-size:.65rem;color:var(--m)">📤 Exported</div>
       </div>
-      <div class="card" style="text-align:center;padding:.6rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="Energy bought from the grid today.&#10;Ø = all-time daily average. The optimizer minimises this during peak tariff hours.">
         <div id="kpi-imp" style="font-size:1.1rem;font-weight:700;color:#f87171">—</div>
+        <div id="kpi-imp-avg" style="font-size:.6rem;color:#dc2626;min-height:.8rem"></div>
         <div style="font-size:.65rem;color:var(--m)">📥 Imported</div>
       </div>
-      <div class="card" style="text-align:center;padding:.6rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="% of today's consumption covered by solar (direct or via battery).&#10;Ø = all-time average. 100% = zero grid imports.">
         <div id="kpi-ss" style="font-size:1.1rem;font-weight:700;color:var(--a)">—</div>
+        <div id="kpi-ss-avg" style="font-size:.6rem;color:var(--m);min-height:.8rem"></div>
         <div style="font-size:.65rem;color:var(--m)">🔄 Self-suff.</div>
       </div>
     </div>
@@ -1938,6 +1956,34 @@ th{color:var(--m);font-weight:500}
 
   <!-- ── HISTORY ───────────────────────────────────────────────────────── -->
   <div id="cv-hist" style="display:none">
+    <!-- Average KPI summary row -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;margin-bottom:.8rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily solar production.&#10;Top = all-time · Bottom = last 12 months.">
+        <div id="hs-solar" style="font-size:1rem;font-weight:700;color:#facc15">—</div>
+        <div id="hs-solar-12m" style="font-size:.6rem;color:#a16207;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">☀️ Solar/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily house consumption (solar + battery discharge + grid import).&#10;Top = all-time · Bottom = last 12 months.">
+        <div id="hs-cons" style="font-size:1rem;font-weight:700;color:#f97316">—</div>
+        <div id="hs-cons-12m" style="font-size:.6rem;color:#c2410c;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">🏠 Consumed/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily energy exported (sold) to the grid.&#10;High values = room to add loads or storage.">
+        <div id="hs-exp" style="font-size:1rem;font-weight:700;color:#4ade80">—</div>
+        <div id="hs-exp-12m" style="font-size:.6rem;color:#16a34a;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">📤 Exported/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily energy imported from the grid.&#10;The optimizer minimises peak-tariff imports.">
+        <div id="hs-imp" style="font-size:1rem;font-weight:700;color:#f87171">—</div>
+        <div id="hs-imp-12m" style="font-size:.6rem;color:#dc2626;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">📥 Imported/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average % of consumption covered by solar (directly or via battery).&#10;100% = zero grid imports.">
+        <div id="hs-ss" style="font-size:1rem;font-weight:700;color:var(--a)">—</div>
+        <div id="hs-ss-12m" style="font-size:.6rem;color:var(--m);min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">🔄 Self-suff.</div>
+      </div>
+    </div>
     <div class="grid2">
       <div class="card">
         <h2 style="margin-top:0;font-size:.85rem">☀️ Solar — last 7 days (kWh)</h2>
@@ -1948,9 +1994,31 @@ th{color:var(--m);font-weight:500}
         <canvas id="savingsChart" style="max-height:200px"></canvas>
       </div>
     </div>
-    <div class="card" style="margin-bottom:1rem">
+    <div class="card" style="margin-bottom:.7rem">
       <h2 style="margin-top:0;font-size:.85rem">📅 Solar production — last 12 months (kWh)</h2>
       <canvas id="sol12Chart" style="max-height:220px"></canvas>
+    </div>
+    <!-- ROI Calculator -->
+    <div class="card" style="margin-bottom:1rem">
+      <h2 style="margin-top:0;font-size:.85rem">🔋 Battery expansion — ROI calculator</h2>
+      <div style="font-size:.72rem;color:var(--m);margin-bottom:.8rem">
+        Based on your actual average daily savings. Enter the cost and capacity of additional storage to estimate payback time.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.6rem">
+        <div>
+          <label style="font-size:.72rem;color:var(--m);display:block;margin-bottom:.25rem">Battery cost (€)</label>
+          <input id="roi-cost" type="number" min="100" step="100" value="3000"
+            style="background:var(--b);border:1px solid #475569;border-radius:.35rem;padding:.3rem .6rem;color:var(--t);font-size:.85rem;width:100%;box-sizing:border-box"
+            oninput="calcROI()">
+        </div>
+        <div>
+          <label style="font-size:.72rem;color:var(--m);display:block;margin-bottom:.25rem">Additional capacity (kWh)</label>
+          <input id="roi-kwh" type="number" min="1" max="50" step="0.5" value="5"
+            style="background:var(--b);border:1px solid #475569;border-radius:.35rem;padding:.3rem .6rem;color:var(--t);font-size:.85rem;width:100%;box-sizing:border-box"
+            oninput="calcROI()">
+        </div>
+      </div>
+      <div id="roi-result" style="font-size:.8rem;line-height:1.8;background:rgba(74,222,128,.05);border:1px solid #1e3a2f;border-radius:.5rem;padding:.7rem .9rem;display:none"></div>
     </div>
   </div>
 </div>
@@ -2006,6 +2074,33 @@ th{color:var(--m);font-weight:500}
         oninput="document.getElementById('val-notify-time').textContent=this.value;markDirty()"
         style="background:var(--b);border:1px solid #475569;border-radius:.35rem;padding:.3rem .5rem;color:var(--t);font-size:.85rem;width:140px">
     </div>
+  </div>
+  <div class="setup-section">
+    <h3>🔋 Battery health mode</h3>
+    <div style="font-size:.72rem;color:var(--m);margin-bottom:.8rem">
+      Controls the SOC operating range. A tighter range reduces deep discharge stress and extends battery lifetime, at a small cost in daily savings capacity.
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem">
+      <button id="hm-bill" class="btn hm-btn" onclick="setHealthMode('bill_reducer')"
+        title="SOC 10–95%. Uses full battery capacity. Best for minimising electricity bill.">
+        <div style="font-size:1.1rem">⚡</div>
+        <div style="font-size:.75rem;font-weight:700;margin:.15rem 0">Bill Reducer</div>
+        <div style="font-size:.63rem;color:var(--m)">10% – 95%</div>
+      </button>
+      <button id="hm-opt" class="btn hm-btn" onclick="setHealthMode('optimized')"
+        title="SOC 20–90%. Balanced: ~95% of savings benefit with moderate cycle protection.">
+        <div style="font-size:1.1rem">⚖️</div>
+        <div style="font-size:.75rem;font-weight:700;margin:.15rem 0">Optimized</div>
+        <div style="font-size:.63rem;color:var(--m)">20% – 90%</div>
+      </button>
+      <button id="hm-guard" class="btn hm-btn" onclick="setHealthMode('battery_guard')"
+        title="SOC 25–85%. Prioritises battery longevity. Recommended for batteries older than 3 years.">
+        <div style="font-size:1.1rem">🛡️</div>
+        <div style="font-size:.75rem;font-weight:700;margin:.15rem 0">Battery Guard</div>
+        <div style="font-size:.63rem;color:var(--m)">25% – 85%</div>
+      </button>
+    </div>
+    <div style="font-size:.7rem;color:var(--m);margin-top:.5rem;min-height:1.1rem" id="hm-desc"></div>
   </div>
   <div class="setup-section">
     <h3>🔋 Battery thresholds</h3>
@@ -2588,6 +2683,21 @@ async function saveTariff(){
 let _dirty=false;
 function markDirty(){_dirty=true;document.getElementById('setup-hint').textContent='Unsaved changes';}
 
+let _healthMode='bill_reducer';
+function setHealthMode(m){
+  _healthMode=m;
+  const ids={bill_reducer:'hm-bill',optimized:'hm-opt',battery_guard:'hm-guard'};
+  Object.entries(ids).forEach(([k,id])=>document.getElementById(id)?.classList.toggle('active',k===m));
+  const desc={
+    bill_reducer:  'SOC operates 10%–95%. Maximum daily savings — uses the full battery capacity every cycle.',
+    optimized:     'SOC operates 20%–90%. Sweet spot for most installations: ~95% of savings benefit with moderate cycle protection.',
+    battery_guard: 'SOC operates 25%–85%. Reduces deep discharge stress — recommended for batteries older than 3 years or when longevity is the priority.',
+  };
+  const el=document.getElementById('hm-desc');
+  if(el) el.textContent=desc[m]||'';
+  markDirty();
+}
+
 async function loadSetup(){
   try {
     const s=await fetch(BASE+'/api/setup').then(r=>r.json());
@@ -2603,6 +2713,7 @@ async function loadSetup(){
     set('rng-storm','val-storm',s.battery_storm_threshold??80,'%');
     set('rng-interval','val-interval',s.decision_interval_minutes??15,' min');
     set('rng-batt-cap','val-batt-cap',s.battery_capacity_kwh??10,' kWh');
+    setHealthMode(s.battery_health_mode||'bill_reducer');
     _dirty=false; document.getElementById('setup-hint').textContent='';
   } catch(e){ notify('Error loading setup','err'); }
 }
@@ -2624,6 +2735,7 @@ async function saveSetup(){
         battery_storm_threshold:         parseInt(document.getElementById('rng-storm').value),
         decision_interval_minutes:       parseInt(document.getElementById('rng-interval').value),
         battery_capacity_kwh:            parseFloat(document.getElementById('rng-batt-cap').value),
+        battery_health_mode:             _healthMode,
       })
     }).then(r=>r.json());
     if(r.ok){notify('✓ Settings saved');_dirty=false;document.getElementById('setup-hint').textContent='Saved ✓';}
@@ -2680,17 +2792,30 @@ async function loadLive(){
     const grid   = ss.grid_power   ?? 0;
     const bat    = ss.battery_power?? 0;
     const soc    = ss.battery_soc  ?? 0;
-    const house  = Math.max(0, solar - grid - bat);  // bat>0=charging, grid>0=export
+    // Energy balance: solar = house + bat_charge + grid_export (sign convention bat>0=chg, grid>0=exp).
+    // When sensors disagree (Huawei battery reading lags during transitions / taper near full SOC),
+    // the implied house comes out negative. Detect and fall back to historical baseload so we don't
+    // lie with "0 W" for casa. STALE_TH = 80W tolerates rounding/sampling jitter.
+    const balanceRaw = solar - grid - bat;
+    const STALE_TH   = 80;
+    const stale      = balanceRaw < -STALE_TH;
+    const baselineW  = (s.consumption_baseline_kw ?? 0.5) * 1000;
+    const house      = stale ? Math.max(50, baselineW) : Math.max(0, balanceRaw);
 
     const fmt = w => Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W';
 
     document.getElementById('lv-solar-w').textContent = fmt(solar);
-    document.getElementById('lv-house-w').textContent = fmt(house);
+    const lvHouseEl = document.getElementById('lv-house-w');
+    lvHouseEl.textContent = fmt(house) + (stale ? ' ?' : '');
+    lvHouseEl.style.color = stale ? '#fb923c' : '#f97316';
+    lvHouseEl.title = stale ? `Balance: faltan ${Math.round(-balanceRaw)} W. Mostrando estimación (baseload nocturno). Suele resolverse en 1-2 ciclos cuando se actualiza la lectura desfasada (típicamente la batería).` : '';
     // bat>0=charging(green/+), bat<0=discharging(red/-). Show signed value directly.
     const batSign = bat > 50 ? '+' : bat < -50 ? '-' : '';
-    document.getElementById('lv-bat-w').textContent   = batSign + fmt(Math.abs(bat));
+    const lvBatEl = document.getElementById('lv-bat-w');
+    lvBatEl.textContent = batSign + fmt(Math.abs(bat)) + (stale ? ' ⚠' : '');
     document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
-    document.getElementById('lv-bat-w').style.color = bat>50?'#4ade80':bat<-50?'#f87171':'#a78bfa';
+    lvBatEl.style.color = stale ? '#fb923c' : (bat>50?'#4ade80':bat<-50?'#f87171':'#a78bfa');
+    lvBatEl.title = stale ? 'Lectura probablemente desfasada (Huawei Luna2000 lagea cerca del 100% SOC). Suele estabilizarse en 1-2 ciclos.' : '';
     document.getElementById('lv-bat-dir').textContent  = bat>50?'↑ carga':bat<-50?'↓ desc':'idle';
 
     const gridEl = document.getElementById('lv-grid-w');
@@ -2709,32 +2834,42 @@ async function loadLive(){
       el.classList.remove('fl-dim'); el.classList.add('fl-active');
       el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
     }
-    // Convention: bat>0=charging, bat<0=discharging, grid>0=export, grid<0=import
-    const NOISE    = 10;
-    const P_casa   = Math.max(0, solar - grid - bat);
-    const bat_chg  = Math.max(0, bat);   // charge power  (bat > 0)
-    const bat_dis  = Math.max(0, -bat);  // discharge power (bat < 0)
-    const grid_imp = Math.max(0, -grid); // import power (grid < 0)
-    // A. Solar flows (priority: casa first, then battery, then export)
-    const f_sol_casa = Math.min(solar, P_casa);
-    const f_sol_bat  = Math.max(0, Math.min(solar - f_sol_casa, bat_chg));
-    const f_sol_red  = Math.max(0, solar - f_sol_casa - f_sol_bat);
-    // B. Battery flows (if discharging: bat < 0)
-    const f_bat_casa = P_casa > f_sol_casa ? bat_dis : 0;
-    const f_bat_red  = Math.max(0, bat_dis - f_bat_casa);
-    // C. Grid flows (if importing: grid < 0)
-    const f_red_bat  = Math.max(0, bat_chg - f_sol_bat);  // emergency charge from grid
-    const f_red_casa = Math.max(0, grid_imp - f_red_bat);
+    // Convention: bat>0=charging, bat<0=discharging, grid>0=export, grid<0=import.
+    // Conservation in: solar + bat_dis + grid_imp = house + bat_chg + grid_exp = out.
+    // When sensors disagree (stale==true), we trust solar+grid (revenue meter is fast,
+    // inverter direct measurement is fast) and re-derive battery as the residual; this
+    // produces a coherent diagram even when battery_power is lagged.
+    const NOISE = 10;
+    let bat_chg  = Math.max(0,  bat);
+    let bat_dis  = Math.max(0, -bat);
+    if (stale) {
+      const batDerived = solar - grid - house;   // forced by conservation
+      bat_chg = Math.max(0,  batDerived);
+      bat_dis = Math.max(0, -batDerived);
+    }
+    const grid_imp = Math.max(0, -grid);
+    const grid_exp = Math.max(0,  grid);
+    // Priority allocation (sources → sinks): solar→house, bat_dis→house, grid_imp→house,
+    // solar→bat_chg, solar→grid_exp, bat_dis→grid_exp, grid_imp→bat_chg.
+    let rSol = solar, rHse = house, rBatChg = bat_chg, rBatDis = bat_dis,
+        rGrdImp = grid_imp, rGrdExp = grid_exp;
+    const f_sol_hse = Math.min(rSol, rHse);     rSol -= f_sol_hse;    rHse    -= f_sol_hse;
+    const f_bat_hse = Math.min(rBatDis, rHse);  rBatDis -= f_bat_hse; rHse    -= f_bat_hse;
+    const f_grd_hse = Math.min(rGrdImp, rHse);  rGrdImp -= f_grd_hse; rHse    -= f_grd_hse;
+    const f_sol_bat = Math.min(rSol, rBatChg);  rSol -= f_sol_bat;    rBatChg -= f_sol_bat;
+    const f_sol_grd = Math.min(rSol, rGrdExp);  rSol -= f_sol_grd;    rGrdExp -= f_sol_grd;
+    const f_bat_grd = Math.min(rBatDis, rGrdExp); rBatDis -= f_bat_grd; rGrdExp -= f_bat_grd;
+    const f_grd_bat = Math.min(rGrdImp, rBatChg); rGrdImp -= f_grd_bat; rBatChg -= f_grd_bat;
     // Derived state
     const charging = bat > 50, discharging = bat < -50;
     const importing = grid < -50, exporting = grid > 50;
-    // Animate — fl-ln-sol-grd also carries battery→grid export (f_bat_red)
-    setLine('fl-ln-sol-hse', f_sol_casa > NOISE, false, spd(f_sol_casa));
-    setLine('fl-ln-sol-bat', f_sol_bat  > NOISE, false, spd(f_sol_bat));
-    setLine('fl-ln-sol-grd', (f_sol_red + f_bat_red) > NOISE, false, spd(f_sol_red + f_bat_red));
-    setLine('fl-ln-bat-hse', f_bat_casa > NOISE, false, spd(f_bat_casa));
-    setLine('fl-ln-grd-bat', f_red_bat  > NOISE, false, spd(f_red_bat));
-    setLine('fl-ln-grd-hse', f_red_casa > NOISE, false, spd(f_red_casa));
+    // Animate — sol-grd line also carries battery→grid (rare: discharging while exporting)
+    setLine('fl-ln-sol-hse', f_sol_hse > NOISE, false, spd(f_sol_hse));
+    setLine('fl-ln-sol-bat', f_sol_bat > NOISE, false, spd(f_sol_bat));
+    setLine('fl-ln-sol-grd', (f_sol_grd + f_bat_grd) > NOISE, false, spd(f_sol_grd + f_bat_grd));
+    setLine('fl-ln-bat-hse', f_bat_hse > NOISE, false, spd(f_bat_hse));
+    setLine('fl-ln-grd-bat', f_grd_bat > NOISE, false, spd(f_grd_bat));
+    setLine('fl-ln-grd-hse', f_grd_hse > NOISE, false, spd(f_grd_hse));
 
     document.getElementById('sv-solar-val').textContent = fmt(solar);
     document.getElementById('sv-house-val').textContent = fmt(house);
@@ -2746,6 +2881,10 @@ async function loadLive(){
     const tp=s.tariff?.period||'';
     document.getElementById('sv-tariff').textContent = tp?`${tp} · ${(s.tariff?.price_kwh??0).toFixed(3)} €/kWh`:'';
     document.getElementById('sv-ts').textContent = new Date().toLocaleTimeString();
+    const warnEl = document.getElementById('sv-warn');
+    if (warnEl) {
+      warnEl.textContent = stale ? `⚠ datos sincronizando · balance Δ ${Math.round(-balanceRaw)} W (lectura desfasada, normal cerca del 100% SOC)` : '';
+    }
 
     // SOC 24h chart
     const sdat = cd.soc||{};
@@ -2820,6 +2959,21 @@ async function loadDay(date){
     document.getElementById('kpi-imp').textContent   = (kpi.import_kwh??0).toFixed(1)+' kWh';
     document.getElementById('kpi-ss').textContent    = (kpi.self_sufficiency_pct??0).toFixed(0)+'%';
 
+    // All-time averages below KPI values
+    try {
+      const av=await fetch(BASE+'/api/averages').then(r=>r.json());
+      const at=av.all_time||{};
+      if(at.n_days){
+        const f1=v=>v!=null?'Ø '+v.toFixed(1)+' kWh':'';
+        const fp=v=>v!=null?'Ø '+v.toFixed(0)+'%':'';
+        document.getElementById('kpi-solar-avg').textContent = f1(at.avg_solar_kwh);
+        document.getElementById('kpi-cons-avg').textContent  = f1(at.avg_consumption_kwh);
+        document.getElementById('kpi-exp-avg').textContent   = f1(at.avg_export_kwh);
+        document.getElementById('kpi-imp-avg').textContent   = f1(at.avg_import_kwh);
+        document.getElementById('kpi-ss-avg').textContent    = fp(at.avg_self_sufficiency_pct);
+      }
+    } catch(_){}
+
     // Stacked hourly bar
     if(dayInst) dayInst.destroy();
     const dCtx = document.getElementById('dayChart')?.getContext('2d');
@@ -2858,6 +3012,29 @@ async function loadDay(date){
       });
     }
   } catch(e){ console.warn('Day error',e); }
+}
+
+// ── ROI calculator ─────────────────────────────────────────────────────────────
+let _roiDailySavings=0;
+function calcROI(){
+  const cost =parseFloat(document.getElementById('roi-cost')?.value)||0;
+  const kwh  =parseFloat(document.getElementById('roi-kwh')?.value)||0;
+  const el   =document.getElementById('roi-result');
+  if(!el) return;
+  if(!_roiDailySavings||_roiDailySavings<=0||!cost||!kwh){el.style.display='none';return;}
+  const existCap=parseFloat(document.getElementById('rng-batt-cap')?.value)||10;
+  const addedDaily=_roiDailySavings*(kwh/Math.max(existCap,1));
+  const payDays=cost/Math.max(addedDaily,0.001);
+  const payYears=payDays/365;
+  el.style.display='block';
+  el.innerHTML=
+    `<b>Current avg savings:</b> €${_roiDailySavings.toFixed(2)}/day · `+
+    `€${(_roiDailySavings*365).toFixed(0)}/year<br>`+
+    `<b>Projected extra savings from +${kwh} kWh:</b> `+
+    `+€${addedDaily.toFixed(2)}/day (proportional estimate)<br>`+
+    `<b>Estimated payback:</b> `+
+    (payDays<365?Math.round(payDays)+' days':payYears.toFixed(1)+' years')+`<br>`+
+    `<span style="font-size:.7rem;color:var(--m)">⚠ Assumes linear savings scaling and current tariff/usage patterns.</span>`;
 }
 
 // ── HISTORY view ──────────────────────────────────────────────────────────────
@@ -2918,6 +3095,35 @@ async function loadHistory(){
         plugins:[dlPlugin]
       });
     }
+    // ── Average KPI stats block ─────────────────────────────────────────────
+    try {
+      const [av,sv]=await Promise.all([
+        fetch(BASE+'/api/averages').then(r=>r.json()),
+        fetch(BASE+'/api/savings').then(r=>r.json()),
+      ]);
+      const at=av.all_time||{}, l12=av.last_12m||{};
+      const f1=v=>v!=null?v.toFixed(1)+' kWh':'—';
+      const fp=v=>v!=null?v.toFixed(0)+'%':'—';
+      const f1s=v=>v!=null?'12m: '+v.toFixed(1)+' kWh':'';
+      const fps=v=>v!=null?'12m: '+v.toFixed(0)+'%':'';
+      if(at.n_days){
+        document.getElementById('hs-solar').textContent     =f1(at.avg_solar_kwh);
+        document.getElementById('hs-cons').textContent      =f1(at.avg_consumption_kwh);
+        document.getElementById('hs-exp').textContent       =f1(at.avg_export_kwh);
+        document.getElementById('hs-imp').textContent       =f1(at.avg_import_kwh);
+        document.getElementById('hs-ss').textContent        =fp(at.avg_self_sufficiency_pct);
+        document.getElementById('hs-solar-12m').textContent =f1s(l12.avg_solar_kwh);
+        document.getElementById('hs-cons-12m').textContent  =f1s(l12.avg_consumption_kwh);
+        document.getElementById('hs-exp-12m').textContent   =f1s(l12.avg_export_kwh);
+        document.getElementById('hs-imp-12m').textContent   =f1s(l12.avg_import_kwh);
+        document.getElementById('hs-ss-12m').textContent    =fps(l12.avg_self_sufficiency_pct);
+      }
+      // ROI: daily savings rate from savings.json
+      const since=new Date(sv.since||Date.now());
+      const elapsed=Math.max(1,(Date.now()-since.getTime())/86400000);
+      _roiDailySavings=(sv.total_eur_saved||0)/elapsed;
+      calcROI();
+    } catch(_){}
   } catch(e){ console.warn('History error',e); }
 }
 
@@ -4226,8 +4432,23 @@ def api_status():
             pass
     optimal = calculate_optimal_soc(sensors)
     storm   = is_storm_forecast()
+    # Energy-balance sanity check: solar = house + bat_charge + grid_export.
+    # Surface the residual so the UI can flag stale sensor reads (Huawei Luna2000
+    # modbus often lags during transitions, especially in taper near full SOC).
+    solar_w = sensors.get("solar_power") or 0
+    grid_w  = sensors.get("grid_power")  or 0
+    bat_w   = sensors.get("battery_power") or 0
+    balance = {
+        "implied_house_w": round(solar_w - grid_w - bat_w, 1),
+        "residual_w":      round(min(0, solar_w - grid_w - bat_w), 1),
+    }
+    if balance["implied_house_w"] < -80:
+        log.warning(f"  Energy balance off by {balance['implied_house_w']:.0f}W "
+                    f"(solar={solar_w:.0f}, grid={grid_w:+.0f}, bat={bat_w:+.0f}) "
+                    f"— sensor likely stale (battery reading typically lags)")
     return jsonify({"sensors": sensors, "tariff": tariff, "model": model,
-                    "optimal": optimal, "storm": storm})
+                    "optimal": optimal, "storm": storm, "balance": balance,
+                    "consumption_baseline_kw": _get_avg_night_consumption_kw()})
 
 @app.route("/api/debug/sensors")
 def api_debug_sensors():
@@ -4312,6 +4533,7 @@ def api_setup_post():
         "battery_storm_threshold":        lambda v: clamp(int(v), 50, 100),
         "decision_interval_minutes":      lambda v: clamp(int(v), 5, 60),
         "battery_capacity_kwh":           lambda v: clamp(float(v), 2.0, 30.0),
+        "battery_health_mode":            lambda v: str(v) if str(v) in ("bill_reducer","optimized","battery_guard") else "bill_reducer",
         "influxdb_url":                   lambda v: str(v)[:200].strip(),
         "influxdb_db":                    lambda v: str(v)[:100].strip(),
         "influxdb_user":                  lambda v: str(v)[:100].strip(),
@@ -4436,6 +4658,70 @@ def _live_averages_7d() -> dict:
         "avg_bat":  avg(bat_v),   # W, net (+ charge / - discharge)
         "avg_casa": avg(casa_v),  # W, house consumption
     }
+
+
+def _daily_kpi_averages() -> dict:
+    """Average daily kWh KPIs aggregated from all decisions.json history.
+
+    decisions.json convention: bat > 0 = discharging (raw Huawei sensor).
+    Returns separate stats for all_time and last_12m.
+    """
+    K = 0.25 / 1000  # 15-min interval → kWh
+    days: dict = {}
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                date = ts_str[:10]
+                s    = dec.get("sensors", {})
+                sol  = s.get("solar_power") or 0
+                grid = s.get("grid_power") or 0
+                bat  = s.get("battery_power") or 0
+                d = days.setdefault(date, {"sol": 0.0, "gimp": 0.0, "gexp": 0.0,
+                                           "bchg": 0.0, "bdis": 0.0})
+                d["sol"]  += max(sol, 0) * K
+                d["gimp"] += max(-grid, 0) * K
+                d["gexp"] += max(grid, 0) * K
+                d["bdis"] += max(bat, 0) * K   # bat > 0 = discharging
+                d["bchg"] += max(-bat, 0) * K  # bat < 0 = charging
+        except Exception:
+            pass
+
+    if not days:
+        return {}
+
+    cutoff_12m = (datetime.now().date() - timedelta(days=365)).isoformat()
+
+    def _stats(day_list: list) -> dict:
+        if not day_list:
+            return {}
+        n     = len(day_list)
+        conss = [max(0.0, d["sol"] + d["bdis"] + d["gimp"] - d["gexp"] - d["bchg"])
+                 for d in day_list]
+        ss    = [min(100.0, (1 - d["gimp"] / max(c, 0.01)) * 100)
+                 for d, c in zip(day_list, conss)]
+        return {
+            "n_days":                   n,
+            "avg_solar_kwh":            round(sum(d["sol"] for d in day_list) / n, 2),
+            "avg_import_kwh":           round(sum(d["gimp"] for d in day_list) / n, 2),
+            "avg_export_kwh":           round(sum(d["gexp"] for d in day_list) / n, 2),
+            "avg_consumption_kwh":      round(sum(conss) / n, 2),
+            "avg_self_sufficiency_pct": round(sum(ss) / n, 1),
+        }
+
+    all_vals    = list(days.values())
+    recent_vals = [v for k, v in days.items() if k >= cutoff_12m]
+    return {
+        "all_time": _stats(all_vals),
+        "last_12m": _stats(recent_vals),
+    }
+
+
+@app.route("/api/averages")
+def api_averages():
+    return jsonify(_daily_kpi_averages())
 
 
 @app.route("/api/chart-data")

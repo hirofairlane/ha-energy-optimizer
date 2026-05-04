@@ -523,6 +523,11 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v3.4.0
+- **Average consumption metrics in Charts:** Day view KPI cards show all-time daily averages (Ø) below each value with tooltip explaining the calculation. History tab adds a full 5-card summary row with all-time and last-12-months averages for solar, consumption, export, import, and self-sufficiency.
+- **Battery ROI calculator:** New section in the History tab. Enter the cost and capacity of additional storage — the calculator uses your actual average daily savings to estimate payback time and projected annual gain.
+- **Battery health mode:** Three-button selector in the Tweaks tab controls the SOC operating range the engine targets: ⚡ **Bill Reducer** (10–95%, default), ⚖️ **Optimized** (20–90%), 🛡️ **Battery Guard** (25–85%). Affects the nightly charge target clamp. Persisted in `setup.json`.
+
 ### v3.3.1
 - Removed all personal/installation-specific defaults from `config.yaml` and Python fallbacks. Add-on now ships clean for any installation.
 

@@ -351,32 +351,34 @@ The **Setup** tab has a **Test connections** button that runs a live diagnostic:
 
 ## Configuration reference
 
+> Since v3.0 the **Setup wizard** (Setup tab → "Configure entities") is the recommended way to fill these. The wizard scans your HA states, scores candidates by name/unit/device_class and proposes the best match for each role. The fields below are still readable from `config.yaml` as a fallback, but most installations should leave them empty and let the wizard write them to `/data/wizard_config.json`.
+
 ### Sensors
 
 | Option | Description | Default |
 |---|---|---|
-| `sensor_battery_soc` | Battery state of charge (%) | `sensor.battery_state_of_capacity` |
-| `sensor_battery_power` | Charge/discharge power (W, +ve=charge) | `sensor.battery_charge_discharge_power` |
-| `sensor_grid_power` | Grid meter (W, **−ve=import, +ve=export**) | `sensor.acometida_general_power` |
-| `sensor_solar_power` | Panel output right now (W, live) | `sensor.produccion_placas_power` |
-| `sensor_solar_current_hour` | Solar production this hour (kWh) | `sensor.energy_current_hour` |
+| `sensor_battery_soc` | Battery state of charge (%) | `sensor.battery_state_of_capacity` (Huawei Modbus standard) |
+| `sensor_battery_power` | Charge/discharge power (W, +ve=charge) | `sensor.battery_charge_discharge_power` (Huawei Modbus standard) |
+| `sensor_grid_power` | Grid meter (W, **−ve=import, +ve=export**) | _(empty — set via wizard)_ |
+| `sensor_solar_power` | Panel output right now (W, live) | _(empty — set via wizard)_ |
+| `sensor_solar_current_hour` | Solar production this hour (kWh) | `sensor.energy_current_hour` (HA Energy dashboard) |
 | `sensor_solar_next_hour` | Solar forecast next hour (kWh) | `sensor.energy_next_hour` |
 | `sensor_solar_today` | Cumulative production today (kWh) | `sensor.energy_production_today` |
 | `sensor_solar_tomorrow` | Forecast for tomorrow (kWh) | `sensor.energy_production_tomorrow` |
-| `sensor_temp_outdoor` | Outdoor temperature (°C) | `sensor.ebusd_broadcast_outsidetemp_temp2` |
-| `sensor_temp_salon` | Indoor temperature (°C) | `sensor.media_salon` |
+| `sensor_temp_outdoor` | Outdoor temperature (°C) | _(empty — set via wizard)_ |
+| `sensor_temp_salon` | Indoor temperature (°C) | _(empty — set via wizard)_ |
 | `sensor_weather` | AEMET weather entity | `weather.aemet` |
 
 ### Actuators
 
 | Option | Description | Default |
 |---|---|---|
-| `switch_pool` | Pool pump switch | `switch.depuradora` |
-| `switch_pool_cleaner` | Pool cleaner switch | `switch.limpiafondos` |
-| `number_hvac_cool` | Heat pump cooling setpoint | `number.ebusd_ctls2_z1coolingtemp_tempv` |
-| `number_hvac_heat` | Heat pump heating setpoint | `number.ebusd_ctls2_z1manualtemp_tempv` |
-| `number_battery_charge_cutoff` | Battery grid charge cutoff SOC | `number.battery_grid_charge_cutoff_soc` |
-| `select_battery_mode` | Battery working mode select | `select.battery_working_mode` |
+| `switch_pool` | Pool pump switch | _(empty — set via wizard)_ |
+| `switch_pool_cleaner` | Pool cleaner switch | _(empty — set via wizard)_ |
+| `number_hvac_cool` | Heat pump cooling setpoint | _(empty — set via wizard)_ |
+| `number_hvac_heat` | Heat pump heating setpoint | _(empty — set via wizard)_ |
+| `number_battery_charge_cutoff` | Battery grid charge cutoff SOC | `number.battery_grid_charge_cutoff_soc` (Huawei Modbus standard) |
+| `select_battery_mode` | Battery working mode select | `select.battery_working_mode` (Huawei Modbus standard) |
 
 ### Battery thresholds
 
@@ -401,9 +403,9 @@ The **Setup** tab has a **Test connections** button that runs a live diagnostic:
 
 | Option | Default | Description |
 |---|---|---|
-| `notify_email_service` | `correo_gmail_com` | HA notify service name for email |
+| `notify_email_service` | _(empty)_ | HA notify service name for email (e.g. `correo_gmail_com`) |
 | `notify_email_target` | _(empty)_ | Recipient email — set in HA add-on config UI, not in repo |
-| `notify_telegram_service` | `telegramsergio` | HA notify service name for Telegram |
+| `notify_telegram_service` | _(empty)_ | HA notify service name for Telegram (e.g. `telegram`) |
 | `notify_daily_time` | `23:00` | Time to send daily summary |
 | `notify_email_enabled` | true | Enable email daily summary |
 | `notify_telegram_daily_enabled` | true | Enable Telegram daily summary |

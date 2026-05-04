@@ -86,6 +86,9 @@ The add-on is useful even with **no battery** if you have loads you can shift: i
 | **Prediction accuracy chart** | Live SOC: actual vs ML-predicted (24h) + 8h forward forecast. Shows MAE badge |
 | **Solar history charts** | 7-day and 12-month Actual vs HA Forecast line charts |
 | **Daily savings chart** | 7-day bar chart with € value labels; counterfactual method |
+| **Historical averages** | Day view KPI cards show all-time Ø below each value. History tab adds a 5-card summary with all-time and last-12-months averages for solar, consumption, export, import, and self-sufficiency |
+| **Battery ROI calculator** | Enter cost + capacity of additional storage — calculates payback period from your actual average daily savings |
+| **Battery health mode** | Three operating modes in Tweaks: ⚡ Bill Reducer (10–95%), ⚖️ Optimized (20–90%), 🛡️ Battery Guard (25–85%). Controls the SOC range used for the nightly charge target |
 | **Telegram instant alerts** | Emergency charge, storm mode, forced grid charge |
 | **Daily summary** | HTML email + Telegram report at configurable time |
 | **Debug section** | Tweaks tab shows how each sensor role resolves (wizard → options → fallback) with live HA value |
@@ -185,11 +188,22 @@ The Tweaks tab is the runtime control panel — all changes take effect immediat
 
 | Section | What it does |
 |---|---|
+| **Battery health mode** | Three-button selector controlling the SOC operating range for the nightly charge target (see below). |
 | **Notifications** | Enable/disable email daily summary, Telegram daily summary, and instant Telegram alerts individually. |
 | **Battery thresholds** | Sliders for emergency, low, medium, and storm SOC thresholds. Adjust without editing `config.yaml`. |
 | **Decision interval** | How often (in minutes) the optimization engine runs. Default 15 min. |
 | **Data Sources** | Connectivity test for InfluxDB and HA Recorder — shows last-read timestamp, row count, and active/fallback status. |
 | **Debug: sensor resolution** | Table that auto-loads when you open the tab and shows exactly how every sensor role was resolved. A **Refresh** button re-reads live HA values. |
+
+#### Battery health mode
+
+| Mode | SOC range | Description |
+|---|---|---|
+| ⚡ **Bill Reducer** | 10% – 95% | Default. Uses full battery capacity every cycle — maximum daily savings. |
+| ⚖️ **Optimized** | 20% – 90% | Sweet spot for most installations: ~95% of savings benefit with moderate cycle protection. |
+| 🛡️ **Battery Guard** | 25% – 85% | Prioritises longevity — recommended for batteries older than 3 years or with visible capacity degradation. |
+
+The selected mode clamps the nightly charge target: the engine will never set a target below the mode's minimum or above its maximum, regardless of the calculated optimal. Saved in `/data/setup.json` and applied immediately without restart.
 
 #### Debug sensor resolution table
 
@@ -204,6 +218,21 @@ The Tweaks tab is the runtime control panel — all changes take effect immediat
 This is the first place to look when a Dashboard card shows 0 W or "unavailable" — it shows whether the problem is entity resolution or a real sensor issue.
 
 ---
+
+### Day view
+
+A date navigator (← Today →) plus five KPI cards: Solar / Consumed / Exported / Imported / Self-sufficiency. Each card shows the day's total and, below it, the **all-time daily average (Ø)** computed from all recorded days. Hover over a card for a tooltip explaining the calculation. Below the KPIs: a stacked hourly energy bar chart and a SOC line for the selected day.
+
+### History view
+
+A 5-card summary row at the top shows **all-time** and **last-12-months** daily averages for all five KPIs — useful for spotting seasonal patterns or tracking improvement over time.
+
+Below the charts, the **Battery ROI calculator** lets you enter the cost (€) and extra capacity (kWh) of additional storage and calculates:
+- Your current average daily savings (from `savings.json`)
+- Estimated extra savings proportional to the added capacity
+- Payback period in days or years
+
+> The calculator uses a linear proportionality assumption. Real results depend on your tariff, usage patterns, and how often the battery is the limiting factor.
 
 ### Live power panel
 

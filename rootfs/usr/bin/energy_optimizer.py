@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-Energy Optimizer — Home Assistant Add-on v2.4
+Energy Optimizer — Home Assistant Add-on
 Smart energy management: battery, heat pump, pool pump, pool cleaner, dishwasher
 Logic: adaptive tariff rules + scikit-learn ML model + consumption history
 
-Changes in v2.4:
-  - History API fix: 60s timeout + no_attributes=true (resolves "0 samples" on retrain)
-  - Minimum training samples lowered to 48 (3×15min cycles per day for 4 days)
-  - Solar proxy now uses actual sun.sun elevation from HA (correct for Guadarrama, Madrid)
-  - Real all-in tariff prices from 2.0TD bill (taxes + IVA included): P1=0.284, P2=0.189, P3=0.146
-  - Export price updated to real excedentes rate: 0.040 €/kWh
-  - Weather forecast widget in Dashboard (condition, temperature, 5-day forecast, storm alert)
-  - New /api/weather endpoint using weather.aemet
+Version is defined ONCE in ADD_ON_VERSION below and must be kept in sync with
+the `version:` field in config.yaml (HA Supervisor reads that file directly).
+A startup check logs a warning if they drift. See README for release notes.
 """
 
 import math
 import os
+import re
 import json
 import logging
 import threading
@@ -30,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.4.1"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.4.1"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -67,6 +63,26 @@ def load_options() -> dict:
     return {}
 
 OPT = load_options()
+
+# ── Version sync check ───────────────────────────────────────────────────────
+ADDON_CONFIG_FILE = Path("/addon-config.yaml")  # copied from config.yaml at build
+
+def _check_version_sync() -> None:
+    """Warn if ADD_ON_VERSION drifts from the version declared in config.yaml.
+
+    config.yaml is what HA Supervisor reads; ADD_ON_VERSION is what the panel
+    and the log banner show. Both must move together when releasing.
+    """
+    if not ADDON_CONFIG_FILE.exists():
+        return  # not packaged in container (dev/test); nothing to compare
+    try:
+        m = re.search(r'^version:\s*"?([^"\s]+)"?\s*$',
+                      ADDON_CONFIG_FILE.read_text(), flags=re.MULTILINE)
+    except Exception:
+        return
+    if m and m.group(1) != ADD_ON_VERSION:
+        log.warning(f"  ⚠ Version drift: ADD_ON_VERSION={ADD_ON_VERSION} "
+                    f"but config.yaml says {m.group(1)} — bump them together.")
 
 # ── Setup overrides (from GUI — stored in /data/setup.json) ──────────────────
 _SETUP: dict = {}
@@ -5496,8 +5512,9 @@ def main():
     _load_setup_cache()
     _load_wizard_cache()
 
+    _check_version_sync()
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v3.1.6 — HAOS")
+    log.info(f"   Energy Optimizer v{ADD_ON_VERSION} — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

@@ -21,6 +21,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     joblib
 
 COPY rootfs /
+COPY config.yaml /addon-config.yaml
 
 RUN chmod a+x /usr/bin/run.sh \
     && chmod a+x /usr/bin/energy_optimizer.py

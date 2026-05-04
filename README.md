@@ -442,6 +442,15 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v3.x — Setup wizard + dynamic ML
+- **7-step Setup wizard** (Location, Grid, Solar, Battery, Loads, Tariff, Summary) replaces manual `config.yaml` editing as the primary configuration path. Wizard state persists in `/data/wizard_config.json`; `config.yaml` defaults still work as fallback.
+- **Entity discovery**: scans HA states and proposes the most likely sensor/switch for each of ~25 roles (battery SOC, grid power, solar production, HVAC, pool, dishwasher…), ranked by friendly-name + unit + device_class scoring. New endpoints `/api/ha/entities`, `/api/ha/location`, `/api/wizard/config`, `/api/wizard/data-quality`, `/api/wizard/test-entity`.
+- **Dynamic ML features** (`MODEL_FEATURE_VER = 3`): training DataFrame is built from whatever sensors the wizard mapped (outdoor temp, solar, grid, submeters), instead of hardcoded entity IDs. Auto-retrain triggers when feature set changes.
+- **Multi-zone heat pump**: per-zone comfort/surplus/economy schedule with per-hour mode (`hvac_zones` list in wizard config). Legacy single-zone path kept as fallback when no zones defined.
+- **Battery health mode** (`bill_reducer` / `optimized` / `battery_guard`): selects the SOC operating band (10-95% / 20-90% / 25-85%) to trade off cycle life vs. savings.
+- **Data Quality sensor**: `sensor.energy_optimizer_data_quality` (0-100%) pushed to HA, scoring source quality (Influx>recorder), key-role coverage and per-entity sample volume. Visible as a live bar in the wizard.
+- **Comic-book UI theme** (Bangers font, speech bubbles, hardware cards, entity pickers) for the wizard pages.
+
 ### v2.6.4
 - **Grid power sign convention fixed:** `sensor.acometida_general_power` is negative = buying, positive = selling. Previous code had this backwards, producing incorrect savings figures.
 - **Savings formula corrected:** `grid_without_battery = grid + battery_power` (derived from energy balance P_grid = P_solar − P_house − P_bat). Cost function now properly handles negative import and positive export.

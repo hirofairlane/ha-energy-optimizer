@@ -89,6 +89,7 @@ The add-on is useful even with **no battery** if you have loads you can shift: i
 | **Historical averages** | Day view KPI cards show all-time Ø below each value. History tab adds a 5-card summary with all-time and last-12-months averages for solar, consumption, export, import, and self-sufficiency |
 | **Battery ROI calculator** | Enter cost + capacity of additional storage — calculates payback period from your actual average daily savings |
 | **Battery health mode** | Three operating modes in Tweaks: ⚡ Bill Reducer (10–95%), ⚖️ Optimized (20–90%), 🛡️ Battery Guard (25–85%). Controls the SOC range used for the nightly charge target |
+| **Split battery sensors** | For inverters that report charge and discharge as two separate positive entities (Deye, Solarman, Growatt…), enable the "Split sensors" toggle in the Battery wizard step and pick the two entity IDs. The add-on combines them automatically (`charge − discharge`) |
 | **Telegram instant alerts** | Emergency charge, storm mode, forced grid charge |
 | **Daily summary** | HTML email + Telegram report at configurable time |
 | **Debug section** | Tweaks tab shows how each sensor role resolves (wizard → options → fallback) with live HA value |
@@ -551,6 +552,9 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 ---
 
 ## Changelog
+
+### v3.4.1
+- **Split battery sensors (Deye/Solarman/Growatt support):** The Battery step of the Setup Wizard now has a "Split sensors" toggle for inverters that report charge and discharge as two separate positive-valued entities instead of one signed sensor. Enable the toggle and select the two entities — the engine combines them as `charge − discharge` so the rest of the logic behaves identically. The debug table in Tweaks also adapts to show both entities when split mode is active.
 
 ### v3.4.0
 - **Average consumption metrics in Charts:** Day view KPI cards show all-time daily averages (Ø) below each value with tooltip explaining the calculation. History tab adds a full 5-card summary row with all-time and last-12-months averages for solar, consumption, export, import, and self-sufficiency.

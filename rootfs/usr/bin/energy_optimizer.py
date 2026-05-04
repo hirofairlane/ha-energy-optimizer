@@ -30,7 +30,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.4.0"  # updated by fix scripts; panel endpoint reads this
+ADD_ON_VERSION = "3.4.1"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -531,10 +531,26 @@ def _compute_solar_correction_factor() -> float:
 
 
 # ── Sensor reading ───────────────────────────────────────────────────────────
+def _read_battery_power() -> float:
+    """Read battery power W. Supports single signed sensor or split charge/discharge.
+
+    Single sensor (Huawei default): +ve = charging, -ve = discharging.
+    Split sensors (Deye/Solarman): charge_entity ≥ 0, discharge_entity ≥ 0.
+      Combined: charge − discharge → +ve = charging, -ve = discharging.
+    """
+    if _WIZARD.get("battery_power_split"):
+        sc  = _WIZARD.get("sensors", {})
+        chg = ha_float(sc.get("battery_charge_entity",    "")) or 0.0
+        dis = ha_float(sc.get("battery_discharge_entity", "")) or 0.0
+        return chg - dis
+    return ha_float(_wiz("battery_power", "sensor_battery_power",
+                         "sensor.battery_charge_discharge_power"))
+
+
 def read_sensors() -> dict:
     s: dict = {
         "battery_soc":        ha_float(_wiz("battery_soc",        "sensor_battery_soc",       "sensor.battery_state_of_capacity")),
-        "battery_power":      ha_float(_wiz("battery_power",      "sensor_battery_power",      "sensor.battery_charge_discharge_power")),
+        "battery_power":      _read_battery_power(),
         "grid_power":         ha_float(_wiz("grid_power",         "sensor_grid_power",         "")),
         "solar_power":        ha_float(_wiz("solar_power",        "sensor_solar_power",        "")),
         "solar_current_hour": ha_float(_wiz("solar_fc_h0",        "sensor_solar_current_hour", "sensor.energy_current_hour")),
@@ -2404,10 +2420,28 @@ th{color:var(--m);font-weight:500}
             <div id="wiz-batt-soc-cands" class="entity-cands"></div>
             <div id="wiz-batt-soc-state" class="entity-state"></div>
           </div>
-          <div class="entity-picker">
+          <div id="wiz-batt-power-row" class="entity-picker">
             <div class="entity-picker-label">Power (W, negative=charging) <span id="wiz-batt-pow-status"></span></div>
             <input class="entity-select" id="wiz-batt-power" placeholder="sensor.battery_charge_discharge_power" oninput="wizEntityTyped('battery_power','wiz-batt-power','wiz-batt-pow-status',null)">
             <div id="wiz-batt-power-cands" class="entity-cands"></div>
+          </div>
+        </div>
+        <label style="font-size:.72rem;color:var(--m);display:flex;align-items:center;gap:.5rem;margin:.4rem 0">
+          <input type="checkbox" id="wiz-batt-split" style="accent-color:var(--a)" onchange="wizToggleBattSplit()">
+          Split sensors — my inverter exposes separate charge and discharge entities (Deye, Solarman, Fronius…)
+        </label>
+        <div id="wiz-batt-split-row" style="display:none;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.3rem">
+          <div class="entity-picker">
+            <div class="entity-picker-label">Charge power (W, always ≥ 0) <span id="wiz-batt-chg-status"></span></div>
+            <input class="entity-select" id="wiz-batt-chg" placeholder="sensor.battery_charge_power"
+              oninput="wizEntityTyped('battery_charge_entity','wiz-batt-chg','wiz-batt-chg-status',null)">
+            <div id="wiz-batt-chg-cands" class="entity-cands"></div>
+          </div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Discharge power (W, always ≥ 0) <span id="wiz-batt-dis-status"></span></div>
+            <input class="entity-select" id="wiz-batt-dis" placeholder="sensor.battery_discharge_power"
+              oninput="wizEntityTyped('battery_discharge_entity','wiz-batt-dis','wiz-batt-dis-status',null)">
+            <div id="wiz-batt-dis-cands" class="entity-cands"></div>
           </div>
         </div>
         <div style="margin-bottom:.5rem">
@@ -4342,6 +4376,13 @@ async function wizSave() {
   }
 }
 
+function wizToggleBattSplit() {
+  const on = document.getElementById('wiz-batt-split')?.checked;
+  document.getElementById('wiz-batt-power-row').style.display  = on ? 'none' : '';
+  document.getElementById('wiz-batt-split-row').style.display  = on ? 'grid' : 'none';
+  wizCfg.battery_power_split = !!on;
+}
+
 function _wizPopulateFields() {
   if (wizCfg.location) {
     if (wizCfg.location.latitude)  document.getElementById('wiz-lat').value  = wizCfg.location.latitude;
@@ -4378,6 +4419,15 @@ function _wizPopulateFields() {
     const el = document.getElementById(id);
     if (el && wizCfg.sensors?.[role]) el.value = wizCfg.sensors[role];
   });
+  // Restore split battery sensor mode
+  if (wizCfg.battery_power_split) {
+    const cb = document.getElementById('wiz-batt-split');
+    if (cb) { cb.checked = true; wizToggleBattSplit(); }
+  }
+  const chgEl = document.getElementById('wiz-batt-chg');
+  const disEl = document.getElementById('wiz-batt-dis');
+  if (chgEl && wizCfg.sensors?.battery_charge_entity)    chgEl.value = wizCfg.sensors.battery_charge_entity;
+  if (disEl && wizCfg.sensors?.battery_discharge_entity) disEl.value = wizCfg.sensors.battery_discharge_entity;
 }
 
 function _wizAddSearchButtons() {
@@ -4456,7 +4506,6 @@ def api_debug_sensors():
     roles = {
         "solar_power":        ("sensor_solar_power",       ""),
         "grid_power":         ("sensor_grid_power",        ""),
-        "battery_power":      ("sensor_battery_power",     "sensor.battery_charge_discharge_power"),
         "battery_soc":        ("sensor_battery_soc",       "sensor.battery_state_of_capacity"),
         "temp_outdoor":       ("sensor_temp_outdoor",      ""),
         "temp_indoor":        ("sensor_temp_salon",        ""),
@@ -4477,6 +4526,41 @@ def api_debug_sensors():
             "entity_id": entity_id,
             "source": ("wizard" if _WIZARD.get("sensors", {}).get(role)
                        else "options" if cfg(cfg_key, "")
+                       else "fallback"),
+            "raw_state": raw_state,
+            "parsed_float": parsed,
+        }
+    # Battery power: single signed sensor OR split charge/discharge (Deye/Solarman)
+    if _WIZARD.get("battery_power_split"):
+        sc = _WIZARD.get("sensors", {})
+        for sub_role, wiz_key in (("battery_charge_entity", "battery_charge_entity"),
+                                   ("battery_discharge_entity", "battery_discharge_entity")):
+            entity_id = sc.get(wiz_key, "")
+            state_obj = ha_state(entity_id) if entity_id else None
+            raw_state = state_obj.get("state") if state_obj else None
+            try:
+                parsed = float(raw_state) if raw_state not in (None, "unavailable", "unknown") else None
+            except (ValueError, TypeError):
+                parsed = None
+            result[sub_role] = {
+                "entity_id": entity_id,
+                "source": "wizard" if entity_id else "fallback",
+                "raw_state": raw_state,
+                "parsed_float": parsed,
+            }
+    else:
+        entity_id = _wiz("battery_power", "sensor_battery_power",
+                         "sensor.battery_charge_discharge_power")
+        state_obj = ha_state(entity_id)
+        raw_state = state_obj.get("state") if state_obj else None
+        try:
+            parsed = float(raw_state) if raw_state not in (None, "unavailable", "unknown") else None
+        except (ValueError, TypeError):
+            parsed = None
+        result["battery_power"] = {
+            "entity_id": entity_id,
+            "source": ("wizard" if _WIZARD.get("sensors", {}).get("battery_power")
+                       else "options" if cfg("sensor_battery_power", "")
                        else "fallback"),
             "raw_state": raw_state,
             "parsed_float": parsed,

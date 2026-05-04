@@ -29,7 +29,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
-MODEL_FEATURE_VER = 2   # v2: continuous solar_proxy from elevation angle
+MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
+ADD_ON_VERSION = "3.4.1"  # updated by fix scripts; panel endpoint reads this
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -91,6 +92,14 @@ def cfg(key: str, default=None):
     if key in _SETUP:
         return _SETUP[key]
     return OPT.get(key, default)
+
+def _health_mode_limits() -> tuple:
+    """Return (min_soc, max_soc) for charging based on battery_health_mode setting."""
+    return {
+        "bill_reducer":  (10, 95),
+        "optimized":     (20, 90),
+        "battery_guard": (25, 85),
+    }.get(cfg("battery_health_mode", "bill_reducer"), (10, 95))
 
 # ── Wizard config (from GUI wizard — stored in /data/wizard_config.json) ──────
 _WIZARD: dict = {}
@@ -381,14 +390,18 @@ ROLE_HINTS = {
     "battery_cutoff_soc":  {"domains":["number"],"device_class":[],"units":["%"],"keywords":["cutoff","corte","charge_cutoff","grid_charge","soc"]},
     "battery_backup_soc":  {"domains":["number"],"device_class":[],"units":["%"],"keywords":["backup","reserva","minimum","minimo","reserve"]},
     "battery_charge_power":{"domains":["number"],"device_class":["power"],"units":["W","kW"],"keywords":["charge_power","charging_power","potencia_carga"]},
-    "battery_force_charge":{"domains":["switch","button"],"device_class":[],"units":[],"keywords":["force_charge","forzar","force","forced"]},
+    "battery_force_charge":{"domains":["switch","button","input_boolean"],"device_class":[],"units":[],"keywords":["force_charge","forzar","force","forced","solar","storage","battery","luna","sungrow","huawei"]},
     "pool_switch":         {"domains":["switch"],"device_class":[],"units":[],"keywords":["pool","piscina","pump","bomba","depuradora","filtro"]},
     "pool_cleaner":        {"domains":["switch"],"device_class":[],"units":[],"keywords":["cleaner","limpiafondos","limpia","robot","vacuum"]},
     "pool_hours_day":      {"domains":["sensor"],"device_class":["duration"],"units":["h","min"],"keywords":["pool","piscina","hours","horas","encendida","runtime"]},
-    "hvac_mode":           {"domains":["climate","select","input_select"],"device_class":[],"units":[],"keywords":["hvac","clima","aerotermia","heat_pump","bomba_calor","ebus","viessmann"]},
-    "hvac_temp_heat":      {"domains":["number","input_number"],"device_class":["temperature"],"units":["°C"],"keywords":["heat","calor","heating","setpoint","consigna","target"]},
-    "hvac_temp_cool":      {"domains":["number","input_number"],"device_class":["temperature"],"units":["°C"],"keywords":["cool","frio","cooling","setpoint","consigna","target"]},
+    "hvac_mode":           {"domains":["climate","select","input_select"],"device_class":[],"units":[],"keywords":["hvac","clima","aerotermia","heat_pump","bomba_calor","ebus","viessmann","climate"]},
+    "hvac_temp_heat":      {"domains":["number","input_number"],"device_class":["temperature"],"units":["°C"],"keywords":["heat","calor","heating","setpoint","consigna","target","manualtemp","z1manual"]},
+    "hvac_temp_cool":      {"domains":["number","input_number"],"device_class":["temperature"],"units":["°C"],"keywords":["cool","frio","cooling","setpoint","consigna","target","coolingtemp","z1cooling"]},
     "dishwasher_state":    {"domains":["sensor"],"device_class":[],"units":[],"keywords":["dishwasher","lavavajillas","washer","machine","operation","estado"]},
+    "washer_state":        {"domains":["sensor"],"device_class":[],"units":[],"keywords":["washer","washing","lavadora","wash","wm","laundry","operation"]},
+    "washer_power":        {"domains":["sensor"],"device_class":["power"],"units":["W","kW"],"keywords":["washer","washing","lavadora","wash","laundry"]},
+    "dryer_state":         {"domains":["sensor"],"device_class":[],"units":[],"keywords":["dryer","secadora","dry","tumble","dryer","secar"]},
+    "dryer_power":         {"domains":["sensor"],"device_class":["power"],"units":["W","kW"],"keywords":["dryer","secadora","dry","tumble"]},
     "ev_charger":          {"domains":["switch","number"],"device_class":[],"units":["A","W"],"keywords":["ev","car","coche","charger","cargador","wallbox","zappi","ocpp"]},
 }
 
@@ -518,41 +531,94 @@ def _compute_solar_correction_factor() -> float:
 
 
 # ── Sensor reading ───────────────────────────────────────────────────────────
+def _read_battery_power() -> float:
+    """Read battery power W. Supports single signed sensor or split charge/discharge.
+
+    Single sensor (Huawei default): +ve = charging, -ve = discharging.
+    Split sensors (Deye/Solarman): charge_entity ≥ 0, discharge_entity ≥ 0.
+      Combined: charge − discharge → +ve = charging, -ve = discharging.
+    """
+    if _WIZARD.get("battery_power_split"):
+        sc  = _WIZARD.get("sensors", {})
+        chg = ha_float(sc.get("battery_charge_entity",    "")) or 0.0
+        dis = ha_float(sc.get("battery_discharge_entity", "")) or 0.0
+        return chg - dis
+    return ha_float(_wiz("battery_power", "sensor_battery_power",
+                         "sensor.battery_charge_discharge_power"))
+
+
 def read_sensors() -> dict:
-    return {
-        "battery_soc":        ha_float(cfg("sensor_battery_soc",       "sensor.battery_state_of_capacity")),
-        "battery_power":      ha_float(cfg("sensor_battery_power",      "sensor.battery_charge_discharge_power")),
-        "grid_power":         ha_float(cfg("sensor_grid_power",         "sensor.acometida_general_power")),
-        "solar_power":        ha_float(cfg("sensor_solar_power",        "sensor.produccion_placas_power")),
-        "solar_current_hour": ha_float(cfg("sensor_solar_current_hour", "sensor.energy_current_hour")),
-        "solar_next_hour":    ha_float(cfg("sensor_solar_next_hour",    "sensor.energy_next_hour")),
-        "solar_today":        ha_float(cfg("sensor_solar_today",        "sensor.energy_production_today")),
-        "solar_tomorrow":     ha_float(cfg("sensor_solar_tomorrow",     "sensor.energy_production_tomorrow")),
-        "temp_outdoor":       ha_float(cfg("sensor_temp_outdoor",       "sensor.ebusd_broadcast_outsidetemp_temp2")),
-        "temp_indoor":        ha_float(cfg("sensor_temp_salon",         "sensor.media_salon")),
-        "pool_hours_day":     ha_float(cfg("sensor_pool_hours_day",     "sensor.depuradora_encendida_24h")),
-        "pool_hours_week":    ha_float(cfg("sensor_pool_hours_week",    "sensor.depuradora_encendida_semana")),
-        "dishwasher_state":   ha_str(cfg("sensor_dishwasher_state",     "sensor.lavavajillas_operation_state")),
+    s: dict = {
+        "battery_soc":        ha_float(_wiz("battery_soc",        "sensor_battery_soc",       "sensor.battery_state_of_capacity")),
+        "battery_power":      _read_battery_power(),
+        "grid_power":         ha_float(_wiz("grid_power",         "sensor_grid_power",         "")),
+        "solar_power":        ha_float(_wiz("solar_power",        "sensor_solar_power",        "")),
+        "solar_current_hour": ha_float(_wiz("solar_fc_h0",        "sensor_solar_current_hour", "sensor.energy_current_hour")),
+        "solar_next_hour":    ha_float(_wiz("solar_fc_h1",        "sensor_solar_next_hour",    "sensor.energy_next_hour")),
+        "solar_today":        ha_float(_wiz("solar_fc_today",     "sensor_solar_today",        "sensor.energy_production_today")),
+        "solar_tomorrow":     ha_float(_wiz("solar_fc_tomorrow",  "sensor_solar_tomorrow",     "sensor.energy_production_tomorrow")),
+        "temp_outdoor":       ha_float(_wiz("temp_outdoor",       "sensor_temp_outdoor",       "")),
+        "temp_indoor":        ha_float(_wiz("temp_indoor",        "sensor_temp_salon",         "")),
+        "pool_hours_day":     ha_float(cfg("sensor_pool_hours_day",  "sensor.depuradora_encendida_24h")),
+        "pool_hours_week":    ha_float(cfg("sensor_pool_hours_week", "sensor.depuradora_encendida_semana")),
+        "dishwasher_state":   ha_str(_wiz("dishwasher_state",     "sensor_dishwasher_state",   "")),
         "ts":                 datetime.now().isoformat(),
     }
 
+    # ── Appliances from wizard (washer / dryer) ───────────────────────────────
+    for role, key in [("washer_state", "washer_state"), ("washer_power", "washer_power"),
+                      ("dryer_state",  "dryer_state"),  ("dryer_power",  "dryer_power")]:
+        entity = _WIZARD.get("sensors", {}).get(role)
+        if entity:
+            s[key] = ha_float(entity) if "power" in role else ha_str(entity)
+
+    # ── Grid sub-meters (wizard-configured extra power sensors) ───────────────
+    for sm in _WIZARD.get("grid_submeters", []):
+        entity = sm.get("entity", "")
+        label  = sm.get("name", entity)
+        if entity:
+            s[f"submeter_{label}"] = ha_float(entity)
+
+    # ── Per-zone indoor temps (read each zone's dedicated sensor) ────────────
+    for i, zone in enumerate(_WIZARD.get("hvac_zones", [])):
+        ts_entity = zone.get("temp_sensor")
+        if ts_entity:
+            s[f"temp_zone_{i}"] = ha_float(ts_entity)
+
+    return s
+
 # ── Battery direct control ───────────────────────────────────────────────────
+def _batt(role: str, cfg_key: str, hardcoded: str) -> str:
+    """Resolve a battery control entity: wizard > setup > hardcoded UUID/id."""
+    return _wiz(role, cfg_key, hardcoded)
+
 def set_battery_charge_target(target_soc: int, charge_power_w: int = 3000) -> bool:
-    ok = all([
-        ha_set_number(cfg("number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), target_soc),
-        ha_set_number(cfg("number_battery_charge_power",  "a186f9599e9cad7127bca381f7a8bfb2"), charge_power_w),
-        ha_set_number(cfg("number_battery_backup_soc",    "de4a2bf18222f354228cdb112b65e882"), target_soc),
-        ha_switch(cfg("switch_battery_force_charge",      "02db00e10018b01211507db92819a25a"), True),
-        ha_set_select(cfg("select_battery_mode",          "select.battery_working_mode"), "time_of_use_luna2000"),
-    ])
+    ops = [
+        ha_set_number(_batt("battery_cutoff_soc",   "number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), target_soc),
+        ha_set_number(_batt("battery_backup_soc",   "number_battery_backup_soc",   ""),       target_soc),
+        ha_set_select(_batt("battery_mode_select",  "select_battery_mode",         "select.battery_working_mode"), "time_of_use_luna2000"),
+    ]
+    # Charge power — only if entity is available
+    pwr_entity = _batt("battery_charge_power", "number_battery_charge_power", "")
+    if pwr_entity:
+        ops.append(ha_set_number(pwr_entity, charge_power_w))
+    # Force charge switch
+    force_entity = _batt("battery_force_charge", "switch_battery_force_charge", "")
+    if force_entity:
+        ops.append(ha_switch(force_entity, True))
+    ok = all(ops)
     log.info(f"  Battery → charge to {target_soc}% @ {charge_power_w}W — {'OK' if ok else 'ERROR'}")
     return ok
 
 def set_battery_self_consumption(min_soc: int = 20) -> bool:
     ok = all([
-        ha_set_number(cfg("number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), min_soc),
-        ha_set_select(cfg("select_battery_mode",          "select.battery_working_mode"), "maximise_self_consumption"),
+        ha_set_number(_batt("battery_cutoff_soc",  "number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), min_soc),
+        ha_set_select(_batt("battery_mode_select", "select_battery_mode",          "select.battery_working_mode"), "maximise_self_consumption"),
     ])
+    # Disengage force charge if entity is set
+    force_entity = _batt("battery_force_charge", "switch_battery_force_charge", "")
+    if force_entity:
+        ha_switch(force_entity, False)
     log.info(f"  Battery → self-consumption (min {min_soc}%) — {'OK' if ok else 'ERROR'}")
     return ok
 
@@ -561,7 +627,7 @@ _consumption_cache: dict = {"kw": 0.5, "updated": None}
 
 def _refresh_consumption_cache():
     global _consumption_cache
-    entity = cfg("sensor_grid_power", "sensor.acometida_general_power")
+    entity = cfg("sensor_grid_power", "")
 
     # Prefer InfluxDB (years of data); fall back to HA recorder
     rows = []
@@ -639,8 +705,9 @@ def calculate_optimal_soc(sensors: dict) -> dict:
     battery_needed = max(0.0, peak_total_kwh - solar_during_peak)
     soc_needed = (battery_needed / battery_kwh) * 100
 
-    # +5% safety buffer, clamp 30–95%
-    target = max(30, min(95, round(soc_needed + 5)))
+    # +5% safety buffer, clamp to health-mode SOC limits (floor at 30% for safe operation)
+    _hmin, _hmax = _health_mode_limits()
+    target = max(max(30, _hmin), min(_hmax, round(soc_needed + 5)))
 
     return {
         "target_soc":         target,
@@ -659,7 +726,7 @@ def calculate_optimal_soc(sensors: dict) -> dict:
 STORM_CONDITIONS = {"lightning", "lightning-rainy", "exceptional", "hail", "pouring"}
 
 def is_storm_forecast() -> bool:
-    entity = cfg("sensor_weather", "weather.aemet")
+    entity = cfg("sensor_weather", "")
     s = ha_state(entity)
     if not s:
         return False
@@ -670,29 +737,192 @@ def is_storm_forecast() -> bool:
             return True
     return False
 
-# ── ML Model ─────────────────────────────────────────────────────────────────
-def _history_to_df(rows: list):
+# ── ML Model — dynamic feature engineering ───────────────────────────────────
+#
+# Feature set is built at training time from wizard-configured sensors.
+# The exact feature list is saved in the model artifact and reused at inference.
+# Adding a new sensor in the wizard triggers a retrain (MODEL_FEATURE_VER bump
+# alone forces retrain on the next cycle that loads a stale artifact).
+#
+# Base features (always present):
+#   hour, weekday, month       — calendar position
+#   lag1, lag4, roll4          — SOC autoregressive lags at 15-min intervals
+#   solar_proxy                — geometric solar elevation proxy (0–1)
+#
+# Dynamic features (added when wizard sensors are configured):
+#   temp_outdoor               — outdoor temperature → HVAC load signal
+#   solar_lag1, solar_roll4    — short-term solar production lags
+#   grid_lag1, grid_roll4      — grid import magnitude lags (unsigned)
+#   sm_<name>                  — one feature per configured sub-meter
+
+BASE_FEATURES = ["hour", "weekday", "month", "lag1", "lag4", "roll4", "solar_proxy"]
+
+# ── History helpers ───────────────────────────────────────────────────────────
+
+def _influx_wizard_history(entity: str, days: int, influx_cfg: dict) -> list:
+    """Fetch entity history from InfluxDB v1 (InfluxQL) configured in the wizard.
+    The official HA InfluxDB integration uses v1 user/password auth.
+    Returns HA-style rows: [{"last_changed": iso_str, "state": str_value}, ...]"""
+    try:
+        url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
+        db   = influx_cfg.get("db", "homeassistant")
+        user = influx_cfg.get("username", "")
+        pwd  = influx_cfg.get("password", "")
+        # HA stores entity_id without domain as the measurement name
+        entity_short = entity.split(".")[-1] if "." in entity else entity
+        q = (
+            f'SELECT mean("value") FROM "{entity_short}" '
+            f'WHERE time > now()-{days}d '
+            f'GROUP BY time(15m) fill(previous)'
+        )
+        resp, err, _ = _influx_query(url, db, q, user, pwd)
+        if err or not resp:
+            return []
+        rows = []
+        for series in resp.get("results", [{}])[0].get("series", []):
+            for point in series.get("values", []):
+                ts, val = point[0], point[1]
+                if val is None:
+                    continue
+                rows.append({"last_changed": ts, "state": str(val)})
+        return rows
+    except Exception as e:
+        log.debug(f"InfluxDB wizard history {entity}: {e}")
+        return []
+
+def _load_history_best_effort(entity: str, days: int) -> list:
+    """Unified history loader: wizard InfluxDB v1 → legacy InfluxDB v1 cfg → HA recorder.
+    Always returns HA-style rows; empty list if nothing is available."""
+    # 1. Wizard InfluxDB (v1 user/password, configured in wizard Data Sources step)
+    influx_cfg = _WIZARD.get("influxdb", {})
+    if influx_cfg.get("host"):
+        rows = _influx_wizard_history(entity, days, influx_cfg)
+        if rows:
+            log.debug(f"  [{entity}] {len(rows)} rows from wizard InfluxDB ({days}d)")
+            return rows
+    # 2. Legacy InfluxDB v1 (cfg-based, old add-on config)
+    if cfg("influxdb_url", ""):
+        rows, _ = ha_history_influx(entity, days=min(days, 365))
+        if rows:
+            log.debug(f"  [{entity}] {len(rows)} rows from InfluxDB v1 cfg")
+            return rows
+    # 3. HA recorder (capped at 14 days — typical recorder retention)
+    rows = ha_history(entity, days=min(days, 14))
+    log.debug(f"  [{entity}] {len(rows)} rows from HA recorder")
+    return rows
+
+def _rows_to_15min_series(rows: list, col: str) -> "pd.Series":
+    """Convert HA-style history rows to a 15-min resampled, forward-filled Series."""
     records = []
     for row in rows:
         try:
             ts  = datetime.fromisoformat(row["last_changed"].replace("Z", "+00:00"))
             val = float(row["state"])
-            records.append({"ts": ts, "value": val})
+            records.append({"ts": ts.replace(tzinfo=None), "value": val})
         except (KeyError, ValueError, TypeError):
             continue
-    if len(records) < 48:   # 48 = 4 readings/h × 12 hours — minimum viable dataset
-        return None
-    df = pd.DataFrame(records).set_index("ts").sort_index()
+    if not records:
+        return pd.Series(dtype=float, name=col)
+    s = pd.DataFrame(records).set_index("ts")["value"]
+    return s.resample("15min").mean().ffill().rename(col)
+
+# ── Dynamic training DataFrame ────────────────────────────────────────────────
+
+def _build_training_df(days: int = 90) -> "tuple[pd.DataFrame, list[str]] | tuple[None, None]":
+    """Build a training DataFrame joining all wizard-configured sensor histories.
+
+    Returns (df, feature_names) or (None, None) if insufficient data.
+    The feature_names list is stored in the model artifact so predict_soc()
+    can reconstruct the exact same feature vector at inference time.
+    """
+    # ── Primary target: battery SOC ──────────────────────────────────────────
+    batt_entity = _wiz("battery_soc", "sensor_battery_soc", "sensor.battery_state_of_capacity")
+    batt_rows   = _load_history_best_effort(batt_entity, days)
+    if not batt_rows:
+        log.warning("  No battery SOC history found — training aborted")
+        return None, None
+
+    soc_series = _rows_to_15min_series(batt_rows, "value")
+    if len(soc_series) < 48:
+        log.warning(f"  SOC series too short ({len(soc_series)} pts) — training aborted")
+        return None, None
+
+    # ── Base DataFrame (SOC + time features + autoregressive lags) ───────────
+    df = soc_series.to_frame("value")
     df["hour"]        = df.index.hour
     df["weekday"]     = df.index.weekday
     df["month"]       = df.index.month
     df["lag1"]        = df["value"].shift(1)
     df["lag4"]        = df["value"].shift(4)
     df["roll4"]       = df["value"].rolling(4).mean()
-    df["solar_proxy"] = df.index.map(lambda ts: _solar_proxy_for_hour(ts.hour, ts.month))
-    return df.dropna()
+    df["solar_proxy"] = [_solar_proxy_for_hour(ts.hour, ts.month) for ts in df.index]
+    features: list[str] = list(BASE_FEATURES)  # copy
 
-FEATURES = ["hour", "weekday", "month", "lag1", "lag4", "roll4", "solar_proxy"]
+    # ── Optional sensor enrichment ────────────────────────────────────────────
+    wiz_sensors = _WIZARD.get("sensors", {})
+
+    # Outdoor temperature → accounts for HVAC-driven SOC swings
+    temp_entity = _wiz("temp_outdoor", "sensor_temp_outdoor",
+                       "")
+    if wiz_sensors.get("temp_outdoor") or cfg("sensor_temp_outdoor", ""):
+        temp_rows = _load_history_best_effort(temp_entity, days)
+        if temp_rows:
+            s = _rows_to_15min_series(temp_rows, "temp_outdoor")
+            df = df.join(s, how="left")
+            df["temp_outdoor"] = df["temp_outdoor"].ffill().fillna(15.0)
+            features.append("temp_outdoor")
+            log.info(f"  Feature added: temp_outdoor ({len(temp_rows)} rows)")
+
+    # Solar production lags → captures daytime energy availability
+    solar_entity = _wiz("solar_power", "sensor_solar_power", "")
+    if wiz_sensors.get("solar_power") or cfg("sensor_solar_power", ""):
+        solar_rows = _load_history_best_effort(solar_entity, days)
+        if solar_rows:
+            s = _rows_to_15min_series(solar_rows, "solar")
+            df = df.join(s, how="left")
+            df["solar"] = df["solar"].ffill().fillna(0.0)
+            df["solar_lag1"]  = df["solar"].shift(1)
+            df["solar_roll4"] = df["solar"].rolling(4).mean()
+            features.extend(["solar_lag1", "solar_roll4"])
+            log.info(f"  Features added: solar_lag1, solar_roll4 ({len(solar_rows)} rows)")
+
+    # Grid power lags (unsigned magnitude) → captures household consumption pattern
+    grid_entity = _wiz("grid_power", "sensor_grid_power", "")
+    if wiz_sensors.get("grid_power") or cfg("sensor_grid_power", ""):
+        grid_rows = _load_history_best_effort(grid_entity, days)
+        if grid_rows:
+            s = _rows_to_15min_series(grid_rows, "grid")
+            df = df.join(s, how="left")
+            df["grid"] = df["grid"].ffill().fillna(0.0).abs()
+            df["grid_lag1"]  = df["grid"].shift(1)
+            df["grid_roll4"] = df["grid"].rolling(4).mean()
+            features.extend(["grid_lag1", "grid_roll4"])
+            log.info(f"  Features added: grid_lag1, grid_roll4 ({len(grid_rows)} rows)")
+
+    # Sub-meter features — one per configured extra power sensor
+    for sm in _WIZARD.get("grid_submeters", []):
+        sm_name   = sm.get("name", "").strip().lower().replace(" ", "_").replace("-", "_")
+        sm_entity = sm.get("entity", "")
+        if not (sm_name and sm_entity):
+            continue
+        feat = f"sm_{sm_name}"
+        sm_rows = _load_history_best_effort(sm_entity, days)
+        if sm_rows:
+            s = _rows_to_15min_series(sm_rows, feat)
+            df = df.join(s, how="left")
+            df[feat] = df[feat].ffill().fillna(0.0).abs()
+            features.append(feat)
+            log.info(f"  Feature added: {feat} ({len(sm_rows)} rows)")
+
+    df = df.dropna(subset=features + ["value"])
+    if len(df) < 48:
+        log.warning(f"  After join/dropna: only {len(df)} rows — training aborted")
+        return None, None
+
+    log.info(f"  Training set: {len(df)} rows × {len(features)} features — {features}")
+    return df, features
+
+# ── Training & prediction ─────────────────────────────────────────────────────
 
 def train_model() -> bool:
     from sklearn.ensemble import GradientBoostingRegressor
@@ -701,71 +931,97 @@ def train_model() -> bool:
     from sklearn.model_selection import cross_val_score
     import numpy as np
 
-    log.info("═══ ML Training started ═══")
-    entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
-    rows = []
+    log.info("═══ ML Training started (dynamic features v3) ═══")
 
-    # Primary: InfluxDB (years of retention — far better for ML)
-    if cfg("influxdb_url", ""):
-        rows, _err = ha_history_influx(entity, days=365)
-        if rows:
-            log.info(f"  Source: InfluxDB — {len(rows)} records / 365d")
+    # Days of history to request — more data available when InfluxDB is configured
+    influx_cfg = _WIZARD.get("influxdb", {})
+    days = 90 if influx_cfg.get("host") else \
+           60 if cfg("influxdb_url", "") else 14
 
-    # Fallback: HA recorder with progressive window (default 10d retention)
-    if not rows:
-        log.info("  InfluxDB not configured or empty — using HA recorder")
-        for days in [60, 30, 14, 7]:
-            rows = ha_history(entity, days=days)
-            if rows:
-                log.info(f"  Source: HA recorder — {len(rows)} records / {days}d")
-                break
-            log.warning(f"  HA recorder {days}d empty — trying shorter window")
-
-    df = _history_to_df(rows)
+    df, features = _build_training_df(days=days)
     if df is None:
-        log.warning(f"Insufficient history ({len(rows)} samples). Rules-only mode.")
+        log.warning("  Insufficient training data — staying in rules-only mode")
         return False
 
-    X, y = df[FEATURES], df["value"]
+    X, y = df[features], df["value"]
     pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("gbr",    GradientBoostingRegressor(n_estimators=150, max_depth=4,
-                                             learning_rate=0.08, subsample=0.8, random_state=42)),
+        ("gbr",    GradientBoostingRegressor(
+            n_estimators=200, max_depth=4,
+            learning_rate=0.07, subsample=0.8,
+            min_samples_leaf=5, random_state=42,
+        )),
     ])
-    scores = cross_val_score(pipe, X, y, cv=3, scoring="r2")
+    scores = cross_val_score(pipe, X, y, cv=min(5, len(df) // 96), scoring="r2")
     pipe.fit(X, y)
-    joblib.dump({"pipeline": pipe, "features": FEATURES,
-                 "trained_at": datetime.now().isoformat(),
-                 "r2_cv_mean": float(np.mean(scores)), "n_samples": len(df),
-                 "feature_version": MODEL_FEATURE_VER}, MODEL_FILE)
-    log.info(f"Model trained: {len(df)} samples, R²={np.mean(scores):.3f}")
+
+    artifact = {
+        "pipeline":        pipe,
+        "features":        features,
+        "trained_at":      datetime.now().isoformat(),
+        "r2_cv_mean":      float(np.mean(scores)),
+        "r2_cv_std":       float(np.std(scores)),
+        "n_samples":       len(df),
+        "days_of_data":    days,
+        "feature_version": MODEL_FEATURE_VER,
+        "wizard_sensors":  list(_WIZARD.get("sensors", {}).keys()),
+        "submeters":       [sm.get("name","") for sm in _WIZARD.get("grid_submeters", [])],
+    }
+    joblib.dump(artifact, MODEL_FILE)
+    log.info(f"  Model saved: {len(df)} samples · R²={np.mean(scores):.3f}±{np.std(scores):.3f} · {len(features)} features")
     return True
 
 def predict_soc(sensors: dict) -> dict:
     if MODEL_FILE.exists():
         try:
             art = joblib.load(MODEL_FILE)
-            # Auto-retrain if feature version changed (keeps model consistent with code)
             if art.get("feature_version", 1) != MODEL_FEATURE_VER:
-                log.info("Feature version mismatch — triggering background retrain")
+                log.info("  Feature version mismatch — triggering background retrain")
                 threading.Thread(target=train_model, daemon=True).start()
-                raise ValueError("stale model — retrain triggered")
-            now        = datetime.now()
-            solar_live = _solar_proxy_for_hour(now.hour, now.month)
-            X   = pd.DataFrame([{
+                raise ValueError("stale model")
+
+            features = art.get("features", BASE_FEATURES)
+            now      = datetime.now()
+
+            # Build the feature row — include all possible features,
+            # then select only those the trained model expects.
+            row: dict = {
                 "hour":        now.hour,
                 "weekday":     now.weekday(),
                 "month":       now.month,
-                "lag1":        sensors["battery_soc"],
-                "lag4":        sensors["battery_soc"],
-                "roll4":       sensors["battery_soc"],
-                "solar_proxy": solar_live,
-            }])
-            pred = float(art["pipeline"].predict(X[FEATURES])[0])
-            return {"predicted_soc": round(max(0.0, min(100.0, pred)), 1),
-                    "method": "ml", "r2": art.get("r2_cv_mean"), "trained_at": art.get("trained_at")}
+                "lag1":        sensors.get("battery_soc", 50.0),
+                "lag4":        sensors.get("battery_soc", 50.0),
+                "roll4":       sensors.get("battery_soc", 50.0),
+                "solar_proxy": _solar_proxy_for_hour(now.hour, now.month),
+                # Dynamic — default to live sensor reading or neutral fallback
+                "temp_outdoor": sensors.get("temp_outdoor", 15.0),
+                "solar_lag1":   max(0, sensors.get("solar_power", 0)),
+                "solar_roll4":  max(0, sensors.get("solar_power", 0)),
+                "grid_lag1":    abs(sensors.get("grid_power", 0)),
+                "grid_roll4":   abs(sensors.get("grid_power", 0)),
+            }
+            # Submeter features from live readings
+            for sm in _WIZARD.get("grid_submeters", []):
+                name = sm.get("name", "").strip().lower().replace(" ", "_").replace("-", "_")
+                feat = f"sm_{name}"
+                if feat in features:
+                    row[feat] = abs(sensors.get(f"submeter_{sm.get('name','')}", 0))
+
+            X    = pd.DataFrame([{f: row.get(f, 0.0) for f in features}])
+            pred = float(art["pipeline"].predict(X)[0])
+            return {
+                "predicted_soc":  round(max(0.0, min(100.0, pred)), 1),
+                "method":         "ml",
+                "r2":             art.get("r2_cv_mean"),
+                "r2_std":         art.get("r2_cv_std"),
+                "trained_at":     art.get("trained_at"),
+                "features_used":  features,
+                "n_features":     len(features),
+            }
         except Exception as e:
-            log.warning(f"ML prediction error: {e}")
+            log.warning(f"  ML prediction error: {e}")
+
+    # Rules-based fallback
     solar_tm = sensors.get("solar_tomorrow", 0)
     pred = 80.0 if solar_tm < cfg("solar_tomorrow_irrisoria_kwh", 2.0) else 50.0
     return {"predicted_soc": pred, "method": "rules_fallback"}
@@ -775,33 +1031,76 @@ def _is_summer() -> bool:
     m = datetime.now().month
     return cfg("summer_start_month", 6) <= m <= cfg("summer_end_month", 9)
 
-def decide_heat_pump(sensors: dict) -> dict:
+def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
     soc        = sensors["battery_soc"]
     batt_power = sensors["battery_power"]
-    temp_in    = sensors["temp_indoor"]
+    summer     = _is_summer()
+    free_power = (soc >= 99 and batt_power > 0)
+    temp_in    = sensors.get(f"temp_zone_{zone_idx}", sensors.get("temp_indoor", 20.0))
+    hour       = datetime.now().hour
+    sched      = zone.get("sched") or {}
+    sched_mode = sched.get(str(hour), sched.get(hour, "comfort"))
+    t_comfort  = float(zone.get("temp_comfort", 21.0))
+    t_surplus  = float(zone.get("temp_surplus", 23.0))
+    t_min      = float(zone.get("temp_min",     18.0))
+    zone_name  = zone.get("name", f"Zone {zone_idx + 1}")
+
+    if summer:
+        entity = (zone.get("temp_cool") or
+                  _wiz("hvac_temp_cool", "number_hvac_cool", ""))
+        if free_power or sched_mode == "surplus":
+            target, reason = max(16.0, t_comfort - 3), f"Surplus cooling [{zone_name}]"
+        elif sched_mode == "comfort":
+            target, reason = t_comfort - 1,            f"Comfort cooling ({temp_in:.1f}°C) [{zone_name}]"
+        else:
+            target = t_surplus if temp_in > t_surplus + 2 else t_surplus + 3
+            reason = f"Minimum economy [{zone_name}]"
+    else:
+        entity = (zone.get("temp_heat") or
+                  _wiz("hvac_temp_heat", "number_hvac_heat", ""))
+        if free_power or sched_mode == "surplus":
+            target, reason = t_surplus, f"Surplus heating [{zone_name}]"
+        elif sched_mode == "comfort":
+            target, reason = t_comfort, f"Comfort heating ({temp_in:.1f}°C) [{zone_name}]"
+        else:
+            target, reason = t_min, f"Minimum heating [{zone_name}]"
+
+    return {"entity": entity, "climate": zone.get("climate") or None,
+            "target": round(target, 1), "reason": reason, "zone": zone_name,
+            "sched_mode": sched_mode, "temp_indoor": round(temp_in, 1),
+            "season": "summer" if summer else "winter"}
+
+def _hp_legacy_decision(sensors: dict) -> dict:
+    soc        = sensors["battery_soc"]
+    batt_power = sensors["battery_power"]
+    temp_in    = sensors.get("temp_indoor", 20.0)
     sun        = get_sun_status()
     daytime    = sun["is_day"]
     free_power = (soc >= 99 and batt_power > 0)
-
     if _is_summer():
-        entity = cfg("number_hvac_cool", "number.ebusd_ctls2_z1coolingtemp_tempv")
+        entity = _wiz("hvac_temp_cool", "number_hvac_cool", "")
         if free_power:
-            target, reason = 16.0, "Free solar power (SOC≥99%, charging from panels)"
+            target, reason = 16.0, "Free solar power (SOC≥99%)"
         elif temp_in > 26 and daytime:
-            target, reason = 20.0, f"Indoor too hot ({temp_in:.1f}°C > 26°C)"
+            target, reason = 20.0, f"Indoor too hot ({temp_in:.1f}°C)"
         else:
             target, reason = 25.0, "Summer base setpoint"
     else:
-        entity = cfg("number_hvac_heat", "number.ebusd_ctls2_z1manualtemp_tempv")
+        entity = _wiz("hvac_temp_heat", "number_hvac_heat", "")
         if free_power:
-            target, reason = 18.5, "Free solar power (SOC≥99%, charging from panels)"
+            target, reason = 18.5, "Free solar power (SOC≥99%)"
         elif temp_in < 16 and daytime:
-            target, reason = 17.0, f"Indoor too cold ({temp_in:.1f}°C < 16°C)"
+            target, reason = 17.0, f"Indoor too cold ({temp_in:.1f}°C)"
         else:
             target, reason = 16.0, "Winter base setpoint"
+    return {"entity": entity, "climate": None, "target": target, "reason": reason,
+            "zone": "default", "season": "summer" if _is_summer() else "winter"}
 
-    return {"entity": entity, "target": target, "reason": reason,
-            "season": "summer" if _is_summer() else "winter"}
+def decide_heat_pump(sensors: dict) -> list:
+    zones = _WIZARD.get("hvac_zones", [])
+    if zones:
+        return [_hp_zone_decision(sensors, z, i) for i, z in enumerate(zones)]
+    return [_hp_legacy_decision(sensors)]
 
 # ── Battery decision ─────────────────────────────────────────────────────────
 def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
@@ -1017,17 +1316,25 @@ def run_cycle() -> dict:
         decision["skipped"].append({"type": "battery", "reason": bat["reason"]})
         log.info(f"  [BATTERY] No action — {bat['reason']}")
 
-    # 2. Heat pump
-    hp = decide_heat_pump(sensors)
-    ok = ha_set_number(hp["entity"], hp["target"])
-    decision["actions"].append({"type": "heat_pump", "entity": hp["entity"],
-        "value": hp["target"], "reason": hp["reason"], "ok": ok})
-    log.info(f"  [HEAT PUMP/{hp['season'].upper()}] {hp['reason']} → {hp['target']}°C")
+    # 2. Heat pump — multi-zone
+    hp_zones = decide_heat_pump(sensors)
+    for hp in hp_zones:
+        ok = ha_set_number(hp["entity"], hp["target"]) if hp["entity"] else False
+        # If a climate entity is also configured, set temperature there too
+        if hp.get("climate"):
+            ha_service("climate", "set_temperature", {
+                "entity_id": hp["climate"], "temperature": hp["target"],
+            })
+        zone_tag = f"/{hp['zone']}" if hp.get("zone", "default") != "default" else ""
+        decision["actions"].append({"type": "heat_pump", "entity": hp["entity"],
+            "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
+            "value": hp["target"], "reason": hp["reason"], "ok": ok})
+        log.info(f"  [HEAT PUMP/{hp['season'].upper()}{zone_tag}] {hp['reason']} → {hp['target']}°C")
 
     # 3. Pool pump + cleaner
     pool     = decide_pool(sensors, tariff)
-    pool_sw  = cfg("switch_pool", "switch.depuradora")
-    clean_sw = cfg("switch_pool_cleaner", "switch.limpiafondos")
+    pool_sw  = _wiz("pool_switch",  "switch_pool",         "")
+    clean_sw = _wiz("pool_cleaner", "switch_pool_cleaner", "")
     if pool["action"]:
         _start_pool_with_cleaner(pool_sw, clean_sw)
         decision["actions"].append({"type": "pool", "action": True,
@@ -1055,6 +1362,31 @@ def run_cycle() -> dict:
         log.info(f"  [DISHWASHER] Waiting — {dw['reason']}")
     else:
         log.info(f"  [DISHWASHER] {dw['reason']}")
+
+    # 5. Washer / Dryer — state monitoring + valley recommendation
+    for appliance, state_key, power_key in [
+        ("washer", "washer_state", "washer_power"),
+        ("dryer",  "dryer_state",  "dryer_power"),
+    ]:
+        state = sensors.get(state_key)
+        if state is None:
+            continue   # not configured in wizard
+        power = sensors.get(power_key, 0)
+        period = tariff["period"]
+        if isinstance(state, str) and state.lower() == "running":
+            log.info(f"  [{appliance.upper()}] Running — {power:.0f}W")
+            decision["actions"].append({"type": appliance, "action": "running",
+                "power_w": power, "reason": "In cycle"})
+        elif isinstance(state, str) and state.lower() in ("ready", "standby", "idle"):
+            if period == "valley":
+                decision["skipped"].append({"type": appliance,
+                    "reason": f"Ready + valley tariff — good time to run"})
+                log.info(f"  [{appliance.upper()}] Ready + valley — recommend manual start")
+            else:
+                decision["skipped"].append({"type": appliance,
+                    "reason": f"Ready, waiting for valley or surplus (period={period})"})
+        else:
+            decision["skipped"].append({"type": appliance, "reason": f"State: {state}"})
 
     _update_savings(sensors, tariff)
     _save_decision(decision)
@@ -1251,6 +1583,8 @@ h2{font-size:.7rem;color:var(--m);text-transform:uppercase;letter-spacing:.08em;
 .btn{background:var(--a);color:#0f172a;border:none;padding:.45rem 1rem;border-radius:.5rem;font-weight:700;cursor:pointer;font-size:.8rem;transition:.15s opacity,.1s transform;display:inline-flex;align-items:center;gap:.35rem}
 .btn:hover{opacity:.85}.btn:active{transform:scale(.97)}.btn:disabled{opacity:.4;cursor:default}
 .btn-y{background:var(--y)}.btn-g{background:var(--g)}.btn-r{background:var(--r)}.btn-p{background:var(--p)}.btn-sm{padding:.3rem .7rem;font-size:.72rem}
+.hm-btn{background:var(--b);color:var(--t);border:1px solid #334155;flex-direction:column;padding:.55rem .4rem;text-align:center;justify-content:center;width:100%;transition:.15s all}
+.hm-btn.active{background:rgba(56,189,248,.15);border-color:var(--a);color:var(--a)}
 .actions{display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap}
 .batt-card{background:var(--s);border-radius:.75rem;padding:.9rem;border:1px solid var(--b);margin-bottom:1rem}
 .batt-header{display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.8rem}
@@ -1330,21 +1664,84 @@ th{color:var(--m);font-weight:500}
 /* ── Wizard comic style ──────────────────────────────────────────────────── */
 .wiz-wrap{max-width:740px;margin:0 auto}
 .wiz-header{font-family:'Bangers',cursive;font-size:2.2rem;color:#fbbf24;text-shadow:3px 3px 0 #0f172a,-1px -1px 0 #0f172a;letter-spacing:.04em;margin-bottom:.3rem}
-.wiz-subtitle{font-size:.82rem;color:var(--m);margin-bottom:1.2rem}
-.wiz-steps{display:flex;gap:.3rem;margin-bottom:1.5rem;overflow-x:auto;padding-bottom:.3rem}
-.wiz-step-dot{display:flex;flex-direction:column;align-items:center;gap:.2rem;min-width:60px;cursor:pointer}
-.wiz-step-dot .dot{width:32px;height:32px;border-radius:50%;border:3px solid var(--b);background:var(--s);display:flex;align-items:center;justify-content:center;font-size:.85rem;font-weight:700;transition:.2s;color:var(--m)}
+.wiz-subtitle{font-size:.82rem;color:var(--m);margin-bottom:.6rem}
+.wiz-steps{display:flex;gap:.3rem;margin-bottom:1.2rem;overflow-x:auto;padding-bottom:.3rem}
+.wiz-step-dot{display:flex;flex-direction:column;align-items:center;gap:.2rem;min-width:55px;cursor:pointer}
+.wiz-step-dot .dot{width:30px;height:30px;border-radius:50%;border:3px solid var(--b);background:var(--s);display:flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:700;transition:.2s;color:var(--m)}
 .wiz-step-dot.done .dot{background:rgba(74,222,128,.2);border-color:var(--g);color:var(--g)}
 .wiz-step-dot.active .dot{background:rgba(251,191,36,.2);border-color:var(--y);color:var(--y);box-shadow:0 0 0 3px rgba(251,191,36,.15)}
-.wiz-step-dot .dot-lbl{font-size:.58rem;color:var(--m);text-align:center;max-width:60px;line-height:1.2}
+.wiz-step-dot .dot-lbl{font-size:.55rem;color:var(--m);text-align:center;max-width:55px;line-height:1.2}
+.wiz-sub-dot{display:flex;flex-direction:column;align-items:center;cursor:pointer;min-width:24px}
+.wiz-sub-dot .sub-circle{width:22px;height:22px;border-radius:50%;border:2px solid #475569;background:var(--s);display:flex;align-items:center;justify-content:center;font-size:.62rem;transition:.2s}
+.wiz-sub-dot.active .sub-circle{border-color:var(--y);background:rgba(251,191,36,.2);box-shadow:0 0 0 2px rgba(251,191,36,.15)}
+.wiz-sub-dot.done .sub-circle{border-color:var(--g);background:rgba(74,222,128,.1)}
 .wiz-step-dot.done .dot-lbl,.wiz-step-dot.active .dot-lbl{color:var(--t)}
 .wiz-pane{display:none}.wiz-pane.active{display:block}
 .wiz-card{background:var(--s);border:3px solid var(--b);border-radius:1rem;box-shadow:4px 4px 0 var(--b);padding:1.2rem;margin-bottom:1rem;position:relative}
 .wiz-card-title{font-family:'Bangers',cursive;font-size:1.35rem;color:var(--a);letter-spacing:.03em;margin-bottom:.8rem;display:flex;align-items:center;gap:.4rem}
 .wiz-robot{position:absolute;top:-14px;right:12px;font-size:1.8rem;filter:drop-shadow(2px 2px 0 var(--b))}
-.bubble{background:#fffef0;color:#1e293b;border:3px solid #1e293b;border-radius:1rem;padding:.6rem .9rem;font-size:.8rem;line-height:1.5;margin-bottom:1rem;position:relative;box-shadow:3px 3px 0 #1e293b}
-.bubble::after{content:"";position:absolute;bottom:-14px;left:20px;border:7px solid transparent;border-top-color:#1e293b}
-.bubble::before{content:"";position:absolute;bottom:-11px;left:21px;border:6px solid transparent;border-top-color:#fffef0;z-index:1}
+/* Bubble — enhanced with avatar */
+.bubble{display:flex;align-items:flex-start;gap:.75rem;background:#fffef0;color:#1e293b;border:3px solid #1e293b;border-radius:1rem;padding:.8rem 1rem;font-size:.95rem;font-weight:500;line-height:1.55;margin-bottom:1.3rem;position:relative;box-shadow:4px 4px 0 #1e293b}
+.bubble::after{content:"";position:absolute;bottom:-15px;left:22px;border:7px solid transparent;border-top-color:#1e293b}
+.bubble::before{content:"";position:absolute;bottom:-12px;left:23px;border:6px solid transparent;border-top-color:#fffef0;z-index:1}
+.bub-avatar{font-size:2.2rem;line-height:1;flex-shrink:0;filter:drop-shadow(1px 1px 0 rgba(0,0,0,.3))}
+.bub-text{flex:1}
+.bub-name{font-size:.6rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;margin-bottom:.25rem;opacity:.5}
+/* Bolt = default (yellow/green warm) */
+.bolt-bubble{display:none!important}
+.nexus-bubble{display:flex}
+/* Nexus mode overrides */
+.nexus-bubble{display:flex;background:#1e1b4b;color:#e0e7ff;border-color:#818cf8;box-shadow:4px 4px 0 #4c1d95}
+.nexus-bubble::after{border-top-color:#818cf8}
+.nexus-bubble::before{border-top-color:#1e1b4b}
+/* Mode toggle bar */
+.wiz-mode-bar{display:flex;align-items:center;gap:.6rem;margin-bottom:.8rem;flex-wrap:wrap}
+.wiz-mode-label{font-size:.68rem;color:var(--m);text-transform:uppercase;letter-spacing:.06em}
+.wiz-mode-btn{font-family:'Bangers',cursive;font-size:.95rem;padding:.28rem .8rem;border:2px solid var(--b);border-radius:.4rem;cursor:pointer;background:var(--s);color:var(--m);letter-spacing:.04em;transition:.15s}
+.wiz-mode-btn.bolt-active{background:#fbbf24;color:#0f172a;border-color:#fbbf24;box-shadow:2px 2px 0 #0f172a}
+.wiz-mode-btn.nexus-active{background:#818cf8;color:#fff;border-color:#818cf8;box-shadow:2px 2px 0 #1e1b4b}
+/* Data Quality bar */
+.dq-wrap{display:flex;align-items:center;gap:.7rem;background:var(--s);border:2px solid var(--b);border-radius:.6rem;padding:.5rem .8rem;margin-bottom:.8rem}
+.dq-label{font-size:.68rem;color:var(--m);white-space:nowrap}
+.dq-track{flex:1;height:9px;background:var(--b);border-radius:5px;overflow:hidden}
+.dq-fill{height:100%;border-radius:5px;transition:width .6s,background .6s;background:#ef4444}
+.dq-score{font-family:'Bangers',cursive;font-size:1.1rem;min-width:40px;text-align:right;letter-spacing:.03em}
+/* Entity status badges */
+.ent-ok{color:#4ade80;font-size:.78rem;margin-left:.35rem;font-weight:700}
+.ent-miss{color:#ef4444;font-size:.78rem;margin-left:.35rem;font-weight:700}
+.ent-samples{font-size:.62rem;color:var(--m);margin-left:.25rem;opacity:.75}
+/* Advanced-only visibility */
+.adv-only{display:none}
+.adv-only{display:block}
+.adv-only-flex{display:none}
+.adv-only-flex{display:flex}
+.adv-only-grid{display:none}
+.adv-only-grid{display:grid}
+/* HVAC zone blocks */
+.hvac-zone{background:var(--bg);border:2px solid #334155;border-radius:.7rem;padding:.8rem;margin-bottom:.6rem;position:relative}
+.hvac-zone-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.5rem}
+.hvac-zone-title{font-size:.78rem;font-weight:700;color:var(--a)}
+.hvac-zone-del{font-size:.72rem;color:#ef4444;cursor:pointer;background:none;border:1px solid #ef4444;border-radius:.3rem;padding:.1rem .4rem}
+.hvac-sched{display:grid;grid-template-columns:repeat(12,1fr);gap:.15rem;margin-top:.4rem}
+.hvac-sched-cell{background:var(--b);border-radius:.2rem;padding:.18rem .1rem;text-align:center;font-size:.56rem;color:var(--m);cursor:pointer;transition:.1s;user-select:none}
+.hvac-sched-cell.comfort{background:rgba(74,222,128,.25);color:#4ade80}
+.hvac-sched-cell.surplus{background:rgba(56,189,248,.2);color:var(--a)}
+.hvac-sched-cell.minimum{background:rgba(100,116,139,.15);color:#94a3b8}
+/* Appliance zone blocks */
+.appliance-zone{background:var(--bg);border:2px solid #334155;border-radius:.7rem;padding:.7rem;margin-bottom:.5rem}
+/* Grid sub-meter list */
+.submeter-row{display:flex;gap:.4rem;align-items:center;margin-bottom:.4rem}
+.submeter-row input{flex:1;background:var(--b);border:1px solid #475569;border-radius:.4rem;padding:.35rem .5rem;color:var(--t);font-size:.8rem}
+.submeter-del{background:none;border:1px solid #ef4444;color:#ef4444;border-radius:.3rem;padding:.2rem .5rem;cursor:pointer;font-size:.72rem}
+.chart-subnav{background:var(--b);color:var(--m);border:1px solid #334155;font-size:.8rem;padding:.35rem .8rem;border-radius:.4rem;cursor:pointer;transition:.15s}
+.chart-subnav.active{background:rgba(56,189,248,.15);color:var(--a);border-color:var(--a)}
+.chart-subnav:hover{color:var(--t)}
+/* ── SVG energy flow diagram ── */
+.fl-ln{fill:none;stroke-width:3;stroke-linecap:round;stroke-dasharray:9 7;transition:opacity .4s}
+.fl-ln.fl-dim{opacity:.1;animation:none!important}
+.fl-ln.fl-active{animation:fl-dash linear infinite}
+.fl-node-bg{fill:rgba(15,23,42,.55)}
+@keyframes fl-dash{to{stroke-dashoffset:-32}}
 .entity-picker{background:var(--bg);border:2px solid var(--b);border-radius:.6rem;padding:.7rem;margin-bottom:.7rem}
 .entity-picker-label{font-size:.72rem;color:var(--m);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.4rem;display:flex;align-items:center;justify-content:space-between}
 .entity-picker-label span{color:var(--g);font-size:.65rem}
@@ -1353,15 +1750,18 @@ th{color:var(--m);font-weight:500}
 .entity-cand{background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.3);color:var(--a);padding:.2rem .55rem;border-radius:.3rem;font-size:.7rem;cursor:pointer;transition:.15s}
 .entity-cand:hover{background:rgba(56,189,248,.2);border-color:var(--a)}
 .entity-cand.best{background:rgba(74,222,128,.12);border-color:var(--g);color:var(--g)}
+.custom-load-row{background:rgba(255,255,255,.03);border:1px solid var(--b);border-radius:.5rem;padding:.6rem;margin-bottom:.4rem}.loads-subdot{display:inline-flex;align-items:center;justify-content:center;width:1.6rem;height:1.6rem;border-radius:.3rem;font-size:.85rem;background:var(--bg);border:1px solid var(--b);cursor:pointer;transition:.15s}.loads-subdot.active{border-color:var(--g);background:rgba(74,222,128,.15)}.loads-subdot:hover{border-color:var(--a)}
+.ent-search-btn{background:none;border:1px solid var(--b);border-radius:.4rem;padding:.2rem .45rem;cursor:pointer;color:var(--m);font-size:.85rem;flex-shrink:0;line-height:1;transition:.15s}.ent-search-btn:hover{border-color:var(--a);color:var(--a)}.entity-picker-row{display:flex;gap:.3rem;align-items:center}.entity-picker-row input{flex:1;min-width:0}
 .entity-state{font-size:.68rem;color:var(--m);margin-top:.15rem}
-.hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.7rem;margin-bottom:1rem}
-.hw-card{background:var(--bg);border:3px solid var(--b);border-radius:.8rem;padding:.8rem;cursor:pointer;transition:.15s;box-shadow:3px 3px 0 var(--b);text-align:center}
+.hw-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:.6rem;margin-bottom:.9rem}
+.hw-card{background:var(--bg);border:3px solid var(--b);border-radius:.8rem;padding:.75rem;cursor:pointer;transition:.15s;box-shadow:3px 3px 0 var(--b);text-align:center}
 .hw-card:hover{border-color:var(--a);box-shadow:3px 3px 0 var(--a)}
 .hw-card.selected{border-color:var(--g);box-shadow:3px 3px 0 var(--g);background:rgba(74,222,128,.06)}
-.hw-card .hw-icon{font-size:2rem;margin-bottom:.3rem}
-.hw-card .hw-name{font-size:.78rem;font-weight:600;color:var(--t)}
-.hw-card .hw-desc{font-size:.65rem;color:var(--m);margin-top:.15rem}
+.hw-card .hw-icon{font-size:1.8rem;margin-bottom:.25rem}
+.hw-card .hw-name{font-size:.76rem;font-weight:600;color:var(--t)}
+.hw-card .hw-desc{font-size:.62rem;color:var(--m);margin-top:.12rem}
 .wiz-nav{display:flex;justify-content:space-between;align-items:center;margin-top:1rem;gap:.5rem}
+.wiz-pane .wiz-nav{display:none}
 .wiz-progress{font-size:.72rem;color:var(--m)}
 .comic-btn{font-family:'Bangers',cursive;font-size:1.1rem;letter-spacing:.05em;padding:.5rem 1.4rem;border:3px solid #1e293b;border-radius:.6rem;box-shadow:3px 3px 0 #1e293b;cursor:pointer;transition:.1s transform,.1s box-shadow}
 .comic-btn:active{transform:translate(2px,2px);box-shadow:1px 1px 0 #1e293b}
@@ -1380,13 +1780,13 @@ th{color:var(--m);font-weight:500}
 </style>
 </head>
 <body>
-<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">v3.0.0</span></h1>
+<h1>⚡ Energy Optimizer <span id="ver" style="font-size:.75rem;color:var(--m);font-weight:400">__VERSION__</span></h1>
 <div id="notify" class="toast"></div>
 <div class="tabs">
   <button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
   <button class="tab" onclick="showTab('charts')">Charts</button>
   <button class="tab" onclick="showTab('tariff')">Tariff</button>
-  <button class="tab" onclick="showTab('setup')">Setup</button>
+  <button class="tab" onclick="showTab('setup')">Tweaks</button>
   <button class="tab" onclick="showTab('wizard')" style="color:#fbbf24">Wizard</button>
 </div>
 
@@ -1429,25 +1829,214 @@ th{color:var(--m);font-weight:500}
 
 <!-- CHARTS -->
 <div id="tab-charts" class="tab-content">
-  <div class="grid2">
-    <div class="card">
-      <h2 style="margin-top:0">Battery SOC — actual vs predicted (24h) <span id="soc-mae" style="font-size:.75rem;color:var(--m);font-weight:400"></span></h2>
-      <canvas id="socChart"></canvas>
+  <!-- Chart sub-nav -->
+  <div style="display:flex;gap:.4rem;margin-bottom:1rem;flex-wrap:wrap">
+    <button class="btn chart-subnav active" id="cn-live" onclick="chartView('live')">⚡ Live</button>
+    <button class="btn chart-subnav" id="cn-day"  onclick="chartView('day')">📅 Day</button>
+    <button class="btn chart-subnav" id="cn-hist" onclick="chartView('hist')">📈 History</button>
+    <button class="btn btn-sm" style="margin-left:auto" onclick="refreshChartView()">🔄 Refresh</button>
+  </div>
+
+  <!-- ── LIVE ─────────────────────────────────────────────────────────── -->
+  <div id="cv-live">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:.6rem;margin-bottom:.8rem">
+      <!-- SOL -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">☀️</div>
+        <div id="lv-solar-w" style="font-size:1.3rem;font-weight:700;color:#facc15;line-height:1.2">—</div>
+        <div id="lv-solar-avg" style="font-size:.65rem;color:#a16207;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem">Solar</div>
+      </div>
+      <!-- RED -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">⚡</div>
+        <div id="lv-grid-w" style="font-size:1.3rem;font-weight:700;line-height:1.2">—</div>
+        <div id="lv-grid-avg" style="font-size:.65rem;color:var(--m);margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-grid-dir">Red</span></div>
+      </div>
+      <!-- BAT -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">🔋</div>
+        <div id="lv-bat-w" style="font-size:1.3rem;font-weight:700;line-height:1.2;color:#a78bfa">—</div>
+        <div id="lv-bat-avg" style="font-size:.65rem;color:#7c3aed;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem"><span id="lv-bat-dir">Bat</span> · <span id="lv-bat-soc" style="color:var(--g)">—</span></div>
+      </div>
+      <!-- CASA -->
+      <div class="card" style="text-align:center;padding:.7rem .5rem">
+        <div style="font-size:1.4rem">🏠</div>
+        <div id="lv-house-w" style="font-size:1.3rem;font-weight:700;color:#f97316;line-height:1.2">—</div>
+        <div id="lv-house-avg" style="font-size:.65rem;color:#c2410c;margin-top:.1rem">Ø —</div>
+        <div style="font-size:.62rem;color:var(--m);margin-top:.15rem">Casa</div>
+      </div>
     </div>
-    <div class="card">
-      <h2 style="margin-top:0">Solar — last 7 days (kWh)</h2>
-      <canvas id="sol7Chart"></canvas>
+    <!-- SVG energy flow diagram -->
+    <div class="card" style="padding:.7rem 1rem">
+      <svg id="flow-svg" viewBox="0 0 440 270" style="width:100%;max-height:230px;display:block">
+        <!-- Connection lines — endpoints stop at node borders (4px gap) -->
+        <path id="fl-ln-sol-hse" class="fl-ln fl-dim" d="M220,76 L220,146" stroke="#facc15"/>
+        <path id="fl-ln-sol-bat" class="fl-ln fl-dim" d="M187,76 C152,110 114,145 68,168" stroke="#facc15"/>
+        <path id="fl-ln-sol-grd" class="fl-ln fl-dim" d="M253,76 C288,110 326,145 372,168" stroke="#4ade80"/>
+        <path id="fl-ln-bat-hse" class="fl-ln fl-dim" d="M120,198 L148,193" stroke="#a78bfa"/>
+        <path id="fl-ln-grd-hse" class="fl-ln fl-dim" d="M320,198 L292,193" stroke="#f87171"/>
+        <path id="fl-ln-grd-bat" class="fl-ln fl-dim" d="M316,215 C260,252 180,252 124,215" stroke="#f87171"/>
+
+        <!-- Solar node (top center) -->
+        <rect x="165" y="14" width="110" height="58" rx="11" class="fl-node-bg" stroke="#facc15" stroke-width="1.5"/>
+        <text x="220" y="36" text-anchor="middle" font-size="19">☀️</text>
+        <text id="sv-solar-val" x="220" y="53" text-anchor="middle" fill="#facc15" font-size="13" font-weight="700" font-family="sans-serif">—</text>
+        <text x="220" y="66" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">SOLAR</text>
+
+        <!-- House node (center, prominent) -->
+        <rect x="152" y="150" width="136" height="68" rx="13" fill="rgba(249,115,22,.08)" stroke="#f97316" stroke-width="2.5"/>
+        <text x="220" y="174" text-anchor="middle" font-size="22">🏠</text>
+        <text id="sv-house-val" x="220" y="193" text-anchor="middle" fill="#f97316" font-size="15" font-weight="700" font-family="sans-serif">—</text>
+        <text x="220" y="207" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">CONSUMO CASA</text>
+
+        <!-- Battery node (bottom left) -->
+        <rect x="12" y="172" width="112" height="62" rx="11" class="fl-node-bg" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="68" y="194" text-anchor="middle" font-size="18">🔋</text>
+        <text id="sv-bat-val" x="68" y="212" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700" font-family="sans-serif">—</text>
+        <text id="sv-bat-lbl" x="68" y="226" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">—</text>
+
+        <!-- Grid node (bottom right) -->
+        <rect x="316" y="172" width="112" height="62" rx="11" class="fl-node-bg" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="372" y="194" text-anchor="middle" font-size="18">⚡</text>
+        <text id="sv-grid-val" x="372" y="212" text-anchor="middle" fill="#94a3b8" font-size="12" font-weight="700" font-family="sans-serif">—</text>
+        <text id="sv-grid-lbl" x="372" y="226" text-anchor="middle" fill="#64748b" font-size="9" font-family="sans-serif">—</text>
+
+        <!-- Footer: tariff + timestamp -->
+        <text id="sv-tariff" x="110" y="258" text-anchor="middle" fill="#475569" font-size="9" font-family="sans-serif">—</text>
+        <text id="sv-ts"     x="330" y="258" text-anchor="middle" fill="#334155" font-size="9" font-family="sans-serif">—</text>
+        <!-- Imbalance warning (only shown when sensors out of sync) -->
+        <text id="sv-warn"   x="220" y="246" text-anchor="middle" fill="#fb923c" font-size="9" font-weight="600" font-family="sans-serif"></text>
+      </svg>
+    </div>
+    <!-- 7-day averages integrated into cards above -->
+    <!-- SOC bar -->
+    <div class="card" style="margin-top:.7rem">
+      <h2 style="margin-top:0;font-size:.85rem">🔋 Battery SOC — last 24h <span id="soc-mae" style="font-size:.72rem;color:var(--m);font-weight:400"></span></h2>
+      <canvas id="socChart" style="max-height:180px"></canvas>
     </div>
   </div>
-  <div class="card">
-    <h2 style="margin-top:0">Solar production — last 12 months (kWh)</h2>
-    <canvas id="sol12Chart" style="max-height:220px"></canvas>
+
+  <!-- ── DAY ──────────────────────────────────────────────────────────── -->
+  <div id="cv-day" style="display:none">
+    <!-- Date nav -->
+    <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.8rem;flex-wrap:wrap">
+      <button class="btn btn-sm" onclick="dayNav(-1)">←</button>
+      <span id="day-label" style="font-weight:600;font-size:.95rem">—</span>
+      <button class="btn btn-sm" onclick="dayNav(1)">→</button>
+      <button class="btn btn-sm btn-g" onclick="dayNav(0)">Today</button>
+    </div>
+    <!-- KPI row -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;margin-bottom:.8rem" id="day-kpis">
+      <div class="card" style="text-align:center;padding:.6rem" title="Total solar energy captured today.&#10;Ø = all-time daily average (daylight hours only).">
+        <div id="kpi-solar" style="font-size:1.1rem;font-weight:700;color:#facc15">—</div>
+        <div id="kpi-solar-avg" style="font-size:.6rem;color:#a16207;min-height:.8rem"></div>
+        <div style="font-size:.65rem;color:var(--m)">☀️ Solar</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Total house consumption today (solar + battery discharge + grid import).&#10;Ø = all-time daily average.">
+        <div id="kpi-cons" style="font-size:1.1rem;font-weight:700;color:#f97316">—</div>
+        <div id="kpi-cons-avg" style="font-size:.6rem;color:#c2410c;min-height:.8rem"></div>
+        <div style="font-size:.65rem;color:var(--m)">🏠 Consumed</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Solar energy sold to the grid today.&#10;Ø = all-time daily average. High export = room to schedule more loads or charge battery more.">
+        <div id="kpi-exp" style="font-size:1.1rem;font-weight:700;color:#4ade80">—</div>
+        <div id="kpi-exp-avg" style="font-size:.6rem;color:#16a34a;min-height:.8rem"></div>
+        <div style="font-size:.65rem;color:var(--m)">📤 Exported</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Energy bought from the grid today.&#10;Ø = all-time daily average. The optimizer minimises this during peak tariff hours.">
+        <div id="kpi-imp" style="font-size:1.1rem;font-weight:700;color:#f87171">—</div>
+        <div id="kpi-imp-avg" style="font-size:.6rem;color:#dc2626;min-height:.8rem"></div>
+        <div style="font-size:.65rem;color:var(--m)">📥 Imported</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="% of today's consumption covered by solar (direct or via battery).&#10;Ø = all-time average. 100% = zero grid imports.">
+        <div id="kpi-ss" style="font-size:1.1rem;font-weight:700;color:var(--a)">—</div>
+        <div id="kpi-ss-avg" style="font-size:.6rem;color:var(--m);min-height:.8rem"></div>
+        <div style="font-size:.65rem;color:var(--m)">🔄 Self-suff.</div>
+      </div>
+    </div>
+    <!-- Stacked hourly bar -->
+    <div class="card">
+      <h2 style="margin-top:0;font-size:.85rem">Hourly energy balance (kWh)
+        <span style="font-size:.65rem;color:var(--m);font-weight:400"> above zero = sources · below zero = sinks</span>
+      </h2>
+      <canvas id="dayChart" style="max-height:260px"></canvas>
+    </div>
+    <!-- SOC day -->
+    <div class="card" style="margin-top:.7rem;margin-bottom:1rem">
+      <h2 style="margin-top:0;font-size:.85rem">Battery SOC during the day (%)</h2>
+      <canvas id="socDayChart" style="max-height:160px"></canvas>
+    </div>
   </div>
-  <div class="card" style="margin-bottom:1rem">
-    <h2 style="margin-top:0">Daily savings — last 7 days (€)</h2>
-    <canvas id="savingsChart" style="max-height:180px"></canvas>
+
+  <!-- ── HISTORY ───────────────────────────────────────────────────────── -->
+  <div id="cv-hist" style="display:none">
+    <!-- Average KPI summary row -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem;margin-bottom:.8rem">
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily solar production.&#10;Top = all-time · Bottom = last 12 months.">
+        <div id="hs-solar" style="font-size:1rem;font-weight:700;color:#facc15">—</div>
+        <div id="hs-solar-12m" style="font-size:.6rem;color:#a16207;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">☀️ Solar/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily house consumption (solar + battery discharge + grid import).&#10;Top = all-time · Bottom = last 12 months.">
+        <div id="hs-cons" style="font-size:1rem;font-weight:700;color:#f97316">—</div>
+        <div id="hs-cons-12m" style="font-size:.6rem;color:#c2410c;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">🏠 Consumed/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily energy exported (sold) to the grid.&#10;High values = room to add loads or storage.">
+        <div id="hs-exp" style="font-size:1rem;font-weight:700;color:#4ade80">—</div>
+        <div id="hs-exp-12m" style="font-size:.6rem;color:#16a34a;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">📤 Exported/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average daily energy imported from the grid.&#10;The optimizer minimises peak-tariff imports.">
+        <div id="hs-imp" style="font-size:1rem;font-weight:700;color:#f87171">—</div>
+        <div id="hs-imp-12m" style="font-size:.6rem;color:#dc2626;min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">📥 Imported/day</div>
+      </div>
+      <div class="card" style="text-align:center;padding:.6rem" title="Average % of consumption covered by solar (directly or via battery).&#10;100% = zero grid imports.">
+        <div id="hs-ss" style="font-size:1rem;font-weight:700;color:var(--a)">—</div>
+        <div id="hs-ss-12m" style="font-size:.6rem;color:var(--m);min-height:.8rem"></div>
+        <div style="font-size:.62rem;color:var(--m)">🔄 Self-suff.</div>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h2 style="margin-top:0;font-size:.85rem">☀️ Solar — last 7 days (kWh)</h2>
+        <canvas id="sol7Chart" style="max-height:200px"></canvas>
+      </div>
+      <div class="card">
+        <h2 style="margin-top:0;font-size:.85rem">💰 Daily savings — last 7 days (€)</h2>
+        <canvas id="savingsChart" style="max-height:200px"></canvas>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:.7rem">
+      <h2 style="margin-top:0;font-size:.85rem">📅 Solar production — last 12 months (kWh)</h2>
+      <canvas id="sol12Chart" style="max-height:220px"></canvas>
+    </div>
+    <!-- ROI Calculator -->
+    <div class="card" style="margin-bottom:1rem">
+      <h2 style="margin-top:0;font-size:.85rem">🔋 Battery expansion — ROI calculator</h2>
+      <div style="font-size:.72rem;color:var(--m);margin-bottom:.8rem">
+        Based on your actual average daily savings. Enter the cost and capacity of additional storage to estimate payback time.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.6rem">
+        <div>
+          <label style="font-size:.72rem;color:var(--m);display:block;margin-bottom:.25rem">Battery cost (€)</label>
+          <input id="roi-cost" type="number" min="100" step="100" value="3000"
+            style="background:var(--b);border:1px solid #475569;border-radius:.35rem;padding:.3rem .6rem;color:var(--t);font-size:.85rem;width:100%;box-sizing:border-box"
+            oninput="calcROI()">
+        </div>
+        <div>
+          <label style="font-size:.72rem;color:var(--m);display:block;margin-bottom:.25rem">Additional capacity (kWh)</label>
+          <input id="roi-kwh" type="number" min="1" max="50" step="0.5" value="5"
+            style="background:var(--b);border:1px solid #475569;border-radius:.35rem;padding:.3rem .6rem;color:var(--t);font-size:.85rem;width:100%;box-sizing:border-box"
+            oninput="calcROI()">
+        </div>
+      </div>
+      <div id="roi-result" style="font-size:.8rem;line-height:1.8;background:rgba(74,222,128,.05);border:1px solid #1e3a2f;border-radius:.5rem;padding:.7rem .9rem;display:none"></div>
+    </div>
   </div>
-  <div class="actions"><button class="btn btn-sm" onclick="loadCharts()">🔄 Refresh</button></div>
 </div>
 
 <!-- TARIFF -->
@@ -1503,6 +2092,33 @@ th{color:var(--m);font-weight:500}
     </div>
   </div>
   <div class="setup-section">
+    <h3>🔋 Battery health mode</h3>
+    <div style="font-size:.72rem;color:var(--m);margin-bottom:.8rem">
+      Controls the SOC operating range. A tighter range reduces deep discharge stress and extends battery lifetime, at a small cost in daily savings capacity.
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem">
+      <button id="hm-bill" class="btn hm-btn" onclick="setHealthMode('bill_reducer')"
+        title="SOC 10–95%. Uses full battery capacity. Best for minimising electricity bill.">
+        <div style="font-size:1.1rem">⚡</div>
+        <div style="font-size:.75rem;font-weight:700;margin:.15rem 0">Bill Reducer</div>
+        <div style="font-size:.63rem;color:var(--m)">10% – 95%</div>
+      </button>
+      <button id="hm-opt" class="btn hm-btn" onclick="setHealthMode('optimized')"
+        title="SOC 20–90%. Balanced: ~95% of savings benefit with moderate cycle protection.">
+        <div style="font-size:1.1rem">⚖️</div>
+        <div style="font-size:.75rem;font-weight:700;margin:.15rem 0">Optimized</div>
+        <div style="font-size:.63rem;color:var(--m)">20% – 90%</div>
+      </button>
+      <button id="hm-guard" class="btn hm-btn" onclick="setHealthMode('battery_guard')"
+        title="SOC 25–85%. Prioritises battery longevity. Recommended for batteries older than 3 years.">
+        <div style="font-size:1.1rem">🛡️</div>
+        <div style="font-size:.75rem;font-weight:700;margin:.15rem 0">Battery Guard</div>
+        <div style="font-size:.63rem;color:var(--m)">25% – 85%</div>
+      </button>
+    </div>
+    <div style="font-size:.7rem;color:var(--m);margin-top:.5rem;min-height:1.1rem" id="hm-desc"></div>
+  </div>
+  <div class="setup-section">
     <h3>🔋 Battery thresholds</h3>
     <div class="setup-grid">
       <div>
@@ -1554,18 +2170,111 @@ th{color:var(--m);font-weight:500}
     <button class="btn btn-sm" id="btn-ds-test" onclick="testDataSources()">🔍 Test connections</button>
     <div id="ds-result" style="margin-top:.7rem;font-size:.78rem;line-height:1.7"></div>
   </div>
+
+  <!-- DEBUG SECTION -->
+  <div class="setup-section" style="margin-top:1rem" id="dbg-section">
+    <h3>🐛 Debug — sensor resolution</h3>
+    <div style="font-size:.72rem;color:var(--m);margin-bottom:.5rem">
+      Shows how each sensor role resolves: wizard config → addon options → hardcoded fallback.
+      Use this to diagnose why a sensor shows 0 or unavailable.
+    </div>
+    <button class="btn btn-sm" onclick="loadDebugSensors()">🔄 Refresh</button>
+    <div id="dbg-result" style="margin-top:.7rem;overflow-x:auto"></div>
+  </div>
 </div>
 
 <!-- WIZARD -->
 <div id="tab-wizard" class="tab-content">
-  <div class="wiz-wrap">
+  <div class="wiz-wrap" id="wiz-wrap">
     <div class="wiz-header">Setup Wizard</div>
-    <div class="wiz-subtitle" id="wiz-sub">Configure your installation so the optimizer knows your hardware</div>
-    <div class="wiz-steps" id="wiz-dots"></div>
+    <div class="wiz-subtitle">Configure your installation — the optimizer adapts to your hardware automatically</div>
 
-    <!-- Step 0: Location -->
+    <!-- Mode toggle -->
+    <div class="wiz-mode-bar">
+      <span class="wiz-mode-label">Assistant:</span>
+      <!-- Mode toggle removed: always full-control (Nexus) mode -->
+    </div>
+
+    <!-- Data Quality thermometer -->
+    <div class="dq-wrap">
+      <span class="dq-label">📊 Data quality</span>
+      <div class="dq-track"><div class="dq-fill" id="dq-fill" style="width:0%"></div></div>
+      <span class="dq-score" id="dq-score" style="color:#ef4444">0%</span>
+    </div>
+
+    <div class="wiz-steps" id="wiz-dots"></div>
+    <!-- Global navigation bar — updated by _wizNavUpdate() on every step change -->
+    <div id="wiz-nav" class="wiz-nav" style="margin-bottom:.9rem"></div>
+
+    <!-- ── Step 0: Data Sources ─────────────────────────────────────────── -->
     <div class="wiz-pane active" id="wiz-pane-0">
-      <div class="bubble">Hey! I'm Bolt, your energy assistant. Let me help you configure everything in a few quick steps. First — where is your home?</div>
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Hey! I'm Bolt. First things first — where does your Home Assistant store history? More data = smarter predictions!
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Initializing data pipeline. The prediction engine performs significantly better with long-term time-series data from InfluxDB (60+ days). HA Recorder is the fallback (14 days). Configure your source carefully.
+        </div>
+      </div>
+      <div class="wiz-card">
+        <div class="wiz-card-title">💾 History &amp; Data Source</div>
+        <div class="wiz-robot">💾</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.8rem">
+          <div class="hw-card" id="ds-card-influx" data-ds="influxdb" onclick="wizSelectDS('influxdb')" style="border-color:var(--g);background:rgba(74,222,128,.06)">
+            <div class="hw-icon">🗄️</div>
+            <div class="hw-name">InfluxDB</div>
+            <div class="hw-desc">60+ days, best accuracy</div>
+          </div>
+          <div class="hw-card" id="ds-card-ha" data-ds="ha_recorder" onclick="wizSelectDS('ha_recorder')">
+            <div class="hw-icon">🏠</div>
+            <div class="hw-name">HA Recorder</div>
+            <div class="hw-desc">Up to 14 days, always available</div>
+          </div>
+        </div>
+        <!-- Already-connected banner (shown when host is saved + tested OK) -->
+        <div id="wiz-influx-ok" style="display:none;background:rgba(74,222,128,.08);border:1px solid rgba(74,222,128,.3);border-radius:.5rem;padding:.6rem .8rem;margin-bottom:.6rem;align-items:center;justify-content:space-between;gap:.6rem">
+          <div>
+            <span style="color:var(--g);font-weight:600">✓ Connected</span>
+            <span id="wiz-influx-ok-detail" style="font-size:.72rem;color:var(--m);margin-left:.5rem">—</span>
+          </div>
+          <button class="btn btn-sm" onclick="wizInfluxEdit()" style="flex-shrink:0">✏️ Edit</button>
+        </div>
+        <div id="wiz-influx-fields" style="display:none">
+          <div style="display:grid;grid-template-columns:1fr auto;gap:.5rem;margin-bottom:.4rem">
+            <div class="wiz-field"><label>Host / IP</label><input type="text" id="wiz-influx-host" placeholder="172.30.32.1"></div>
+            <div class="wiz-field"><label>Port</label><input type="number" id="wiz-influx-port" value="8086" style="width:80px"></div>
+          </div>
+          <div class="wiz-field" style="margin-bottom:.4rem"><label>Database</label><input type="text" id="wiz-influx-db" placeholder="homeassistant"></div>
+          <div class="wiz-field" style="margin-bottom:.4rem"><label>Username</label><input type="text" id="wiz-influx-user" placeholder="(leave blank if none)" autocomplete="off"></div>
+          <div class="wiz-field" style="margin-bottom:.6rem"><label>Password</label><input type="password" id="wiz-influx-pass" placeholder="(leave blank if none)"></div>
+          <button class="btn btn-sm" onclick="wizTestInflux()" id="btn-test-influx">🔌 Test connection</button>
+          <span id="wiz-influx-status" style="font-size:.72rem;margin-left:.5rem;color:var(--m)"></span>
+        </div>
+      </div>
+      <div class="wiz-nav">
+        <span class="wiz-progress">Step 1 of 8</span>
+        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+      </div>
+    </div>
+
+    <!-- ── Step 1: Location ─────────────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-1">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Where is your home? I need this to calculate solar angles and sunrise/sunset times accurately.
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Geographic coordinates are used for solar elevation geometry — the ML model uses a continuous solar proxy derived from the exact sun angle at your latitude. Precision matters here.
+        </div>
+      </div>
       <div class="wiz-card">
         <div class="wiz-card-title">📍 Location</div>
         <div class="wiz-robot">🤖</div>
@@ -1580,211 +2289,327 @@ th{color:var(--m);font-weight:500}
         <div id="wiz-loc-status" style="font-size:.72rem;color:var(--m);margin-top:.3rem"></div>
       </div>
       <div class="wiz-nav">
-        <span class="wiz-progress">Step 1 of 7</span>
+        <button class="comic-btn back" onclick="wizBack()">← Back</button>
+        <span class="wiz-progress">Step 2 of 8</span>
         <button class="comic-btn next" onclick="wizNext()">Next →</button>
       </div>
     </div>
 
-    <!-- Step 1: Grid -->
-    <div class="wiz-pane" id="wiz-pane-1">
-      <div class="bubble">Great! Now let's find your grid connection sensor — this measures what you import/export from the utility.</div>
+    <!-- ── Step 2: Grid ─────────────────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-2">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Let's find your grid meter — the sensor that measures what you import and export from the utility.
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          The primary grid sensor provides the net import/export signal. Additional sub-meters for high-consumption devices (HVAC, EV, pool) feed the ML feature set and improve per-device predictions. Add as many as you have.
+        </div>
+      </div>
       <div class="wiz-card">
         <div class="wiz-card-title">⚡ Grid Power Meter</div>
-        <div class="wiz-robot">🤖</div>
+        <div class="wiz-robot">⚡</div>
         <div class="entity-picker">
-          <div class="entity-picker-label">Grid power sensor (W, positive = import) <span id="wiz-grid-score"></span></div>
-          <input class="entity-select" id="wiz-grid-entity" placeholder="sensor.grid_power" oninput="wizEntityTyped('grid_power','wiz-grid-entity')">
+          <div class="entity-picker-label">
+            Main grid sensor (W — import/export)
+            <span id="wiz-grid-status"></span>
+          </div>
+          <input class="entity-select" id="wiz-grid-entity" placeholder="sensor.grid_power" oninput="wizEntityTyped('grid_power','wiz-grid-entity','wiz-grid-status','wiz-grid-state')">
           <div id="wiz-grid-cands" class="entity-cands"></div>
           <div id="wiz-grid-state" class="entity-state"></div>
         </div>
-        <div style="font-size:.72rem;color:var(--m)">Sign convention: negative = importing from grid, positive = exporting. Set to match your meter.</div>
-        <div style="margin-top:.7rem">
-          <label style="font-size:.72rem;color:var(--m);display:flex;align-items:center;gap:.5rem">
-            <input type="checkbox" id="wiz-grid-flip" style="accent-color:var(--a)"> Flip sign (multiply by -1)
-          </label>
+        <div style="font-size:.72rem;color:var(--m);margin-bottom:.5rem">Sign convention: <strong>negative = importing from grid</strong>, positive = exporting.</div>
+        <label style="font-size:.72rem;color:var(--m);display:flex;align-items:center;gap:.5rem;margin-bottom:.7rem">
+          <input type="checkbox" id="wiz-grid-flip" style="accent-color:var(--a)"> Flip sign (multiply by −1)
+        </label>
+        <!-- Advanced: sub-meters -->
+        <div class="adv-only">
+          <div style="font-size:.75rem;font-weight:600;color:var(--a);margin-bottom:.4rem">Additional power meters <span style="font-size:.62rem;color:var(--m);font-weight:400">(enrich ML predictions)</span></div>
+          <div id="wiz-submeters-list"></div>
+          <button class="btn btn-sm" onclick="wizAddSubmeter()" style="margin-top:.2rem">+ Add meter</button>
         </div>
       </div>
       <div class="wiz-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 2 of 7</span>
+        <span class="wiz-progress">Step 3 of 8</span>
         <button class="comic-btn next" onclick="wizNext()">Next →</button>
       </div>
     </div>
 
-    <!-- Step 2: Solar -->
-    <div class="wiz-pane" id="wiz-pane-2">
-      <div class="bubble">Do you have solar panels? Let's find the production sensors and forecast data.</div>
+    <!-- ── Step 3: Solar ────────────────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-3">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Do you have solar panels? Let's connect your production sensor and forecast data.
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Real-time production feeds the energy balance equation. Hourly forecasts (Forecast.Solar / Solcast) are used by the optimizer to pre-charge the battery before expected low-solar periods. All four forecast horizons improve decisions.
+        </div>
+      </div>
       <div class="wiz-card">
         <div class="wiz-card-title">☀️ Solar</div>
-        <div class="wiz-robot">🤖</div>
+        <div class="wiz-robot">☀️</div>
         <div class="entity-picker">
-          <div class="entity-picker-label">Solar production (W, real-time)</div>
-          <input class="entity-select" id="wiz-solar-entity" placeholder="sensor.solar_power" oninput="wizEntityTyped('solar_power','wiz-solar-entity')">
+          <div class="entity-picker-label">Solar production (W, real-time) <span id="wiz-solar-status"></span></div>
+          <input class="entity-select" id="wiz-solar-entity" placeholder="sensor.solar_power" oninput="wizEntityTyped('solar_power','wiz-solar-entity','wiz-solar-status','wiz-solar-state')">
           <div id="wiz-solar-cands" class="entity-cands"></div>
           <div id="wiz-solar-state" class="entity-state"></div>
         </div>
         <div class="entity-picker">
-          <div class="entity-picker-label">Forecast — today (kWh) <span style="color:var(--m);font-size:.65rem">Forecast.Solar / Solcast</span></div>
-          <input class="entity-select" id="wiz-fc-today" placeholder="sensor.energy_production_today" oninput="wizEntityTyped('solar_fc_today','wiz-fc-today')">
+          <div class="entity-picker-label">Forecast — today (kWh) <span style="color:var(--m);font-size:.62rem">Forecast.Solar / Solcast</span></div>
+          <input class="entity-select" id="wiz-fc-today" placeholder="sensor.energy_production_today" oninput="wizEntityTyped('solar_fc_today','wiz-fc-today',null,null)">
           <div id="wiz-fc-today-cands" class="entity-cands"></div>
         </div>
-        <div class="entity-picker">
-          <div class="entity-picker-label">Forecast — tomorrow (kWh)</div>
-          <input class="entity-select" id="wiz-fc-tomorrow" placeholder="sensor.energy_production_tomorrow">
-          <div id="wiz-fc-tomorrow-cands" class="entity-cands"></div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+        <!-- Advanced: hourly forecasts -->
+        <div class="adv-only">
           <div class="entity-picker">
-            <div class="entity-picker-label">Forecast — current hour</div>
-            <input class="entity-select" id="wiz-fc-h0" placeholder="sensor.energy_current_hour">
-            <div id="wiz-fc-h0-cands" class="entity-cands"></div>
+            <div class="entity-picker-label">Forecast — tomorrow (kWh)</div>
+            <input class="entity-select" id="wiz-fc-tomorrow" placeholder="sensor.energy_production_tomorrow">
+            <div id="wiz-fc-tomorrow-cands" class="entity-cands"></div>
           </div>
-          <div class="entity-picker">
-            <div class="entity-picker-label">Forecast — next hour</div>
-            <input class="entity-select" id="wiz-fc-h1" placeholder="sensor.energy_next_hour">
-            <div id="wiz-fc-h1-cands" class="entity-cands"></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+            <div class="entity-picker">
+              <div class="entity-picker-label">Forecast — current hour</div>
+              <input class="entity-select" id="wiz-fc-h0" placeholder="sensor.energy_current_hour">
+              <div id="wiz-fc-h0-cands" class="entity-cands"></div>
+            </div>
+            <div class="entity-picker">
+              <div class="entity-picker-label">Forecast — next hour</div>
+              <input class="entity-select" id="wiz-fc-h1" placeholder="sensor.energy_next_hour">
+              <div id="wiz-fc-h1-cands" class="entity-cands"></div>
+            </div>
           </div>
         </div>
-        <div style="font-size:.72rem;color:var(--m);margin-top:.5rem">Forecast sensors are optional but improve charging decisions.</div>
+        <div style="font-size:.7rem;color:var(--m);margin-top:.3rem">Forecast sensors are optional but significantly improve charging decisions.</div>
       </div>
       <div class="wiz-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 3 of 7</span>
+        <span class="wiz-progress">Step 4 of 8</span>
         <button class="comic-btn next" onclick="wizNext()">Next →</button>
       </div>
     </div>
 
-    <!-- Step 3: Battery -->
-    <div class="wiz-pane" id="wiz-pane-3">
-      <div class="bubble">Battery storage is where the magic happens! Let's map your battery sensors and controls.</div>
+    <!-- ── Step 4: Battery ──────────────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-4">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Battery storage is where the magic happens! Map your SOC sensor and I'll handle the rest.
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Battery control requires SOC + power for monitoring, plus the mode select and cutoff entities for active management. Force-charge switch activates pre-emptive grid charging before peak tariff windows. If auto-detection fails, all switches are listed below.
+        </div>
+      </div>
       <div class="wiz-card">
         <div class="wiz-card-title">🔋 Battery</div>
-        <div class="wiz-robot">🤖</div>
+        <div class="wiz-robot">🔋</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
           <div class="entity-picker">
-            <div class="entity-picker-label">State of charge (%)</div>
-            <input class="entity-select" id="wiz-batt-soc" placeholder="sensor.battery_state_of_capacity" oninput="wizEntityTyped('battery_soc','wiz-batt-soc')">
+            <div class="entity-picker-label">State of charge (%) <span id="wiz-batt-soc-status"></span></div>
+            <input class="entity-select" id="wiz-batt-soc" placeholder="sensor.battery_state_of_capacity" oninput="wizEntityTyped('battery_soc','wiz-batt-soc','wiz-batt-soc-status','wiz-batt-soc-state')">
             <div id="wiz-batt-soc-cands" class="entity-cands"></div>
             <div id="wiz-batt-soc-state" class="entity-state"></div>
           </div>
-          <div class="entity-picker">
-            <div class="entity-picker-label">Power (W, negative=charging)</div>
-            <input class="entity-select" id="wiz-batt-power" placeholder="sensor.battery_charge_discharge_power" oninput="wizEntityTyped('battery_power','wiz-batt-power')">
+          <div id="wiz-batt-power-row" class="entity-picker">
+            <div class="entity-picker-label">Power (W, negative=charging) <span id="wiz-batt-pow-status"></span></div>
+            <input class="entity-select" id="wiz-batt-power" placeholder="sensor.battery_charge_discharge_power" oninput="wizEntityTyped('battery_power','wiz-batt-power','wiz-batt-pow-status',null)">
             <div id="wiz-batt-power-cands" class="entity-cands"></div>
           </div>
         </div>
-        <div style="font-size:.75rem;color:var(--a);font-weight:600;margin:.7rem 0 .4rem">Control entities (Huawei Luna2000 / SolarEdge / generic)</div>
-        <div class="entity-picker">
-          <div class="entity-picker-label">Working mode select</div>
-          <input class="entity-select" id="wiz-batt-mode" placeholder="select.battery_working_mode" oninput="wizEntityTyped('battery_mode_select','wiz-batt-mode')">
-          <div id="wiz-batt-mode-cands" class="entity-cands"></div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem">
+        <label style="font-size:.72rem;color:var(--m);display:flex;align-items:center;gap:.5rem;margin:.4rem 0">
+          <input type="checkbox" id="wiz-batt-split" style="accent-color:var(--a)" onchange="wizToggleBattSplit()">
+          Split sensors — my inverter exposes separate charge and discharge entities (Deye, Solarman, Fronius…)
+        </label>
+        <div id="wiz-batt-split-row" style="display:none;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.3rem">
           <div class="entity-picker">
-            <div class="entity-picker-label">Charge cutoff SOC</div>
-            <input class="entity-select" id="wiz-batt-cutoff" placeholder="number.battery_grid_charge_cutoff_soc">
-            <div id="wiz-batt-cutoff-cands" class="entity-cands"></div>
+            <div class="entity-picker-label">Charge power (W, always ≥ 0) <span id="wiz-batt-chg-status"></span></div>
+            <input class="entity-select" id="wiz-batt-chg" placeholder="sensor.battery_charge_power"
+              oninput="wizEntityTyped('battery_charge_entity','wiz-batt-chg','wiz-batt-chg-status',null)">
+            <div id="wiz-batt-chg-cands" class="entity-cands"></div>
           </div>
           <div class="entity-picker">
-            <div class="entity-picker-label">Backup SOC</div>
-            <input class="entity-select" id="wiz-batt-backup" placeholder="number.battery_backup_soc">
-            <div id="wiz-batt-backup-cands" class="entity-cands"></div>
-          </div>
-          <div class="entity-picker">
-            <div class="entity-picker-label">Force charge switch</div>
-            <input class="entity-select" id="wiz-batt-force" placeholder="switch.battery_force_charge">
-            <div id="wiz-batt-force-cands" class="entity-cands"></div>
+            <div class="entity-picker-label">Discharge power (W, always ≥ 0) <span id="wiz-batt-dis-status"></span></div>
+            <input class="entity-select" id="wiz-batt-dis" placeholder="sensor.battery_discharge_power"
+              oninput="wizEntityTyped('battery_discharge_entity','wiz-batt-dis','wiz-batt-dis-status',null)">
+            <div id="wiz-batt-dis-cands" class="entity-cands"></div>
           </div>
         </div>
-        <div style="margin-top:.6rem">
+        <div style="margin-bottom:.5rem">
           <label style="font-size:.72rem;color:var(--m)">Battery capacity (kWh)</label>
           <input type="number" id="wiz-batt-cap" value="10" min="1" max="100" step="0.5" style="width:100px;background:var(--b);border:2px solid #475569;border-radius:.4rem;padding:.35rem .5rem;color:var(--t);font-size:.85rem;margin-top:.2rem">
         </div>
+        <!-- Advanced: control entities -->
+        <div class="adv-only">
+          <div style="font-size:.75rem;font-weight:600;color:var(--a);margin:.6rem 0 .4rem">Control entities — Huawei Luna2000 / SolarEdge / generic</div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Working mode select <span id="wiz-batt-mode-status"></span></div>
+            <input class="entity-select" id="wiz-batt-mode" placeholder="select.battery_working_mode" oninput="wizEntityTyped('battery_mode_select','wiz-batt-mode','wiz-batt-mode-status',null)">
+            <div id="wiz-batt-mode-cands" class="entity-cands"></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+            <div class="entity-picker">
+              <div class="entity-picker-label">Charge cutoff SOC <span id="wiz-batt-cutoff-status"></span></div>
+              <input class="entity-select" id="wiz-batt-cutoff" placeholder="number.battery_grid_charge_cutoff_soc" oninput="wizEntityTyped('battery_cutoff_soc','wiz-batt-cutoff','wiz-batt-cutoff-status',null)">
+              <div id="wiz-batt-cutoff-cands" class="entity-cands"></div>
+            </div>
+            <div class="entity-picker">
+              <div class="entity-picker-label">Backup SOC <span id="wiz-batt-backup-status"></span></div>
+              <input class="entity-select" id="wiz-batt-backup" placeholder="number.battery_backup_soc" oninput="wizEntityTyped('battery_backup_soc','wiz-batt-backup','wiz-batt-backup-status',null)">
+              <div id="wiz-batt-backup-cands" class="entity-cands"></div>
+            </div>
+          </div>
+          <div class="entity-picker">
+            <div class="entity-picker-label">Force charge switch <span id="wiz-batt-force-status"></span></div>
+            <input class="entity-select" id="wiz-batt-force" placeholder="switch.battery_force_charge" oninput="wizEntityTyped('battery_force_charge','wiz-batt-force','wiz-batt-force-status',null)">
+            <div id="wiz-batt-force-cands" class="entity-cands"></div>
+            <div style="font-size:.65rem;color:var(--m);margin-top:.2rem">If no candidates shown, all available switches are listed — pick yours manually.</div>
+          </div>
+        </div>
       </div>
       <div class="wiz-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 4 of 7</span>
+        <span class="wiz-progress">Step 5 of 8</span>
         <button class="comic-btn next" onclick="wizNext()">Next →</button>
       </div>
     </div>
 
-    <!-- Step 4: Loads -->
-    <div class="wiz-pane" id="wiz-pane-4">
-      <div class="bubble">Which devices do you want me to manage? Select all that apply, then I'll find the right entities.</div>
+    <!-- ── Step 5: Loads ────────────────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-5">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Which devices should I manage? Select all that apply and I'll find the entities automatically.
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Each HVAC zone can have independent climate entities, temperature sensors, and a full 24h schedule with three setpoint tiers: Comfort (optimal), Surplus (boost when solar overproduces), Minimum (low-tariff floor). Appliances support state sensors, power meters, and schedule windows.
+        </div>
+      </div>
       <div class="hw-grid" id="wiz-hw-grid">
         <div class="hw-card selected" data-hw="hvac" onclick="wizToggleHw(this)">
-          <div class="hw-icon">🌡️</div>
-          <div class="hw-name">Heat Pump</div>
-          <div class="hw-desc">Aerotermia / HVAC</div>
+          <div class="hw-icon">🌡️</div><div class="hw-name">HVAC</div><div class="hw-desc">Heat pump / AC zones</div>
         </div>
         <div class="hw-card selected" data-hw="pool" onclick="wizToggleHw(this)">
-          <div class="hw-icon">🏊</div>
-          <div class="hw-name">Pool</div>
-          <div class="hw-desc">Filter pump + cleaner</div>
-        </div>
-        <div class="hw-card" data-hw="ev" onclick="wizToggleHw(this)">
-          <div class="hw-icon">🚗</div>
-          <div class="hw-name">EV Charger</div>
-          <div class="hw-desc">Wallbox / OCPP</div>
+          <div class="hw-icon">🏊</div><div class="hw-name">Pool</div><div class="hw-desc">Filter + cleaner</div>
         </div>
         <div class="hw-card" data-hw="dishwasher" onclick="wizToggleHw(this)">
-          <div class="hw-icon">🍽️</div>
-          <div class="hw-name">Dishwasher</div>
-          <div class="hw-desc">Delay start</div>
+          <div class="hw-icon">🍽️</div><div class="hw-name">Dishwasher</div><div class="hw-desc">Smart scheduling</div>
+        </div>
+        <div class="hw-card" data-hw="washer" onclick="wizToggleHw(this)">
+          <div class="hw-icon">👕</div><div class="hw-name">Washer</div><div class="hw-desc">Washing machine</div>
+        </div>
+        <div class="hw-card" data-hw="dryer" onclick="wizToggleHw(this)">
+          <div class="hw-icon">🌀</div><div class="hw-name">Dryer</div><div class="hw-desc">Tumble dryer</div>
+        </div>
+        <div class="hw-card" data-hw="ev" onclick="wizToggleHw(this)">
+          <div class="hw-icon">🚗</div><div class="hw-name">EV Charger</div><div class="hw-desc">Wallbox / OCPP</div>
+        </div>
+        <div class="hw-card" data-hw="custom" onclick="wizToggleHw(this)">
+          <div class="hw-icon">⚙️</div><div class="hw-name">Custom</div><div class="hw-desc">Any switch load</div>
         </div>
       </div>
       <div id="wiz-loads-entities"></div>
-      <div class="wiz-nav">
+      <div class="wiz-nav" id="wiz-loads-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 5 of 7</span>
-        <button class="comic-btn next" onclick="wizNext()">Next →</button>
+        <span class="wiz-progress" id="wiz-loads-progress">Step 6 of 8</span>
+        <button class="comic-btn next" onclick="wizLoadsNext()">Next →</button>
       </div>
     </div>
 
-    <!-- Step 5: Tariff -->
-    <div class="wiz-pane" id="wiz-pane-5">
-      <div class="bubble">Tell me about your electricity contract. I'll optimize charging around your pricing periods.</div>
+    <!-- ── Step 6: Tariff ───────────────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-6">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Tell me about your electricity contract. I'll optimize battery charging around your pricing periods.
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Currently locked to Spain 2.0TD (P1/P2/P3 + excedentes). A global tariff sub-assistant supporting PVPC, flat-rate, TOU, and export pricing is planned for v3.1. Fine-tune the exact schedule in the Tariff tab after this wizard.
+        </div>
+      </div>
       <div class="wiz-card">
         <div class="wiz-card-title">💶 Electricity Tariff</div>
-        <div class="wiz-robot">🤖</div>
+        <div class="wiz-robot">💶</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-bottom:.8rem">
           <div class="wiz-field"><label>Contracted power (kW)</label>
             <input type="number" id="wiz-contracted-kw" value="5.75" step="0.25" min="1" max="30">
           </div>
-          <div class="wiz-field"><label>Country / tariff type</label>
+          <div class="wiz-field"><label>Tariff type</label>
             <select id="wiz-tariff-type" class="entity-select" style="margin-bottom:0">
-              <option value="es_2td">Spain 2.0TD</option>
-              <option value="es_pvpc">Spain PVPC (dynamic)</option>
-              <option value="custom">Custom</option>
+              <option value="es_2td">Spain 2.0TD (active)</option>
+              <option value="es_pvpc" disabled>Spain PVPC — coming in v3.1</option>
+              <option value="custom" disabled>Custom — coming in v3.1</option>
             </select>
           </div>
         </div>
-        <div style="font-size:.72rem;color:var(--m)">Peak / valley schedule can be fine-tuned in the Tariff tab after setup.</div>
-        <div style="margin-top:.8rem">
-          <label style="font-size:.72rem;color:var(--m)">Weather entity (for storm protection)</label>
-          <input class="entity-select" id="wiz-weather" placeholder="weather.aemet" oninput="wizEntityTyped('weather','wiz-weather')" style="margin-top:.3rem">
+        <div style="margin-bottom:.5rem">
+          <div class="tariff-note" style="margin-bottom:.4rem">Click a day to toggle all-day valley (green = cheap all day). Click hours to cycle: <span class="badge valley">valley</span> → <span class="badge mid">mid</span> → <span class="badge peak">peak</span>.</div>
+          <div class="day-row" id="wiz-tariff-days"></div>
+          <div class="timeline" id="wiz-tariff-timeline" style="margin:.5rem 0"></div>
+          <div class="price-grid">
+            <div class="price-field"><label>Peak (€/kWh)</label><input id="wiz-p-peak" type="number" step="0.01" min="0"></div>
+            <div class="price-field"><label>Mid (€/kWh)</label><input id="wiz-p-mid" type="number" step="0.01" min="0"></div>
+            <div class="price-field"><label>Valley (€/kWh)</label><input id="wiz-p-valley" type="number" step="0.01" min="0"></div>
+            <div class="price-field"><label>Export (€/kWh)</label><input id="wiz-p-export" type="number" step="0.01" min="0"></div>
+          </div>
+          <button class="btn btn-g btn-sm" style="margin-top:.5rem" onclick="wizSaveTariff()">💾 Save tariff</button>
+        </div>
+        <div>
+          <label style="font-size:.72rem;color:var(--m)">Weather entity (storm protection)</label>
+          <input class="entity-select" id="wiz-weather" placeholder="" oninput="wizEntityTyped('weather','wiz-weather',null,null)" style="margin-top:.3rem">
           <div id="wiz-weather-cands" class="entity-cands" style="margin-top:.3rem"></div>
         </div>
       </div>
       <div class="wiz-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 6 of 7</span>
+        <span class="wiz-progress">Step 7 of 8</span>
         <button class="comic-btn next" onclick="wizNext()">Next →</button>
       </div>
     </div>
 
-    <!-- Step 6: Summary + Save -->
-    <div class="wiz-pane" id="wiz-pane-6">
-      <div class="bubble">Looking great! Here's a summary of your configuration. Hit Save to activate!</div>
+    <!-- ── Step 7: Summary + Save ───────────────────────────────────────── -->
+    <div class="wiz-pane" id="wiz-pane-7">
+      <div class="bubble bolt-bubble">
+        <span class="bub-avatar">🤖</span>
+        <div class="bub-text"><div class="bub-name">Bolt</div>
+          Looking great! Here's your configuration summary. Hit Save to activate — I'll start optimizing immediately!
+        </div>
+      </div>
+      <div class="bubble nexus-bubble">
+        <span class="bub-avatar">⚡</span>
+        <div class="bub-text"><div class="bub-name">Nexus</div>
+          Configuration validated. Committing to wizard_config.json. The optimizer will reload settings on the next cycle. Data quality score will update as entities are confirmed against your history source.
+        </div>
+      </div>
       <div class="wiz-card">
         <div class="wiz-card-title">📋 Summary</div>
-        <div class="wiz-robot">🤖</div>
+        <div class="wiz-robot">📋</div>
         <table class="summary-table" id="wiz-summary-table"></table>
+        <!-- Data quality & prediction forecast -->
+        <div id="wiz-dq-summary" style="margin-top:.8rem;padding:.7rem;background:rgba(56,189,248,.04);border:1px solid rgba(56,189,248,.15);border-radius:.5rem;font-size:.75rem;display:none">
+          <div style="font-weight:600;color:var(--a);margin-bottom:.4rem">📊 Data quality & prediction estimate</div>
+          <div id="wiz-dq-detail" style="color:var(--m);line-height:1.6"></div>
+        </div>
         <div id="wiz-save-status" style="font-size:.78rem;margin-top:.8rem;color:var(--m)"></div>
       </div>
       <div class="wiz-nav">
         <button class="comic-btn back" onclick="wizBack()">← Back</button>
-        <span class="wiz-progress">Step 7 of 7</span>
+        <span class="wiz-progress">Step 8 of 8</span>
         <button class="comic-btn save" onclick="wizSave()">Save &amp; Activate</button>
       </div>
     </div>
@@ -1801,9 +2626,9 @@ function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelector('.tab[onclick="showTab(\''+name+'\')"]').classList.add('active');
   document.getElementById('tab-'+name).classList.add('active');
-  if (name==='charts') loadCharts();
+  if (name==='charts') chartView('live');
   if (name==='tariff') loadTariff();
-  if (name==='setup')  loadSetup();
+  if (name==='setup')  { loadSetup(); loadDebugSensors(); }
   if (name==='wizard') loadWizard();
 }
 
@@ -1892,6 +2717,21 @@ async function saveTariff(){
 let _dirty=false;
 function markDirty(){_dirty=true;document.getElementById('setup-hint').textContent='Unsaved changes';}
 
+let _healthMode='bill_reducer';
+function setHealthMode(m){
+  _healthMode=m;
+  const ids={bill_reducer:'hm-bill',optimized:'hm-opt',battery_guard:'hm-guard'};
+  Object.entries(ids).forEach(([k,id])=>document.getElementById(id)?.classList.toggle('active',k===m));
+  const desc={
+    bill_reducer:  'SOC operates 10%–95%. Maximum daily savings — uses the full battery capacity every cycle.',
+    optimized:     'SOC operates 20%–90%. Sweet spot for most installations: ~95% of savings benefit with moderate cycle protection.',
+    battery_guard: 'SOC operates 25%–85%. Reduces deep discharge stress — recommended for batteries older than 3 years or when longevity is the priority.',
+  };
+  const el=document.getElementById('hm-desc');
+  if(el) el.textContent=desc[m]||'';
+  markDirty();
+}
+
 async function loadSetup(){
   try {
     const s=await fetch(BASE+'/api/setup').then(r=>r.json());
@@ -1907,6 +2747,7 @@ async function loadSetup(){
     set('rng-storm','val-storm',s.battery_storm_threshold??80,'%');
     set('rng-interval','val-interval',s.decision_interval_minutes??15,' min');
     set('rng-batt-cap','val-batt-cap',s.battery_capacity_kwh??10,' kWh');
+    setHealthMode(s.battery_health_mode||'bill_reducer');
     _dirty=false; document.getElementById('setup-hint').textContent='';
   } catch(e){ notify('Error loading setup','err'); }
 }
@@ -1928,6 +2769,7 @@ async function saveSetup(){
         battery_storm_threshold:         parseInt(document.getElementById('rng-storm').value),
         decision_interval_minutes:       parseInt(document.getElementById('rng-interval').value),
         battery_capacity_kwh:            parseFloat(document.getElementById('rng-batt-cap').value),
+        battery_health_mode:             _healthMode,
       })
     }).then(r=>r.json());
     if(r.ok){notify('✓ Settings saved');_dirty=false;document.getElementById('setup-hint').textContent='Saved ✓';}
@@ -1937,85 +2779,332 @@ async function saveSetup(){
 }
 
 // ── Charts ────────────────────────────────────────────────────────────────────
-let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null;
-function mkChart(id,type,labels,datasets,yExtra={},maxH=null){
-  const el=document.getElementById(id); if(!el) return null;
-  if(maxH) el.style.maxHeight=maxH;
-  return new Chart(el.getContext('2d'),{type,data:{labels,datasets},
-    options:{responsive:true,maintainAspectRatio:true,
-      plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-      scales:{x:{ticks:{color:'#94a3b8',maxTicksLimit:10,font:{size:10}},grid:{color:'#334155'}},
-              y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'},...yExtra}}}});
+let socInst=null,sol7Inst=null,sol12Inst=null,savInst=null,pwrInst=null,dayInst=null,socDayInst=null;
+let _chartView='live', _chartDate=new Date().toISOString().slice(0,10), _liveTimer=null;
+
+const CHART_DEFAULTS = {responsive:true,maintainAspectRatio:true,
+  interaction:{mode:'index',intersect:false},
+  plugins:{legend:{labels:{color:'#94a3b8',font:{size:10},boxWidth:10}}},
+  scales:{
+    x:{ticks:{color:'#94a3b8',maxTicksLimit:12,font:{size:9}},grid:{color:'#1e293b'}},
+    y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}
+  }
+};
+
+function _mkOpts(extra={}){
+  const o=JSON.parse(JSON.stringify(CHART_DEFAULTS));
+  if(extra.yMin!==undefined) o.scales.y.min=extra.yMin;
+  if(extra.yMax!==undefined) o.scales.y.max=extra.yMax;
+  if(extra.stacked){ o.scales.y.stacked=true; o.scales.x.stacked=true; }
+  if(extra.tooltip) o.plugins.tooltip=extra.tooltip;
+  return o;
 }
 
-async function loadCharts(){
+function chartView(v){
+  _chartView=v;
+  ['live','day','hist'].forEach(k=>{
+    document.getElementById('cv-'+k).style.display = k===v?'':'none';
+    document.getElementById('cn-'+k).classList.toggle('active', k===v);
+  });
+  if(_liveTimer){ clearInterval(_liveTimer); _liveTimer=null; }
+  if(v==='live'){ loadLive(); _liveTimer=setInterval(loadLive,30000); }
+  else if(v==='day') loadDay(_chartDate);
+  else loadHistory();
+}
+
+function refreshChartView(){ chartView(_chartView); }
+
+// ── LIVE view ─────────────────────────────────────────────────────────────────
+async function loadLive(){
   try {
-    const cd=await fetch(BASE+'/api/chart-data').then(r=>r.json());
-    // Combine past + future labels for x-axis
-    const futureLabels=cd.soc.future_labels||[];
-    const futurePred=cd.soc.future_predicted||[];
-    const nPast=cd.soc.labels.length;
-    const allLabels=[...cd.soc.labels,...futureLabels];
-    // Pad arrays: actual and past-predicted are null in the future segment
-    const actualData=[...cd.soc.actual,...Array(futureLabels.length).fill(null)];
-    const pastPredData=[...(cd.soc.predicted||[]),...Array(futureLabels.length).fill(null)];
-    // Future forecast: null for past segment, values for future
-    const futureData=[...Array(nPast).fill(null),...futurePred];
+    const [s, cd] = await Promise.all([
+      fetch(BASE+'/api/status').then(r=>r.json()),
+      fetch(BASE+'/api/chart-data').then(r=>r.json())
+    ]);
+    const ss = s.sensors||{};
+    const solar  = ss.solar_power  ?? 0;
+    const grid   = ss.grid_power   ?? 0;
+    const bat    = ss.battery_power?? 0;
+    const soc    = ss.battery_soc  ?? 0;
+    // Energy balance: solar = house + bat_charge + grid_export (sign convention bat>0=chg, grid>0=exp).
+    // When sensors disagree (Huawei battery reading lags during transitions / taper near full SOC),
+    // the implied house comes out negative. Detect and fall back to historical baseload so we don't
+    // lie with "0 W" for casa. STALE_TH = 80W tolerates rounding/sampling jitter.
+    const balanceRaw = solar - grid - bat;
+    const STALE_TH   = 80;
+    const stale      = balanceRaw < -STALE_TH;
+    const baselineW  = (s.consumption_baseline_kw ?? 0.5) * 1000;
+    const house      = stale ? Math.max(50, baselineW) : Math.max(0, balanceRaw);
+
+    const fmt = w => Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W';
+
+    document.getElementById('lv-solar-w').textContent = fmt(solar);
+    const lvHouseEl = document.getElementById('lv-house-w');
+    lvHouseEl.textContent = fmt(house) + (stale ? ' ?' : '');
+    lvHouseEl.style.color = stale ? '#fb923c' : '#f97316';
+    lvHouseEl.title = stale ? `Balance: faltan ${Math.round(-balanceRaw)} W. Mostrando estimación (baseload nocturno). Suele resolverse en 1-2 ciclos cuando se actualiza la lectura desfasada (típicamente la batería).` : '';
+    // bat>0=charging(green/+), bat<0=discharging(red/-). Show signed value directly.
+    const batSign = bat > 50 ? '+' : bat < -50 ? '-' : '';
+    const lvBatEl = document.getElementById('lv-bat-w');
+    lvBatEl.textContent = batSign + fmt(Math.abs(bat)) + (stale ? ' ⚠' : '');
+    document.getElementById('lv-bat-soc').textContent  = soc.toFixed(0)+'%';
+    lvBatEl.style.color = stale ? '#fb923c' : (bat>50?'#4ade80':bat<-50?'#f87171':'#a78bfa');
+    lvBatEl.title = stale ? 'Lectura probablemente desfasada (Huawei Luna2000 lagea cerca del 100% SOC). Suele estabilizarse en 1-2 ciclos.' : '';
+    document.getElementById('lv-bat-dir').textContent  = bat>50?'↑ carga':bat<-50?'↓ desc':'idle';
+
+    const gridEl = document.getElementById('lv-grid-w');
+    // Show signed value: + export (green), - import (red)
+    const gridSign = grid > 50 ? '+' : '';
+    gridEl.textContent = gridSign + fmt(Math.abs(grid));
+    gridEl.style.color = grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8';
+    document.getElementById('lv-grid-dir').textContent = grid>50?'↑ venta':grid<-50?'↓ compra':'idle';
+
+    // SVG flow diagram
+    const spd = p => Math.max(0.35, 2.4 - Math.abs(p)/1800)+'s';
+    function setLine(id, on, reverse=false, dur='1.6s'){
+      const el=document.getElementById(id); if(!el) return;
+      if(!on){ el.classList.add('fl-dim'); el.classList.remove('fl-active');
+               el.style.animationDuration=''; el.style.animationDirection=''; return; }
+      el.classList.remove('fl-dim'); el.classList.add('fl-active');
+      el.style.animationDuration=dur; el.style.animationDirection=reverse?'reverse':'normal';
+    }
+    // Convention: bat>0=charging, bat<0=discharging, grid>0=export, grid<0=import.
+    // Conservation in: solar + bat_dis + grid_imp = house + bat_chg + grid_exp = out.
+    // When sensors disagree (stale==true), we trust solar+grid (revenue meter is fast,
+    // inverter direct measurement is fast) and re-derive battery as the residual; this
+    // produces a coherent diagram even when battery_power is lagged.
+    const NOISE = 10;
+    let bat_chg  = Math.max(0,  bat);
+    let bat_dis  = Math.max(0, -bat);
+    if (stale) {
+      const batDerived = solar - grid - house;   // forced by conservation
+      bat_chg = Math.max(0,  batDerived);
+      bat_dis = Math.max(0, -batDerived);
+    }
+    const grid_imp = Math.max(0, -grid);
+    const grid_exp = Math.max(0,  grid);
+    // Priority allocation (sources → sinks): solar→house, bat_dis→house, grid_imp→house,
+    // solar→bat_chg, solar→grid_exp, bat_dis→grid_exp, grid_imp→bat_chg.
+    let rSol = solar, rHse = house, rBatChg = bat_chg, rBatDis = bat_dis,
+        rGrdImp = grid_imp, rGrdExp = grid_exp;
+    const f_sol_hse = Math.min(rSol, rHse);     rSol -= f_sol_hse;    rHse    -= f_sol_hse;
+    const f_bat_hse = Math.min(rBatDis, rHse);  rBatDis -= f_bat_hse; rHse    -= f_bat_hse;
+    const f_grd_hse = Math.min(rGrdImp, rHse);  rGrdImp -= f_grd_hse; rHse    -= f_grd_hse;
+    const f_sol_bat = Math.min(rSol, rBatChg);  rSol -= f_sol_bat;    rBatChg -= f_sol_bat;
+    const f_sol_grd = Math.min(rSol, rGrdExp);  rSol -= f_sol_grd;    rGrdExp -= f_sol_grd;
+    const f_bat_grd = Math.min(rBatDis, rGrdExp); rBatDis -= f_bat_grd; rGrdExp -= f_bat_grd;
+    const f_grd_bat = Math.min(rGrdImp, rBatChg); rGrdImp -= f_grd_bat; rBatChg -= f_grd_bat;
+    // Derived state
+    const charging = bat > 50, discharging = bat < -50;
+    const importing = grid < -50, exporting = grid > 50;
+    // Animate — sol-grd line also carries battery→grid (rare: discharging while exporting)
+    setLine('fl-ln-sol-hse', f_sol_hse > NOISE, false, spd(f_sol_hse));
+    setLine('fl-ln-sol-bat', f_sol_bat > NOISE, false, spd(f_sol_bat));
+    setLine('fl-ln-sol-grd', (f_sol_grd + f_bat_grd) > NOISE, false, spd(f_sol_grd + f_bat_grd));
+    setLine('fl-ln-bat-hse', f_bat_hse > NOISE, false, spd(f_bat_hse));
+    setLine('fl-ln-grd-bat', f_grd_bat > NOISE, false, spd(f_grd_bat));
+    setLine('fl-ln-grd-hse', f_grd_hse > NOISE, false, spd(f_grd_hse));
+
+    document.getElementById('sv-solar-val').textContent = fmt(solar);
+    document.getElementById('sv-house-val').textContent = fmt(house);
+    document.getElementById('sv-bat-val').textContent   = fmt(Math.abs(bat));
+    document.getElementById('sv-bat-lbl').textContent   = soc.toFixed(0)+'% · '+(discharging?'↓ desc':charging?'↑ carga':'idle');
+    const svGridVal=document.getElementById('sv-grid-val');
+    if(svGridVal){svGridVal.textContent=fmt(Math.abs(grid)); svGridVal.setAttribute('fill',grid>50?'#4ade80':grid<-50?'#f87171':'#94a3b8');}
+    document.getElementById('sv-grid-lbl').textContent = exporting?'↑ exportando':importing?'↓ importando':'idle';
+    const tp=s.tariff?.period||'';
+    document.getElementById('sv-tariff').textContent = tp?`${tp} · ${(s.tariff?.price_kwh??0).toFixed(3)} €/kWh`:'';
+    document.getElementById('sv-ts').textContent = new Date().toLocaleTimeString();
+    const warnEl = document.getElementById('sv-warn');
+    if (warnEl) {
+      warnEl.textContent = stale ? `⚠ datos sincronizando · balance Δ ${Math.round(-balanceRaw)} W (lectura desfasada, normal cerca del 100% SOC)` : '';
+    }
+
+    // SOC 24h chart
+    const sdat = cd.soc||{};
+    const futL = sdat.future_labels||[], futP = sdat.future_predicted||[];
+    const nP   = (sdat.labels||[]).length;
+    const allL = [...(sdat.labels||[]),...futL];
+    const actD = [...(sdat.actual||[]),...Array(futL.length).fill(null)];
+    const preD = [...(sdat.predicted||[]),...Array(futL.length).fill(null)];
+    const futD = [...Array(nP).fill(null),...futP];
     if(socInst) socInst.destroy();
-    socInst=new Chart(document.getElementById('socChart').getContext('2d'),{
-      type:'line',
-      data:{labels:allLabels,datasets:[
-        {label:'Actual SOC %',data:actualData,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.08)',fill:true,tension:.3,pointRadius:0},
-        {label:'Predicted (past) %',data:pastPredData,borderColor:'#a78bfa',backgroundColor:'transparent',fill:false,tension:.3,pointRadius:0,borderDash:[4,3]},
-        {label:'Forecast (next 8h) %',data:futureData,borderColor:'#4ade80',backgroundColor:'rgba(74,222,128,.06)',fill:true,tension:.3,pointRadius:0,borderDash:[6,3]},
+    const socCtx = document.getElementById('socChart')?.getContext('2d');
+    if(socCtx) socInst = new Chart(socCtx,{type:'line',
+      data:{labels:allL,datasets:[
+        {label:'Actual %',data:actD,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.08)',fill:true,tension:.3,pointRadius:0},
+        {label:'Predicted %',data:preD,borderColor:'#a78bfa',backgroundColor:'transparent',fill:false,tension:.3,pointRadius:0,borderDash:[4,3]},
+        {label:'Forecast %',data:futD,borderColor:'#4ade80',backgroundColor:'rgba(74,222,128,.06)',fill:true,tension:.3,pointRadius:0,borderDash:[6,3]},
       ]},
-      options:{responsive:true,maintainAspectRatio:true,
-        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-        scales:{
-          x:{ticks:{color:'#94a3b8',maxTicksLimit:10,font:{size:10}},grid:{color:'#334155'}},
-          y:{min:0,max:100,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}
-        }
-      }
+      options:{..._mkOpts({yMin:0,yMax:100}),plugins:{...CHART_DEFAULTS.plugins,
+        tooltip:{callbacks:{label:ctx=>` ${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(1)??''}%`}}}}
     });
     const maeEl=document.getElementById('soc-mae');
-    if(maeEl) maeEl.textContent=cd.soc.mae!=null?`— MAE ${cd.soc.mae}%`:'';
+    if(maeEl) maeEl.textContent=sdat.mae!=null?`— MAE ${sdat.mae}%`:'';
+
+    // 7-day averages row
+    // 7-day W-level averages — integrated into each card
+    const av = cd.averages||{};
+    const fmtW = w => w == null ? '—' : (Math.abs(w) >= 1000 ? (w/1000).toFixed(1)+' kW' : Math.round(w)+' W');
+    const fmtAvg = (v, suffix) => v != null ? `Ø7d ${fmtW(v)}${suffix||''}` : 'Ø7d —';
+    // SOL: avg during solar hours (non-zero samples)
+    const solAvgEl = document.getElementById('lv-solar-avg');
+    if(solAvgEl) solAvgEl.textContent = fmtAvg(av.avg_sol, ' (sol)');
+    // RED: net avg (+ export green, - import red)
+    const redAvgEl = document.getElementById('lv-grid-avg');
+    if(redAvgEl) {
+      redAvgEl.textContent = fmtAvg(av.avg_red);
+      redAvgEl.style.color = av.avg_red > 0 ? '#16a34a' : av.avg_red < 0 ? '#dc2626' : 'var(--m)';
+    }
+    // BAT: net avg (+ charge purple, - discharge light)
+    const batAvgEl = document.getElementById('lv-bat-avg');
+    if(batAvgEl) {
+      batAvgEl.textContent = fmtAvg(av.avg_bat);
+      batAvgEl.style.color = av.avg_bat > 0 ? '#4ade80' : av.avg_bat < 0 ? '#f87171' : 'var(--m)';
+    }
+    // CASA: avg consumption
+    const hsAvgEl = document.getElementById('lv-house-avg');
+    if(hsAvgEl) hsAvgEl.textContent = fmtAvg(av.avg_casa);
+  } catch(e){ console.warn('Live error',e); }
+}
+
+// ── DAY view ──────────────────────────────────────────────────────────────────
+function dayNav(dir){
+  if(dir===0){ _chartDate=new Date().toISOString().slice(0,10); }
+  else {
+    const d=new Date(_chartDate+'T12:00:00');
+    d.setDate(d.getDate()+dir);
+    _chartDate=d.toISOString().slice(0,10);
+  }
+  loadDay(_chartDate);
+}
+
+async function loadDay(date){
+  document.getElementById('day-label').textContent = new Date(date+'T12:00:00').toLocaleDateString(undefined,{weekday:'short',year:'numeric',month:'short',day:'numeric'});
+  try {
+    const cd = await fetch(BASE+'/api/chart-data?date='+date).then(r=>r.json());
+    const h  = cd.hourly||{};
+    const kpi = h.kpi||{};
+
+    // KPIs
+    document.getElementById('kpi-solar').textContent = (kpi.solar_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-cons').textContent  = (kpi.consumption_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-exp').textContent   = (kpi.export_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-imp').textContent   = (kpi.import_kwh??0).toFixed(1)+' kWh';
+    document.getElementById('kpi-ss').textContent    = (kpi.self_sufficiency_pct??0).toFixed(0)+'%';
+
+    // All-time averages below KPI values
+    try {
+      const av=await fetch(BASE+'/api/averages').then(r=>r.json());
+      const at=av.all_time||{};
+      if(at.n_days){
+        const f1=v=>v!=null?'Ø '+v.toFixed(1)+' kWh':'';
+        const fp=v=>v!=null?'Ø '+v.toFixed(0)+'%':'';
+        document.getElementById('kpi-solar-avg').textContent = f1(at.avg_solar_kwh);
+        document.getElementById('kpi-cons-avg').textContent  = f1(at.avg_consumption_kwh);
+        document.getElementById('kpi-exp-avg').textContent   = f1(at.avg_export_kwh);
+        document.getElementById('kpi-imp-avg').textContent   = f1(at.avg_import_kwh);
+        document.getElementById('kpi-ss-avg').textContent    = fp(at.avg_self_sufficiency_pct);
+      }
+    } catch(_){}
+
+    // Stacked hourly bar
+    if(dayInst) dayInst.destroy();
+    const dCtx = document.getElementById('dayChart')?.getContext('2d');
+    if(dCtx && h.labels) {
+      dayInst = new Chart(dCtx,{type:'bar',
+        data:{labels:h.labels, datasets:[
+          {label:'Solar (kWh)',   data:h.solar,        backgroundColor:'rgba(250,204,21,.7)', stack:'src'},
+          {label:'Bat discharge', data:h.bat_discharge, backgroundColor:'rgba(167,139,250,.7)',stack:'src'},
+          {label:'Grid import',  data:h.grid_import,  backgroundColor:'rgba(248,113,113,.7)',stack:'src'},
+          {label:'Grid export',  data:(h.grid_export||[]).map(v=>v!=null?-v:null),  backgroundColor:'rgba(74,222,128,.6)', stack:'snk'},
+          {label:'Bat charge',   data:(h.bat_charge||[]).map(v=>v!=null?-v:null),   backgroundColor:'rgba(56,189,248,.6)', stack:'snk'},
+        ]},
+        options:{..._mkOpts({stacked:true}),
+          plugins:{...CHART_DEFAULTS.plugins,
+            tooltip:{callbacks:{label:ctx=>{
+              const v=Math.abs(ctx.parsed.y??0);
+              return ` ${ctx.dataset.label}: ${v.toFixed(3)} kWh`;
+            }}}
+          }
+        }
+      });
+    }
+
+    // SOC line for the day
+    const socHours = h.labels||[];
+    const socVals  = h.soc||[];
+    if(socDayInst) socDayInst.destroy();
+    const sdCtx = document.getElementById('socDayChart')?.getContext('2d');
+    if(sdCtx && socVals.some(v=>v!=null)){
+      socDayInst = new Chart(sdCtx,{type:'line',
+        data:{labels:socHours,datasets:[
+          {label:'SOC %',data:socVals,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.1)',
+           fill:true,tension:.4,pointRadius:3,pointBackgroundColor:'#38bdf8'}
+        ]},
+        options:_mkOpts({yMin:0,yMax:100})
+      });
+    }
+  } catch(e){ console.warn('Day error',e); }
+}
+
+// ── ROI calculator ─────────────────────────────────────────────────────────────
+let _roiDailySavings=0;
+function calcROI(){
+  const cost =parseFloat(document.getElementById('roi-cost')?.value)||0;
+  const kwh  =parseFloat(document.getElementById('roi-kwh')?.value)||0;
+  const el   =document.getElementById('roi-result');
+  if(!el) return;
+  if(!_roiDailySavings||_roiDailySavings<=0||!cost||!kwh){el.style.display='none';return;}
+  const existCap=parseFloat(document.getElementById('rng-batt-cap')?.value)||10;
+  const addedDaily=_roiDailySavings*(kwh/Math.max(existCap,1));
+  const payDays=cost/Math.max(addedDaily,0.001);
+  const payYears=payDays/365;
+  el.style.display='block';
+  el.innerHTML=
+    `<b>Current avg savings:</b> €${_roiDailySavings.toFixed(2)}/day · `+
+    `€${(_roiDailySavings*365).toFixed(0)}/year<br>`+
+    `<b>Projected extra savings from +${kwh} kWh:</b> `+
+    `+€${addedDaily.toFixed(2)}/day (proportional estimate)<br>`+
+    `<b>Estimated payback:</b> `+
+    (payDays<365?Math.round(payDays)+' days':payYears.toFixed(1)+' years')+`<br>`+
+    `<span style="font-size:.7rem;color:var(--m)">⚠ Assumes linear savings scaling and current tariff/usage patterns.</span>`;
+}
+
+// ── HISTORY view ──────────────────────────────────────────────────────────────
+async function loadHistory(){
+  try {
+    const cd=await fetch(BASE+'/api/chart-data').then(r=>r.json());
+
     // ── Solar 7-day line chart ──────────────────────────────────────────────
     if(sol7Inst) sol7Inst.destroy();
     const s7=cd.solar_7d||{labels:[],actual:[],forecast:[]};
-    sol7Inst=new Chart(document.getElementById('sol7Chart').getContext('2d'),{
-      type:'line',
-      data:{labels:s7.labels,datasets:[
-        {label:'Actual kWh',data:s7.actual,borderColor:'#4ade80',
-         backgroundColor:'rgba(74,222,128,.08)',fill:true,tension:.3,
-         pointRadius:4,pointBackgroundColor:'#4ade80'},
-        {label:'HA Forecast kWh',data:s7.forecast,borderColor:'#a78bfa',
-         backgroundColor:'transparent',fill:false,tension:.3,
-         pointRadius:4,pointBackgroundColor:'#a78bfa',borderDash:[5,3]},
-      ]},
-      options:{responsive:true,maintainAspectRatio:true,
-        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-        scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
-                y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}}
-    });
-    // ── Solar 12-month line chart ───────────────────────────────────────────
+    const s7Ctx=document.getElementById('sol7Chart')?.getContext('2d');
+    if(s7Ctx){
+      sol7Inst=new Chart(s7Ctx,{type:'bar',
+        data:{labels:s7.labels,datasets:[
+          {label:'Actual kWh',data:s7.actual,backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4},
+          {label:'Forecast kWh',data:s7.forecast,backgroundColor:'rgba(167,139,250,.4)',borderColor:'#a78bfa',borderWidth:1,borderRadius:4},
+        ]},
+        options:_mkOpts({stacked:false})
+      });
+    }
+
+    // ── Solar 12-month bar chart ────────────────────────────────────────────
     if(sol12Inst) sol12Inst.destroy();
     const s12=cd.solar_12m||{labels:[],actual:[],forecast:[]};
-    sol12Inst=new Chart(document.getElementById('sol12Chart').getContext('2d'),{
-      type:'line',
-      data:{labels:s12.labels,datasets:[
-        {label:'Actual kWh',data:s12.actual,borderColor:'#4ade80',
-         backgroundColor:'rgba(74,222,128,.08)',fill:true,tension:.3,
-         pointRadius:5,pointBackgroundColor:'#4ade80'},
-        {label:'HA Forecast kWh',data:s12.forecast,borderColor:'#a78bfa',
-         backgroundColor:'transparent',fill:false,tension:.3,
-         pointRadius:5,pointBackgroundColor:'#a78bfa',borderDash:[5,3]},
-      ]},
-      options:{responsive:true,maintainAspectRatio:false,
-        plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-        scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
-                y:{min:0,ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}}
-    });
-    // ── Savings bar chart with value labels ─────────────────────────────────
+    const s12Ctx=document.getElementById('sol12Chart')?.getContext('2d');
+    if(s12Ctx){
+      sol12Inst=new Chart(s12Ctx,{type:'bar',
+        data:{labels:s12.labels,datasets:[
+          {label:'Actual kWh',data:s12.actual,backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4},
+          {label:'Forecast kWh',data:s12.forecast,backgroundColor:'rgba(167,139,250,.4)',borderColor:'#a78bfa',borderWidth:1,borderRadius:4},
+        ]},
+        options:_mkOpts({stacked:false})
+      });
+    }
+
+    // ── Daily savings bar chart ─────────────────────────────────────────────
     const dlPlugin={id:'dl',afterDatasetsDraw(chart){
       const ctx=chart.ctx; ctx.save();
       chart.data.datasets.forEach((ds,i)=>{
@@ -2029,23 +3118,47 @@ async function loadCharts(){
       }); ctx.restore();
     }};
     if(savInst) savInst.destroy();
-    if(cd.savings_daily&&cd.savings_daily.labels.length>0){
-      const el=document.getElementById('savingsChart');
-      if(el){ el.style.maxHeight='180px';
-        savInst=new Chart(el.getContext('2d'),{type:'bar',
-          data:{labels:cd.savings_daily.labels,datasets:[
-            {label:'€ saved',data:cd.savings_daily.values,
-             backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4}
-          ]},
-          options:{responsive:true,maintainAspectRatio:true,
-            plugins:{legend:{labels:{color:'#94a3b8',font:{size:11}}}},
-            scales:{x:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}},
-                    y:{ticks:{color:'#94a3b8',font:{size:10}},grid:{color:'#334155'}}}},
-          plugins:[dlPlugin]
-        });
-      }
+    const savEl=document.getElementById('savingsChart');
+    if(savEl && cd.savings_daily?.labels?.length>0){
+      savInst=new Chart(savEl.getContext('2d'),{type:'bar',
+        data:{labels:cd.savings_daily.labels,datasets:[
+          {label:'€ saved',data:cd.savings_daily.values,
+           backgroundColor:'rgba(74,222,128,.6)',borderColor:'#4ade80',borderWidth:1,borderRadius:4}
+        ]},
+        options:_mkOpts({stacked:false}),
+        plugins:[dlPlugin]
+      });
     }
-  } catch(e){ console.warn('Chart error',e); }
+    // ── Average KPI stats block ─────────────────────────────────────────────
+    try {
+      const [av,sv]=await Promise.all([
+        fetch(BASE+'/api/averages').then(r=>r.json()),
+        fetch(BASE+'/api/savings').then(r=>r.json()),
+      ]);
+      const at=av.all_time||{}, l12=av.last_12m||{};
+      const f1=v=>v!=null?v.toFixed(1)+' kWh':'—';
+      const fp=v=>v!=null?v.toFixed(0)+'%':'—';
+      const f1s=v=>v!=null?'12m: '+v.toFixed(1)+' kWh':'';
+      const fps=v=>v!=null?'12m: '+v.toFixed(0)+'%':'';
+      if(at.n_days){
+        document.getElementById('hs-solar').textContent     =f1(at.avg_solar_kwh);
+        document.getElementById('hs-cons').textContent      =f1(at.avg_consumption_kwh);
+        document.getElementById('hs-exp').textContent       =f1(at.avg_export_kwh);
+        document.getElementById('hs-imp').textContent       =f1(at.avg_import_kwh);
+        document.getElementById('hs-ss').textContent        =fp(at.avg_self_sufficiency_pct);
+        document.getElementById('hs-solar-12m').textContent =f1s(l12.avg_solar_kwh);
+        document.getElementById('hs-cons-12m').textContent  =f1s(l12.avg_consumption_kwh);
+        document.getElementById('hs-exp-12m').textContent   =f1s(l12.avg_export_kwh);
+        document.getElementById('hs-imp-12m').textContent   =f1s(l12.avg_import_kwh);
+        document.getElementById('hs-ss-12m').textContent    =fps(l12.avg_self_sufficiency_pct);
+      }
+      // ROI: daily savings rate from savings.json
+      const since=new Date(sv.since||Date.now());
+      const elapsed=Math.max(1,(Date.now()-since.getTime())/86400000);
+      _roiDailySavings=(sv.total_eur_saved||0)/elapsed;
+      calcROI();
+    } catch(_){}
+  } catch(e){ console.warn('History error',e); }
 }
 
 // ── Status & decisions ────────────────────────────────────────────────────────
@@ -2077,9 +3190,14 @@ async function load(){
         <div class="sub">Outdoor: ${(ss.temp_outdoor??0).toFixed(1)}°C</div></div>
       <div class="card"><div class="metric" style="font-size:1.1rem"><span class="badge ${dwCls}">${dw}</span></div>
         <div class="label">Dishwasher</div></div>
-      <div class="card"><div class="metric" style="font-size:1rem">${m?.r2_cv_mean!=null?'R²='+m.r2_cv_mean.toFixed(2):'No model'}</div>
-        <div class="label">ML model</div>
-        <div class="sub">${m?.n_samples?m.n_samples+' samples':''}</div></div>`;
+      <div class="card">${(()=>{
+        if(!m?.r2_cv_mean) return '<div class="metric" style="font-size:.9rem">Not trained</div><div class="label">ML model</div><div class="sub">Will train tonight at 3 AM</div>';
+        const r=m.r2_cv_mean;
+        const [qual,col]=r>=0.9?['Excellent','var(--g)']:r>=0.7?['Good','var(--g)']:r>=0.5?['Fair','var(--y)']:['Learning','var(--m)'];
+        return `<div class="metric" style="font-size:1rem;color:${col}">${qual}</div>
+          <div class="label">Consumption forecast</div>
+          <div class="sub">Trained on ${m.n_samples||0} readings · accuracy R²=${r.toFixed(2)}</div>`;
+      })()}</div>`;
 
     const bpow=ss.battery_power??0;
     const bdir=bpow>50?'▲ Charging':bpow<-50?'▼ Discharging':'● Idle';
@@ -2161,6 +3279,67 @@ async function sendSummary(){
     notify('✓ Summary sent — '+r.cycles+' cycles, €'+(r.savings_eur||0).toFixed(2)+' saved','ok',5000);
   }catch(e){notify('✗ Error sending summary','err');}
   finally{btn.disabled=false;btn.textContent='📧 Send daily summary';}
+}
+
+// ── Sensor resolution debug ──────────────────────────────────────────────────
+function loadDebugSensors() {
+  const el = document.getElementById('dbg-result');
+  el.innerHTML = '<span style="color:var(--m);font-size:.75rem">Loading…</span>';
+  fetch(BASE+'/api/debug/sensors')
+    .then(r => r.json())
+    .then(data => {
+      const ROLE_LABEL = {
+        solar_power:       'Solar',
+        grid_power:        'Grid (Red)',
+        battery_power:     'Battery',
+        battery_soc:       'Battery SoC',
+        temp_outdoor:      'Temp outdoor',
+        temp_indoor:       'Temp indoor',
+        solar_fc_today:    'Solar FC today',
+        solar_fc_tomorrow: 'Solar FC tomorrow',
+        pool_switch:       'Pool switch',
+      };
+      const srcColor = {wizard:'#4ade80', options:'#60a5fa', fallback:'#facc15'};
+      let rows = '';
+      for (const [role, info] of Object.entries(data)) {
+        const lbl = ROLE_LABEL[role] || role;
+        const raw = info.raw_state;
+        const val = info.parsed_float;
+        const src = info.source;
+        const eid = info.entity_id;
+        let statusIcon, statusColor;
+        if (raw === null || raw === 'unavailable' || raw === 'unknown') {
+          statusIcon = '✗'; statusColor = '#f87171';
+        } else if (val === null) {
+          statusIcon = '⚠'; statusColor = '#fb923c';
+        } else {
+          statusIcon = '✓'; statusColor = '#4ade80';
+        }
+        const dispVal = val !== null
+          ? (Math.abs(val) >= 1000 ? (val/1000).toFixed(2)+' k' : val.toFixed(1))
+          : (raw || '—');
+        rows += `<tr>
+          <td style="padding:.3rem .5rem;white-space:nowrap">${lbl}</td>
+          <td style="padding:.3rem .5rem;font-size:.68rem;color:#94a3b8;word-break:break-all">${eid}</td>
+          <td style="padding:.3rem .5rem;text-align:center"><span style="color:${srcColor[src]||'#fff'};font-size:.7rem">${src}</span></td>
+          <td style="padding:.3rem .5rem;text-align:right;font-weight:600">${dispVal}</td>
+          <td style="padding:.3rem .5rem;text-align:center;font-size:1rem;color:${statusColor}">${statusIcon}</td>
+        </tr>`;
+      }
+      el.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:.75rem">
+        <thead><tr style="color:var(--m);font-size:.65rem;border-bottom:1px solid #334155">
+          <th style="padding:.3rem .5rem;text-align:left">Role</th>
+          <th style="padding:.3rem .5rem;text-align:left">Entity ID</th>
+          <th style="padding:.3rem .5rem;text-align:center">Source</th>
+          <th style="padding:.3rem .5rem;text-align:right">Value</th>
+          <th style="padding:.3rem .5rem;text-align:center">OK</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    })
+    .catch(err => {
+      el.innerHTML = `<span style="color:#f87171;font-size:.75rem">Error: ${err.message}</span>`;
+    });
 }
 
 // ── Data sources debug ───────────────────────────────────────────────────────
@@ -2259,37 +3438,125 @@ async function loadWeather(){
   }catch(e){box.innerHTML='';}
 }
 
-// ── Wizard ───────────────────────────────────────────────────────────────────
-const WIZ_STEPS = ['Location','Grid','Solar','Battery','Loads','Tariff','Summary'];
+// ── Wizard state ──────────────────────────────────────────────────────────────
+let wizMode = 'nexus';  // always advanced mode
 let wizStep = 0;
 let wizEntities = [];
-let wizCfg = {location:{}, sensors:{}, hardware:['hvac','pool'], tariff:{}, battery_capacity_kwh:10};
+let wizDQSamples = {};
+let wizCfg = {
+  location:{}, sensors:{}, hardware:['hvac','pool'], tariff:{},
+  battery_capacity_kwh:10, data_source:'influxdb',
+  influxdb:{host:'',port:8086,org:'homeassistant',token:'',bucket:'homeassistant'},
+  hvac_zones:[], grid_submeters:[]
+};
 
+const WIZ_STEPS = ['Data','Location','Grid','Solar','Battery','Loads','Tariff','Done'];
+
+// ── Assistant mode ─────────────────────────────────────────────────────────────
+function wizSetMode(mode) {
+  wizMode = mode;
+  const wrap = document.getElementById('wiz-wrap');
+  wrap.className = 'wiz-wrap' + (mode==='nexus' ? ' mode-nexus' : '');
+  document.getElementById('btn-mode-bolt').className = 'wiz-mode-btn' + (mode==='bolt' ? ' bolt-active' : '');
+  document.getElementById('btn-mode-nexus').className = 'wiz-mode-btn' + (mode==='nexus' ? ' nexus-active' : '');
+  if (wizStep === 5) wizLoadsEnter();
+}
+
+// ── Data Quality bar ───────────────────────────────────────────────────────────
+function wizUpdateDQ(score) {
+  const fill = document.getElementById('dq-fill');
+  const txt  = document.getElementById('dq-score');
+  if (!fill) return;
+  const pct = Math.max(0, Math.min(100, Math.round(score)));
+  fill.style.width = pct + '%';
+  fill.style.background = pct >= 70 ? '#4ade80' : pct >= 40 ? '#fbbf24' : '#ef4444';
+  txt.style.color = pct >= 70 ? '#4ade80' : pct >= 40 ? '#fbbf24' : '#ef4444';
+  txt.textContent = pct + '%';
+}
+
+async function wizFetchDQ() {
+  try {
+    const r = await fetch(BASE+'/api/wizard/data-quality').then(r=>r.json());
+    if (r.score !== undefined) {
+      wizUpdateDQ(r.score);
+      wizDQSamples = r.samples || {};
+      _wizRefreshStatusBadges();
+    }
+  } catch(e) {}
+}
+
+// ── Load wizard ────────────────────────────────────────────────────────────────
 async function loadWizard() {
-  // Load existing wizard config
   try {
     const r = await fetch(BASE+'/api/wizard/config').then(r=>r.json());
-    if (r.sensors) wizCfg = Object.assign(wizCfg, r);
-    _wizPopulateFields();
+    if (r.sensors || r.location) wizCfg = Object.assign(wizCfg, r);
+    // restore influxdb sub-object
+    if (r.influxdb) wizCfg.influxdb = Object.assign(wizCfg.influxdb, r.influxdb);
+    if (r.hvac_zones) wizCfg.hvac_zones = r.hvac_zones;
+    if (r.grid_submeters) wizCfg.grid_submeters = r.grid_submeters;
   } catch(e) {}
-  // Load all HA entities for auto-detection
+  // Pre-fill influxdb from HA options when wizard config has no host
+  if (!wizCfg.influxdb?.host) {
+    try {
+      const opts = await fetch(BASE+'/api/options').then(r=>r.json());
+      const url = opts.influxdb_url || '';
+      const m = url.match(/https?:\/\/([^:\/]+)(?::(\d+))?/);
+      if (m) {
+        wizCfg.influxdb.host = m[1];
+        wizCfg.influxdb.port = m[2] ? parseInt(m[2]) : 8086;
+        wizCfg.influxdb.db   = opts.influxdb_db || 'homeassistant';
+        wizCfg.influxdb.username = opts.influxdb_user || '';
+      }
+    } catch(e) {}
+  }
+  _wizPopulateFields();
   try {
     const r = await fetch(BASE+'/api/ha/entities').then(r=>r.json());
     wizEntities = r.entities || [];
   } catch(e) { wizEntities = []; }
   wizRenderDots();
   wizGoTo(wizStep);
-  // Auto-show candidates for current step
-  _wizShowAllCands();
+  wizFetchDQ();
 }
 
 function wizRenderDots() {
-  document.getElementById('wiz-dots').innerHTML = WIZ_STEPS.map((lbl,i) =>
-    `<div class="wiz-step-dot ${i<wizStep?'done':i===wizStep?'active':''}" onclick="wizGoTo(${i})">
-      <div class="dot">${i<wizStep?'✓':(i+1)}</div>
+  const _HW_EMO = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+  const _selDevs = (wizCfg.hardware||[]).filter(h=>h&&h!=='');
+  let html = '';
+  WIZ_STEPS.forEach((lbl, i) => {
+    const st = i < wizStep ? 'done' : i === wizStep ? 'active' : '';
+    html += `<div class="wiz-step-dot ${st}" onclick="wizGoTo(${i})">
+      <div class="dot">${i < wizStep ? '✓' : (i+1)}</div>
       <div class="dot-lbl">${lbl}</div>
-    </div>`
-  ).join('');
+    </div>`;
+    if (i === 5 && _selDevs.length > 0) {
+      _selDevs.forEach((hw, si) => {
+        const emo  = _HW_EMO[hw] || '🔧';
+        const done = wizStep > 5 || (wizStep === 5 && wizLoadsSub > si + 1);
+        const act  = wizStep === 5 && wizLoadsSub === si + 1;
+        html += `<div class="wiz-sub-dot ${act?'active':done?'done':''}"
+          onclick="if(wizStep===5){wizLoadsGoTo(${si+1});}else{wizGoTo(5);}" title="${hw}">
+          <div class="sub-circle">${emo}</div>
+        </div>`;
+      });
+    }
+  });
+  document.getElementById('wiz-dots').innerHTML = html;
+}
+
+function _wizNavUpdate() {
+  const nav = document.getElementById('wiz-nav');
+  if (!nav) return;
+  const isFirst = wizStep === 0;
+  const isLast  = wizStep === WIZ_STEPS.length - 1;
+  const isLoads = wizStep === 5;
+  if (isLoads) return;  // loads manages its own nav via wizLoadsEnter/_wizLoadsUpdateNav
+  nav.innerHTML =
+    (isFirst ? '<span></span>' : `<button class="comic-btn back" onclick="wizBack()">← Back</button>`) +
+    `<span class="wiz-progress">Step ${wizStep+1} of ${WIZ_STEPS.length} — ${WIZ_STEPS[wizStep]}</span>` +
+    (isLast
+      ? `<button class="comic-btn save" onclick="wizSave()">Save &amp; Activate</button>`
+      : `<button class="comic-btn next" onclick="wizNext()">Next →</button>`);
 }
 
 function wizGoTo(step) {
@@ -2297,58 +3564,236 @@ function wizGoTo(step) {
   document.getElementById('wiz-pane-'+step).classList.add('active');
   wizStep = step;
   wizRenderDots();
+  _wizNavUpdate();
   _wizShowAllCands();
+  if (step === 6) wizRenderTariffInStep();
+  if (step === 7) wizBuildSummary();
+  setTimeout(_wizAddSearchButtons, 80);
 }
 
-function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); if(wizStep===WIZ_STEPS.length-1) wizBuildSummary(); }
+function wizNext() { if(wizStep < WIZ_STEPS.length-1) wizGoTo(wizStep+1); }
 function wizBack() { if(wizStep > 0) wizGoTo(wizStep-1); }
 
+function wizRenderTariffInStep() {
+  if (!tariffCfg) { loadTariff().then(()=>wizRenderTariffInStep()); return; }
+  const wd = tariffCfg.weekend_days||[5,6];
+  const daysEl = document.getElementById('wiz-tariff-days');
+  if (daysEl) daysEl.innerHTML = DAY_NAMES.map((d,i)=>
+    '<div class="day-chip'+(wd.includes(i)?' weekend':'')+'" onclick="wizTariffToggleDay('+i+')">'+
+    (wd.includes(i)?'🌿 ':'')+d+'</div>'
+  ).join('');
+  const tlEl = document.getElementById('wiz-tariff-timeline');
+  if (tlEl) {
+    const {peak_hours,valley_hours} = tariffCfg;
+    tlEl.innerHTML = Array.from({length:24},(_,h)=>{
+      const p = peak_hours.includes(h)?'peak':valley_hours.includes(h)?'valley':'mid';
+      return '<div class="t-hour '+p+'" onclick="wizTariffToggleHour('+h+')" title="'+h+':00">'+h+'</div>';
+    }).join('');
+  }
+  ['peak','mid','valley','export'].forEach(k=>{
+    const el=document.getElementById('wiz-p-'+k);
+    if(el && tariffCfg.prices) el.value=tariffCfg.prices[k]||0;
+  });
+}
+
+function wizTariffToggleDay(i) {
+  const wd=tariffCfg.weekend_days||[5,6];
+  tariffCfg.weekend_days=wd.includes(i)?wd.filter(x=>x!==i):[...wd,i].sort((a,b)=>a-b);
+  wizRenderTariffInStep(); renderDayRow();
+}
+
+function wizTariffToggleHour(h) {
+  const {peak_hours,valley_hours}=tariffCfg;
+  const isPeak=peak_hours.includes(h), isValley=valley_hours.includes(h);
+  if(isValley){ tariffCfg.valley_hours=valley_hours.filter(x=>x!==h); }
+  else if(!isPeak){ tariffCfg.peak_hours=[...peak_hours,h].sort((a,b)=>a-b); }
+  else { tariffCfg.peak_hours=peak_hours.filter(x=>x!==h); tariffCfg.valley_hours=[...valley_hours,h].sort((a,b)=>a-b); }
+  wizRenderTariffInStep(); renderTariffTimeline();
+}
+
+async function wizSaveTariff() {
+  tariffCfg.prices = {
+    peak:   parseFloat(document.getElementById('wiz-p-peak').value)||0.30,
+    mid:    parseFloat(document.getElementById('wiz-p-mid').value)||0.18,
+    valley: parseFloat(document.getElementById('wiz-p-valley').value)||0.08,
+    export: parseFloat(document.getElementById('wiz-p-export').value)||0.06,
+  };
+  const r=await fetch(BASE+'/api/tariff',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(tariffCfg)}).then(r=>r.json());
+  notify(r.ok?'✓ Tariff saved':'✗ Error','r.ok?\'ok\':\'err\'');
+}
+
+// ── Data source step ───────────────────────────────────────────────────────────
+function wizSelectDS(ds) {
+  wizCfg.data_source = ds;
+  ['influx','ha'].forEach(k => {
+    const c = document.getElementById('ds-card-'+k);
+    if (c) { c.style.borderColor = ''; c.style.background = ''; }
+  });
+  const id = ds === 'influxdb' ? 'ds-card-influx' : 'ds-card-ha';
+  const card = document.getElementById(id);
+  if (card) { card.style.borderColor = 'var(--g)'; card.style.background = 'rgba(74,222,128,.06)'; }
+  if (ds === 'influxdb') {
+    // If already have a tested connection, show banner; else show form
+    const host = wizCfg.influxdb?.host;
+    const ft   = wizCfg.influxdb?.first_ts;
+    if (host) {
+      const detail = ft ? `${host} · data since ${ft}` : `${host} · checking…`;
+      document.getElementById('wiz-influx-ok-detail').textContent = detail;
+      const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
+      document.getElementById('wiz-influx-fields').style.display = 'none';
+      if (!ft) setTimeout(_wizAutoTestInflux, 200);
+    } else {
+      document.getElementById('wiz-influx-ok').style.display = 'none';
+      document.getElementById('wiz-influx-fields').style.display = '';
+
+    }
+  } else {
+    document.getElementById('wiz-influx-ok').style.display = 'none';
+    document.getElementById('wiz-influx-fields').style.display = 'none';
+  }
+}
+function wizInfluxEdit() {
+  document.getElementById('wiz-influx-ok').style.display = 'none';
+  document.getElementById('wiz-influx-fields').style.display = '';
+  const inf = wizCfg.influxdb||{};
+  if (inf.host) document.getElementById('wiz-influx-host').value = inf.host;
+  if (inf.port) document.getElementById('wiz-influx-port').value = inf.port;
+  if (inf.db)   document.getElementById('wiz-influx-db').value   = inf.db;
+  if (inf.username) document.getElementById('wiz-influx-user').value = inf.username;
+}
+
+async function wizTestInflux() {
+  const btn = document.getElementById('btn-test-influx');
+  const st  = document.getElementById('wiz-influx-status');
+  btn.disabled = true; st.textContent = 'Testing…';
+  wizCfg.influxdb = {
+    host:     document.getElementById('wiz-influx-host').value.trim(),
+    port:     parseInt(document.getElementById('wiz-influx-port').value) || 8086,
+    db:       document.getElementById('wiz-influx-db').value.trim() || 'homeassistant',
+    username: document.getElementById('wiz-influx-user').value.trim(),
+    password: document.getElementById('wiz-influx-pass').value,
+  };
+  try {
+    const r = await fetch(BASE+'/api/wizard/data-quality', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({influxdb: wizCfg.influxdb, sensors: wizCfg.sensors})
+    }).then(r=>r.json());
+    if (r.ok) {
+      st.style.color = 'var(--g)';
+      st.textContent = `✓ Connected — ${r.total_samples||0} samples found`;
+      wizUpdateDQ(r.score||0);
+      wizDQSamples = r.samples||{};
+      wizCfg.influxdb.first_ts = r.first_ts || null;
+      // Switch to "already connected" banner (always, as long as connection succeeded)
+      const _detail = r.first_ts ? `${wizCfg.influxdb.host} · data since ${r.first_ts}` : `${wizCfg.influxdb.host} · connected (no history yet)`;
+      document.getElementById('wiz-influx-ok-detail').textContent = _detail;
+      const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
+      document.getElementById('wiz-influx-fields').style.display = 'none';
+    } else {
+      st.style.color = '#ef4444'; st.textContent = '✗ ' + (r.error||'Connection failed');
+    }
+  } catch(e) { st.style.color='#ef4444'; st.textContent='✗ Network error'; }
+  btn.disabled = false;
+}
+
+async function _wizAutoTestInflux() {
+  try {
+    const r = await fetch(BASE+'/api/wizard/data-quality', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({influxdb: wizCfg.influxdb, sensors: wizCfg.sensors})
+    }).then(r=>r.json());
+    const el = document.getElementById('wiz-influx-ok-detail');
+    if (!el) return;
+    if (r.ok) {
+      wizCfg.influxdb.first_ts = r.first_ts || null;
+      el.textContent = r.first_ts
+        ? `${wizCfg.influxdb.host} · data since ${r.first_ts}`
+        : `${wizCfg.influxdb.host} · connected (no history yet)`;
+    } else {
+      el.textContent = `${wizCfg.influxdb.host} · previously configured`;
+    }
+  } catch(e) {
+    const el = document.getElementById('wiz-influx-ok-detail');
+    if (el) el.textContent = (wizCfg.influxdb?.host||'') + ' · previously configured';
+  }
+}
+
+// ── Location ───────────────────────────────────────────────────────────────────
 async function wizDetectLocation() {
-  document.getElementById('wiz-loc-status').textContent = 'Detecting...';
+  document.getElementById('wiz-loc-status').textContent = 'Detecting…';
   try {
     const r = await fetch(BASE+'/api/ha/location').then(r=>r.json());
-    if (r.latitude) { document.getElementById('wiz-lat').value = r.latitude; wizCfg.location.latitude = r.latitude; }
+    if (r.latitude)  { document.getElementById('wiz-lat').value = r.latitude;  wizCfg.location.latitude  = r.latitude; }
     if (r.longitude) { document.getElementById('wiz-lon').value = r.longitude; wizCfg.location.longitude = r.longitude; }
-    if (r.time_zone) { document.getElementById('wiz-tz').value = r.time_zone; wizCfg.location.timezone = r.time_zone; }
+    if (r.time_zone) { document.getElementById('wiz-tz').value  = r.time_zone; wizCfg.location.timezone  = r.time_zone; }
     document.getElementById('wiz-loc-status').textContent = r.latitude ? '✓ Location loaded from Home Assistant' : 'Not found in HA config';
   } catch(e) { document.getElementById('wiz-loc-status').textContent = 'Error contacting HA'; }
 }
 
-function wizEntityTyped(role, inputId) {
-  const val = document.getElementById(inputId).value.trim();
-  wizCfg.sensors[role] = val;
-  // Show live state
-  const stateEl = document.getElementById(inputId.replace('wiz-','wiz-').replace('-entity','').replace('-power','').replace('-soc','') + '-state');
-  if (stateEl && val) {
-    const ent = wizEntities.find(e=>e.entity_id===val);
-    stateEl.textContent = ent ? `Current: ${ent.state} ${ent.unit||''}` : '';
+// ── Entity typed / selected ────────────────────────────────────────────────────
+function wizEntityTyped(role, inputId, statusId, stateId) {
+  const val = document.getElementById(inputId)?.value.trim() || '';
+  const exactMatch = wizEntities.find(e=>e.entity_id===val);
+  wizCfg.sensors[role] = exactMatch ? val : (val === '' ? '' : wizCfg.sensors[role]||'');
+  _wizUpdateStatusBadge(statusId, role, exactMatch ? val : '');
+  if (stateId) {
+    const el = document.getElementById(stateId);
+    if (el) el.textContent = exactMatch ? `Current: ${exactMatch.state} ${exactMatch.unit||''}` : '';
   }
+  // Live-filter candidates as user types
+  const m = WIZ_CANDS_MAP[role];
+  const _candsId = m?.candsId || (inputId + '-cands');
+  _wizRenderCands(role, inputId, _candsId, stateId||m?.stateId, statusId||m?.statusId);
 }
 
+function _wizUpdateStatusBadge(statusId, role, val) {
+  if (!statusId) return;
+  const el = document.getElementById(statusId);
+  if (!el) return;
+  if (!val) { el.innerHTML = '<span class="ent-miss">✗</span>'; return; }
+  const samples = wizDQSamples[val] || wizDQSamples[role];
+  const sampleTxt = samples ? `<span class="ent-samples">(${samples} pts)</span>` : '';
+  el.innerHTML = `<span class="ent-ok">✓</span>${sampleTxt}`;
+}
+
+function _wizRefreshStatusBadges() {
+  const statusMap = {
+    grid_power:'wiz-grid-status', solar_power:'wiz-solar-status',
+    battery_soc:'wiz-batt-soc-status', battery_power:'wiz-batt-pow-status',
+    battery_mode_select:'wiz-batt-mode-status', battery_cutoff_soc:'wiz-batt-cutoff-status',
+    battery_backup_soc:'wiz-batt-backup-status', battery_force_charge:'wiz-batt-force-status',
+  };
+  Object.entries(statusMap).forEach(([role, sid]) => {
+    _wizUpdateStatusBadge(sid, role, wizCfg.sensors[role]||'');
+  });
+}
+
+// ── Candidate rendering ────────────────────────────────────────────────────────
 function _wizShowAllCands() {
   const stepRoles = [
+    [],
     [],
     ['grid_power'],
     ['solar_power','solar_fc_today','solar_fc_tomorrow','solar_fc_h0','solar_fc_h1'],
     ['battery_soc','battery_power','battery_mode_select','battery_cutoff_soc','battery_backup_soc','battery_force_charge'],
-    ['temp_outdoor','temp_indoor','hvac_mode','hvac_temp_heat','hvac_temp_cool','pool_switch','pool_cleaner','dishwasher_state','ev_charger'],
+    [],
     ['weather'],
     []
   ];
   const roleMappings = {
-    'grid_power':          {inputId:'wiz-grid-entity',   candsId:'wiz-grid-cands',       stateId:'wiz-grid-state'},
-    'solar_power':         {inputId:'wiz-solar-entity',  candsId:'wiz-solar-cands',      stateId:'wiz-solar-state'},
-    'solar_fc_today':      {inputId:'wiz-fc-today',      candsId:'wiz-fc-today-cands',   stateId:null},
-    'solar_fc_tomorrow':   {inputId:'wiz-fc-tomorrow',   candsId:'wiz-fc-tomorrow-cands',stateId:null},
-    'solar_fc_h0':         {inputId:'wiz-fc-h0',         candsId:'wiz-fc-h0-cands',      stateId:null},
-    'solar_fc_h1':         {inputId:'wiz-fc-h1',         candsId:'wiz-fc-h1-cands',      stateId:null},
-    'battery_soc':         {inputId:'wiz-batt-soc',      candsId:'wiz-batt-soc-cands',   stateId:'wiz-batt-soc-state'},
-    'battery_power':       {inputId:'wiz-batt-power',    candsId:'wiz-batt-power-cands', stateId:null},
-    'battery_mode_select': {inputId:'wiz-batt-mode',     candsId:'wiz-batt-mode-cands',  stateId:null},
-    'battery_cutoff_soc':  {inputId:'wiz-batt-cutoff',   candsId:'wiz-batt-cutoff-cands',stateId:null},
-    'battery_backup_soc':  {inputId:'wiz-batt-backup',   candsId:'wiz-batt-backup-cands',stateId:null},
-    'battery_force_charge':{inputId:'wiz-batt-force',    candsId:'wiz-batt-force-cands', stateId:null},
-    'weather':             {inputId:'wiz-weather',       candsId:'wiz-weather-cands',    stateId:null},
+    grid_power:          {inputId:'wiz-grid-entity',   candsId:'wiz-grid-cands',       stateId:'wiz-grid-state',     statusId:'wiz-grid-status'},
+    solar_power:         {inputId:'wiz-solar-entity',  candsId:'wiz-solar-cands',      stateId:'wiz-solar-state',    statusId:'wiz-solar-status'},
+    solar_fc_today:      {inputId:'wiz-fc-today',      candsId:'wiz-fc-today-cands',   stateId:null,                 statusId:null},
+    solar_fc_tomorrow:   {inputId:'wiz-fc-tomorrow',   candsId:'wiz-fc-tomorrow-cands',stateId:null,                 statusId:null},
+    solar_fc_h0:         {inputId:'wiz-fc-h0',         candsId:'wiz-fc-h0-cands',      stateId:null,                 statusId:null},
+    solar_fc_h1:         {inputId:'wiz-fc-h1',         candsId:'wiz-fc-h1-cands',      stateId:null,                 statusId:null},
+    battery_soc:         {inputId:'wiz-batt-soc',      candsId:'wiz-batt-soc-cands',   stateId:'wiz-batt-soc-state', statusId:'wiz-batt-soc-status'},
+    battery_power:       {inputId:'wiz-batt-power',    candsId:'wiz-batt-power-cands', stateId:null,                 statusId:'wiz-batt-pow-status'},
+    battery_mode_select: {inputId:'wiz-batt-mode',     candsId:'wiz-batt-mode-cands',  stateId:null,                 statusId:'wiz-batt-mode-status'},
+    battery_cutoff_soc:  {inputId:'wiz-batt-cutoff',   candsId:'wiz-batt-cutoff-cands',stateId:null,                 statusId:'wiz-batt-cutoff-status'},
+    battery_backup_soc:  {inputId:'wiz-batt-backup',   candsId:'wiz-batt-backup-cands',stateId:null,                 statusId:'wiz-batt-backup-status'},
+    battery_force_charge:{inputId:'wiz-batt-force',    candsId:'wiz-batt-force-cands', stateId:null,                 statusId:'wiz-batt-force-status'},
+    weather:             {inputId:'wiz-weather',       candsId:'wiz-weather-cands',    stateId:null,                 statusId:null},
   };
   const roles = stepRoles[wizStep] || [];
   roles.forEach(role => {
@@ -2357,79 +3802,286 @@ function _wizShowAllCands() {
     const inputEl = document.getElementById(m.inputId);
     const candsEl = document.getElementById(m.candsId);
     if (!inputEl || !candsEl) return;
-    // Pre-fill from saved config
     if (!inputEl.value && wizCfg.sensors[role]) inputEl.value = wizCfg.sensors[role];
-    // Show candidates
-    _wizRenderCands(role, m.inputId, m.candsId, m.stateId);
+    _wizRenderCands(role, m.inputId, m.candsId, m.stateId, m.statusId);
   });
-  if (wizStep === 4) wizRenderLoadsEntities();
+  if (wizStep === 5) wizLoadsEnter();
+  if (wizStep === 2) _wizRenderSubmeters();
 }
 
-function _wizRenderCands(role, inputId, candsId, stateId) {
+const WIZ_ROLE_HINTS = {
+  grid_power:          {kw:['grid','acometida','net','meter','import','red'],units:['W','kW'],dc:['power'],dom:['sensor']},
+  solar_power:         {kw:['solar','pv','placas','inverter','photovoltaic','produccion'],units:['W','kW'],dc:['power'],dom:['sensor']},
+  battery_soc:         {kw:['soc','battery','bateria','capacity','charge','estado'],units:['%'],dc:['battery'],dom:['sensor']},
+  battery_power:       {kw:['battery','bateria','charge','discharge','luna','storage'],units:['W','kW'],dc:['power'],dom:['sensor']},
+  solar_fc_today:      {kw:['today','hoy','production_today','forecast_today'],units:['kWh'],dc:['energy'],dom:['sensor']},
+  solar_fc_tomorrow:   {kw:['tomorrow','manana','production_tomorrow'],units:['kWh'],dc:['energy'],dom:['sensor']},
+  solar_fc_h0:         {kw:['current_hour','esta_hora','energy_now'],units:['kWh','W'],dc:['energy','power'],dom:['sensor']},
+  solar_fc_h1:         {kw:['next_hour','proxima','energy_next'],units:['kWh','W'],dc:['energy','power'],dom:['sensor']},
+  battery_mode_select: {kw:['working_mode','battery','luna','mode'],units:[],dc:[],dom:['select']},
+  battery_cutoff_soc:  {kw:['cutoff','grid_charge','charge_cutoff','soc'],units:['%'],dc:[],dom:['number']},
+  battery_backup_soc:  {kw:['backup','reserva','minimum','minimo'],units:['%'],dc:[],dom:['number']},
+  battery_force_charge:{kw:['force_charge','forzar','force','forced','solar','storage','battery','luna','sungrow','huawei'],units:[],dc:[],dom:['switch','button','input_boolean']},
+  temp_outdoor:        {kw:['outdoor','outside','exterior','outsidetemp','ambient'],units:['°C','°F'],dc:['temperature'],dom:['sensor']},
+  temp_indoor:         {kw:['indoor','salon','room','living','temperatura','interior'],units:['°C','°F'],dc:['temperature'],dom:['sensor']},
+  hvac_mode:           {kw:['hvac','clima','aerotermia','heat_pump','ebus','climate','bomba'],units:[],dc:[],dom:['climate','select']},
+  hvac_temp_heat:      {kw:['heat','calor','heating','setpoint','manualtemp','z1manual'],units:['°C'],dc:['temperature'],dom:['number','input_number']},
+  hvac_temp_cool:      {kw:['cool','frio','cooling','setpoint','coolingtemp','z1cooling'],units:['°C'],dc:['temperature'],dom:['number','input_number']},
+  pool_switch:         {kw:['pool','piscina','pump','depuradora','filtro'],units:[],dc:[],dom:['switch']},
+  pool_cleaner:        {kw:['cleaner','limpiafondos','robot','vacuum'],units:[],dc:[],dom:['switch']},
+  dishwasher_state:    {kw:['dishwasher','lavavajillas','operation','estado'],units:[],dc:[],dom:['sensor']},
+  washer_state:        {kw:['washer','washing','lavadora','wash','wm','laundry','operation'],units:[],dc:[],dom:['sensor']},
+  washer_power:        {kw:['washer','lavadora','washing','laundry'],units:['W','kW'],dc:['power'],dom:['sensor']},
+  dryer_state:         {kw:['dryer','secadora','dry','tumble','secar'],units:[],dc:[],dom:['sensor']},
+  dryer_power:         {kw:['dryer','secadora','dry','tumble'],units:['W','kW'],dc:['power'],dom:['sensor']},
+  ev_charger:          {kw:['ev','car','coche','charger','cargador','wallbox','zappi','ocpp'],units:['A','W'],dc:[],dom:['switch','number']},
+  weather:             {kw:['aemet','openweather','weather','tiempo'],units:[],dc:[],dom:['weather']},
+};
+
+function _wizScoreEntities(role, forceShowSwitches) {
+  const hints = WIZ_ROLE_HINTS[role] || {kw:[],units:[],dc:[],dom:[]};
+  const scored = wizEntities.map(e => {
+    let score = 0;
+    const id   = (e.entity_id||'').toLowerCase();
+    const name = (e.name||'').toLowerCase();
+    const combined = id + ' ' + name;
+    const dom = id.split('.')[0];
+    if (hints.dom.length && !hints.dom.includes(dom)) return {...e, _score:0};
+    hints.kw.forEach(k => { if(combined.includes(k.toLowerCase())) score += 25; });
+    if (hints.dc.length && hints.dc.includes(e.device_class)) score += 50;
+    if (hints.units.length && hints.units.some(u=>e.unit&&e.unit.includes(u))) score += 40;
+    return {...e, _score:score};
+  }).filter(e=>e._score>0).sort((a,b)=>b._score-a._score);
+  // Fallback for force_charge: list all switches if no candidates found
+  if (!scored.length && forceShowSwitches) {
+    return wizEntities
+      .filter(e=>(e.entity_id||'').startsWith('switch.'))
+      .sort((a,b)=>(a.entity_id||'').localeCompare(b.entity_id||''))
+      .map(e=>({...e, _score:1, _fallback:true}));
+  }
+  return scored;
+}
+
+function _wizCandHtml(e, i, isFallback, inputId, candsId, role, stateId, statusId) {
+  const samp = wizDQSamples[e.entity_id] ? ` <span class="ent-samples">(${wizDQSamples[e.entity_id]}pts)</span>` : '';
+  const best = i===0 && !isFallback;
+  return `<span class="entity-cand${best?' best':''}" onclick="_wizSelectCand('${e.entity_id}','${inputId}','${candsId}','${role}','${stateId||''}','${statusId||''}')">
+    ${best?'⭐ ':''}${e.name||e.entity_id}
+    <span style="font-size:.6rem;opacity:.7">${e.entity_id} ${e.state||''} ${e.unit||''}</span>${samp}
+  </span>`;
+}
+
+// Module-level role→candsId map used by wizEntityTyped for live search
+const WIZ_CANDS_MAP = {
+  grid_power:           {candsId:'wiz-grid-cands',          stateId:'wiz-grid-state',     statusId:'wiz-grid-status'},
+  solar_power:          {candsId:'wiz-solar-cands',         stateId:'wiz-solar-state',    statusId:'wiz-solar-status'},
+  solar_fc_today:       {candsId:'wiz-fc-today-cands',      stateId:null,                 statusId:null},
+  solar_fc_tomorrow:    {candsId:'wiz-fc-tomorrow-cands',   stateId:null,                 statusId:null},
+  solar_fc_h0:          {candsId:'wiz-fc-h0-cands',         stateId:null,                 statusId:null},
+  solar_fc_h1:          {candsId:'wiz-fc-h1-cands',         stateId:null,                 statusId:null},
+  battery_soc:          {candsId:'wiz-batt-soc-cands',      stateId:'wiz-batt-soc-state', statusId:'wiz-batt-soc-status'},
+  battery_power:        {candsId:'wiz-batt-power-cands',    stateId:null,                 statusId:'wiz-batt-pow-status'},
+  battery_mode_select:  {candsId:'wiz-batt-mode-cands',     stateId:null,                 statusId:'wiz-batt-mode-status'},
+  battery_cutoff_soc:   {candsId:'wiz-batt-cutoff-cands',   stateId:null,                 statusId:'wiz-batt-cutoff-status'},
+  battery_backup_soc:   {candsId:'wiz-batt-backup-cands',   stateId:null,                 statusId:'wiz-batt-backup-status'},
+  battery_force_charge: {candsId:'wiz-batt-force-cands',    stateId:null,                 statusId:'wiz-batt-force-status'},
+  weather:              {candsId:'wiz-weather-cands',        stateId:null,                 statusId:null},
+};
+
+function _wizRenderCands(role, inputId, candsId, stateId, statusId) {
   const candsEl = document.getElementById(candsId);
   if (!candsEl) return;
-  // Score entities client-side using simple keyword matching
-  const scored = _wizScoreEntities(role);
-  if (!scored.length) { candsEl.innerHTML = '<span style="font-size:.68rem;color:var(--m)">No candidates found</span>'; return; }
-  candsEl.innerHTML = scored.slice(0,5).map((e,i) =>
-    `<span class="entity-cand${i===0?' best':''}" onclick="_wizSelectCand('${e.entity_id}','${inputId}','${candsId}','${role}','${stateId||''}')">
-      ${i===0?'⭐ ':''}${e.name||e.entity_id}
-      <span style="font-size:.6rem;opacity:.7">${e.state||''} ${e.unit||''}</span>
-    </span>`
-  ).join('');
+  const inputEl = document.getElementById(inputId);
+  const q = (inputEl?.value||'').trim();
+  // If user is typing a search query, filter all entities
+  if (q && !wizEntities.find(e=>e.entity_id===q)) {
+    const ql = q.toLowerCase();
+    const matches = wizEntities.filter(e=>
+      (e.entity_id||'').toLowerCase().includes(ql)||(e.name||'').toLowerCase().includes(ql)
+    ).slice(0,20);
+    candsEl.innerHTML = matches.length
+      ? matches.map((e,i)=>_wizCandHtml(e,i,false,inputId,candsId,role,stateId,statusId)).join('')
+      : '<span style="font-size:.68rem;color:var(--m)">No results</span>';
+    return;
+  }
+  // Default: show top scored suggestions
+  const isForceSw = role === 'battery_force_charge';
+  const scored = _wizScoreEntities(role, isForceSw);
+  const isFallback = scored.length && scored[0]._fallback;
+  const topLabel = isFallback ? '<span style="font-size:.62rem;color:var(--y);margin-bottom:.2rem;display:block">⚠ No auto-match — all switches listed:</span>' : '';
+  candsEl.innerHTML = scored.length
+    ? topLabel + scored.slice(0, isFallback ? 15 : 5).map((e,i)=>_wizCandHtml(e,i,isFallback,inputId,candsId,role,stateId,statusId)).join('')
+    : '<span style="font-size:.68rem;color:var(--m)">Type to search entities…</span>';
+  if (inputEl && statusId) _wizUpdateStatusBadge(statusId, role, inputEl.value);
 }
 
-function _wizSelectCand(entityId, inputId, candsId, role, stateId) {
-  document.getElementById(inputId).value = entityId;
+function _wizSelectCand(entityId, inputId, candsId, role, stateId, statusId) {
+  const inputEl = document.getElementById(inputId);
+  if (inputEl) inputEl.value = entityId;
   wizCfg.sensors[role] = entityId;
   if (stateId) {
     const ent = wizEntities.find(e=>e.entity_id===entityId);
     const el = document.getElementById(stateId);
     if (el && ent) el.textContent = `Current: ${ent.state} ${ent.unit||''}`;
   }
-  // Highlight selected
+  _wizUpdateStatusBadge(statusId, role, entityId);
   document.querySelectorAll('#'+candsId+' .entity-cand').forEach(c=>{
     c.style.background = c.textContent.includes(entityId) ? 'rgba(74,222,128,.2)' : '';
   });
 }
 
-const WIZ_ROLE_HINTS = {
-  grid_power:         {kw:['grid','acometida','net','meter','import','red'],units:['W','kW'],dc:['power']},
-  solar_power:        {kw:['solar','pv','placas','inverter','photovoltaic','produccion'],units:['W','kW'],dc:['power']},
-  battery_soc:        {kw:['soc','battery','bateria','capacity','charge'],units:['%'],dc:['battery']},
-  battery_power:      {kw:['battery','bateria','charge','discharge','luna','storage'],units:['W','kW'],dc:['power']},
-  solar_fc_today:     {kw:['today','hoy','production_today','forecast_today'],units:['kWh'],dc:['energy']},
-  solar_fc_tomorrow:  {kw:['tomorrow','manana','production_tomorrow'],units:['kWh'],dc:['energy']},
-  solar_fc_h0:        {kw:['current_hour','esta_hora','energy_now'],units:['kWh','W'],dc:['energy','power']},
-  solar_fc_h1:        {kw:['next_hour','proxima','energy_next'],units:['kWh','W'],dc:['energy','power']},
-  battery_mode_select:{kw:['working_mode','battery','luna','mode'],units:[],dc:[]},
-  battery_cutoff_soc: {kw:['cutoff','grid_charge','charge_cutoff'],units:['%'],dc:[]},
-  battery_backup_soc: {kw:['backup','reserva','minimum'],units:['%'],dc:[]},
-  battery_force_charge:{kw:['force_charge','forzar','forced'],units:[],dc:[]},
-  temp_outdoor:       {kw:['outdoor','outside','exterior','outsidetemp'],units:['C','F'],dc:['temperature']},
-  temp_indoor:        {kw:['indoor','salon','room','living','temperatura'],units:['C','F'],dc:['temperature']},
-  hvac_mode:          {kw:['hvac','clima','aerotermia','heat_pump','ebus'],units:[],dc:[]},
-  hvac_temp_heat:     {kw:['heat','calor','heating','setpoint'],units:['C'],dc:['temperature']},
-  hvac_temp_cool:     {kw:['cool','frio','cooling','setpoint'],units:['C'],dc:['temperature']},
-  pool_switch:        {kw:['pool','piscina','pump','depuradora','filtro'],units:[],dc:[]},
-  pool_cleaner:       {kw:['cleaner','limpiafondos','robot','vacuum'],units:[],dc:[]},
-  dishwasher_state:   {kw:['dishwasher','lavavajillas','operation'],units:[],dc:[]},
-  ev_charger:         {kw:['ev','car','coche','charger','wallbox','zappi'],units:['A','W'],dc:[]},
-  weather:            {kw:['aemet','openweather','weather','tiempo'],units:[],dc:[]},
-};
+// ── Grid sub-meters (Nexus mode) ───────────────────────────────────────────────
+function _wizRenderSubmeters() {
+  const list = document.getElementById('wiz-submeters-list');
+  if (!list) return;
+  list.innerHTML = (wizCfg.grid_submeters||[]).map((m,i) =>
+    `<div class="submeter-row">
+      <input value="${m.name||''}" placeholder="Label (e.g. HVAC)" oninput="wizCfg.grid_submeters[${i}].name=this.value">
+      <input value="${m.entity||''}" placeholder="sensor.entity_id" oninput="wizCfg.grid_submeters[${i}].entity=this.value">
+      <button class="submeter-del" onclick="wizDelSubmeter(${i})">✕</button>
+    </div>`
+  ).join('');
+}
 
-function _wizScoreEntities(role) {
-  const hints = WIZ_ROLE_HINTS[role] || {kw:[],units:[],dc:[]};
-  return wizEntities.map(e => {
-    let score = 0;
-    const id = (e.entity_id||'').toLowerCase();
-    const name = (e.name||'').toLowerCase();
-    const combined = id + ' ' + name;
-    hints.kw.forEach(k => { if(combined.includes(k.toLowerCase())) score += 25; });
-    if (hints.dc.length && hints.dc.includes(e.device_class)) score += 50;
-    if (hints.units.length && hints.units.some(u=>e.unit&&e.unit.includes(u))) score += 40;
-    return {...e, _score: score};
-  }).filter(e=>e._score>0).sort((a,b)=>b._score-a._score);
+function wizAddSubmeter() {
+  wizCfg.grid_submeters = wizCfg.grid_submeters || [];
+  wizCfg.grid_submeters.push({name:'',entity:''});
+  _wizRenderSubmeters();
+}
+function wizDelSubmeter(i) {
+  wizCfg.grid_submeters.splice(i,1);
+  _wizRenderSubmeters();
+}
+
+// ── Loads step ─────────────────────────────────────────────────────────────────
+let wizLoadsSub = 0;  // 0=selection screen, ≥1=device config index
+
+function wizLoadsEnter() {
+  wizLoadsSub = 0;
+  _wizLoadsUpdateNav();
+}
+
+function _wizLoadsUpdateNav() {
+  const devices = wizCfg.hardware.filter(h=>h!=='');
+  const nav = document.getElementById('wiz-nav');  // use global nav
+  if (!nav) return;
+  const grid = document.getElementById('wiz-hw-grid');
+  const ents = document.getElementById('wiz-loads-entities');
+  if (wizLoadsSub === 0) {
+    if (grid) grid.style.display = '';
+    if (ents) ents.innerHTML = '';
+    const _devIcons = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+    const _miniDots0 = devices.map(d=>`<span class="loads-subdot" title="${d}">${_devIcons[d]||d}</span>`).join('');
+    nav.innerHTML = `
+      <button class="comic-btn back" onclick="wizBack()">← Back</button>
+      <span style="display:flex;flex-direction:column;align-items:center;gap:.15rem">
+        <span style="font-size:.65rem;color:var(--m)">Step 6 — Select devices</span>
+        ${_miniDots0 ? `<span style="display:flex;gap:.25rem">${_miniDots0}</span>` : ''}
+      </span>
+      <button class="comic-btn next" onclick="wizLoadsNext()">Configure →</button>`;
+  } else {
+    const dev = devices[wizLoadsSub-1];
+    const label = {hvac:'HVAC',pool:'Pool',dishwasher:'Dishwasher',washer:'Washer',dryer:'Dryer',ev:'EV Charger'}[dev]||dev;
+    if (grid) grid.style.display = 'none';
+    _wizRenderSingleDevice(dev, ents);
+    const isLast = wizLoadsSub >= devices.length;
+    const _devIcons1 = {hvac:'🌡️',pool:'🏊',dishwasher:'🍽️',washer:'👕',dryer:'🌀',ev:'🚗',custom:'⚙️'};
+    const _miniDots1 = devices.map((d,i)=>{
+      const act = i===wizLoadsSub-1;
+      return `<span class="loads-subdot${act?' active':''}" onclick="wizLoadsGoTo(${i+1})" title="${d}">${_devIcons1[d]||d}</span>`;
+    }).join('');
+    nav.innerHTML = `
+      <button class="comic-btn back" onclick="wizLoadsBack()">← Back</button>
+      <span style="display:flex;flex-direction:column;align-items:center;gap:.15rem">
+        <span style="font-size:.65rem;color:var(--m)">${label} · ${wizLoadsSub}/${devices.length}</span>
+        <span style="display:flex;gap:.25rem">${_miniDots1}</span>
+      </span>
+      ${isLast
+        ? `<button class="comic-btn next" onclick="wizNext()">Next →</button>`
+        : `<button class="comic-btn next" onclick="wizLoadsNext()">Next →</button>`}`;
+    setTimeout(()=>{ _wizLoadsRenderCands(); _wizAddSearchButtons(); }, 60);
+  }
+}
+
+function wizLoadsNext() {
+  const devices = wizCfg.hardware.filter(h=>h!=='');
+  if (wizLoadsSub === 0 && devices.length === 0) { wizNext(); return; }
+  if (wizLoadsSub < devices.length) { wizLoadsSub++; _wizLoadsUpdateNav(); }
+  else { wizNext(); }
+}
+
+function wizLoadsBack() {
+  if (wizLoadsSub > 0) { wizLoadsSub--; _wizLoadsUpdateNav(); }
+  else wizBack();
+}
+function wizLoadsGoTo(sub) { wizLoadsSub = sub; _wizLoadsUpdateNav(); wizRenderDots(); }
+
+function _wizRenderSingleDevice(hw, container) {
+  if (!container) return;
+  const isAdv = wizMode === 'nexus';
+  let html = '';
+  if (hw === 'hvac') {
+    const zones = wizCfg.hvac_zones.length ? wizCfg.hvac_zones : [{name:'Zone 1',climate:'',temp_heat:'',temp_cool:'',temp_sensor:'',sched:{}}];
+    if (!wizCfg.hvac_zones.length) wizCfg.hvac_zones = zones;
+    html = `<div class="wiz-card"><div class="wiz-card-title">🌡️ HVAC Zones</div>
+      ${zones.map((z,zi)=>{
+        const schedHtml = isAdv ? `
+          <div style="font-size:.65rem;color:var(--m);margin-top:.4rem">24h — click to cycle: <span style="color:#4ade80">■ Comfort</span> <span style="color:var(--a)">■ Surplus</span> <span style="color:#94a3b8">■ Min</span></div>
+          <div class="hvac-sched">${Array.from({length:24},(_,h)=>{const mode=(z.sched||{})[h]||'minimum';return `<div class="hvac-sched-cell ${mode}" title="${h}:00" onclick="wizCycleSched(${zi},${h})">${h}</div>`;}).join('')}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4rem;margin-top:.4rem">
+            <div class="wiz-field"><label>Comfort °C</label><input type="number" value="${z.temp_comfort||21}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_comfort=+this.value"></div>
+            <div class="wiz-field"><label>Surplus °C</label><input type="number" value="${z.temp_surplus||23}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_surplus=+this.value"></div>
+            <div class="wiz-field"><label>Minimum °C</label><input type="number" value="${z.temp_min||18}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_min=+this.value"></div>
+          </div>` : '';
+        return `<div class="hvac-zone">
+          <div class="hvac-zone-hdr"><span class="hvac-zone-title">🌡️ ${z.name||'Zone '+(zi+1)}</span>${zi>0?`<button class="hvac-zone-del" onclick="wizDelHvacZone(${zi})">Remove</button>`:''}</div>
+          <input class="entity-select" value="${z.name||''}" placeholder="Zone name" style="margin-bottom:.4rem" oninput="wizCfg.hvac_zones[${zi}].name=this.value">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
+            <div class="entity-picker"><div class="entity-picker-label">Climate entity</div>
+              <input class="entity-select" id="wiz-hvac-cli-${zi}" value="${z.climate||''}" placeholder="climate.aerotermia" oninput="wizCfg.hvac_zones[${zi}].climate=this.value;wizEntityTyped('hvac_mode','wiz-hvac-cli-${zi}',null,null)">
+              <div id="wiz-hvac-cli-${zi}-cands" class="entity-cands"></div></div>
+            <div class="entity-picker"><div class="entity-picker-label">Temp sensor</div>
+              <input class="entity-select" id="wiz-hvac-ts-${zi}" value="${z.temp_sensor||''}" placeholder="sensor.indoor_temp" oninput="wizCfg.hvac_zones[${zi}].temp_sensor=this.value;wizEntityTyped('temp_indoor','wiz-hvac-ts-${zi}',null,null)">
+              <div id="wiz-hvac-ts-${zi}-cands" class="entity-cands"></div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.3rem">
+            <div class="entity-picker"><div class="entity-picker-label">Heat setpoint</div>
+              <input class="entity-select" id="wiz-hvac-ht-${zi}" value="${z.temp_heat||''}" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_heat=this.value;wizEntityTyped('hvac_temp_heat','wiz-hvac-ht-${zi}',null,null)">
+              <div id="wiz-hvac-ht-${zi}-cands" class="entity-cands"></div></div>
+            <div class="entity-picker"><div class="entity-picker-label">Cool setpoint</div>
+              <input class="entity-select" id="wiz-hvac-cl-${zi}" value="${z.temp_cool||''}" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_cool=this.value;wizEntityTyped('hvac_temp_cool','wiz-hvac-cl-${zi}',null,null)">
+              <div id="wiz-hvac-cl-${zi}-cands" class="entity-cands"></div></div>
+          </div>${schedHtml}</div>`;
+      }).join('')}
+      <button class="btn btn-sm" onclick="wizAddHvacZone()" style="margin-top:.4rem">+ Add zone</button>
+    </div>`;
+  } else if (hw === 'pool') {
+    html = `<div class="wiz-card"><div class="wiz-card-title">🏊 Pool</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+        <div class="entity-picker"><div class="entity-picker-label">Filter pump switch</div>
+          <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="" oninput="wizCfg.sensors.pool_switch=this.value;wizEntityTyped('pool_switch','wiz-pool-sw',null,null)">
+          <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
+        <div class="entity-picker"><div class="entity-picker-label">Cleaner switch (optional)</div>
+          <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="" oninput="wizCfg.sensors.pool_cleaner=this.value;wizEntityTyped('pool_cleaner','wiz-pool-cl',null,null)">
+          <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
+      </div></div>`;
+  } else if (hw === 'dishwasher') {
+    html = _wizApplianceSection('dishwasher','🍽️','Dishwasher','dishwasher_state','washer_power');
+  } else if (hw === 'washer') {
+    html = _wizApplianceSection('washer','👕','Washing Machine','washer_state','washer_power');
+  } else if (hw === 'dryer') {
+    html = _wizApplianceSection('dryer','🌀','Dryer','dryer_state','dryer_power');
+  } else if (hw === 'ev') {
+    html = `<div class="wiz-card"><div class="wiz-card-title">🚗 EV Charger</div>
+      <div class="entity-picker"><div class="entity-picker-label">EV charger entity</div>
+        <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value;wizEntityTyped('ev_charger','wiz-ev',null,null)">
+        <div id="wiz-ev-cands" class="entity-cands"></div></div></div>`;
+  } else if (hw === 'custom') {
+    container.innerHTML = _wizCustomLoadsSection();
+    setTimeout(_wizAddSearchButtons, 60);
+    return;
+  }
+  container.innerHTML = html;
 }
 
 function wizToggleHw(card) {
@@ -2440,125 +4092,295 @@ function wizToggleHw(card) {
   } else {
     wizCfg.hardware = wizCfg.hardware.filter(h=>h!==hw);
   }
-  wizRenderLoadsEntities();
+  // Stay on selection screen; don't auto-navigate
 }
 
 function wizRenderLoadsEntities() {
   const hw = wizCfg.hardware;
-  // Sync card visual state
-  document.querySelectorAll('.hw-card').forEach(c => {
-    c.classList.toggle('selected', hw.includes(c.dataset.hw));
-  });
+  document.querySelectorAll('.hw-card').forEach(c => c.classList.toggle('selected', hw.includes(c.dataset.hw)));
   const sections = [];
-  if (hw.includes('hvac')) sections.push(`
-    <div class="entity-picker"><div class="entity-picker-label">HVAC / Heat pump mode entity</div>
-      <input class="entity-select" id="wiz-hvac-mode" placeholder="climate.aerotermia" oninput="wizCfg.sensors.hvac_mode=this.value">
-      <div id="wiz-hvac-mode-cands" class="entity-cands"></div></div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
-      <div class="entity-picker"><div class="entity-picker-label">Heat setpoint (number)</div>
-        <input class="entity-select" id="wiz-hvac-heat" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.sensors.hvac_temp_heat=this.value">
-        <div id="wiz-hvac-heat-cands" class="entity-cands"></div></div>
-      <div class="entity-picker"><div class="entity-picker-label">Cool setpoint (number)</div>
-        <input class="entity-select" id="wiz-hvac-cool" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.sensors.hvac_temp_cool=this.value">
-        <div id="wiz-hvac-cool-cands" class="entity-cands"></div></div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-top:.3rem">
-      <div class="entity-picker"><div class="entity-picker-label">Outdoor temp sensor</div>
-        <input class="entity-select" id="wiz-temp-out" placeholder="sensor.outdoor_temp" oninput="wizCfg.sensors.temp_outdoor=this.value">
-        <div id="wiz-temp-out-cands" class="entity-cands"></div></div>
-      <div class="entity-picker"><div class="entity-picker-label">Indoor temp sensor</div>
-        <input class="entity-select" id="wiz-temp-in" placeholder="sensor.indoor_temp" oninput="wizCfg.sensors.temp_indoor=this.value">
-        <div id="wiz-temp-in-cands" class="entity-cands"></div></div>
+  const isAdv = wizMode === 'nexus';
+
+  // ── HVAC ──
+  if (hw.includes('hvac')) {
+    const zones = wizCfg.hvac_zones.length ? wizCfg.hvac_zones : [{name:'Zone 1',climate:'',temp_heat:'',temp_cool:'',temp_sensor:'',sched:{}}];
+    if (!wizCfg.hvac_zones.length) wizCfg.hvac_zones = zones;
+    const zoneHtml = zones.map((z,zi) => {
+      const schedHtml = isAdv ? `
+        <div style="font-size:.65rem;color:var(--m);margin-top:.4rem">24h schedule — click to cycle: <span style="color:#4ade80">■ Comfort</span> <span style="color:var(--a)">■ Surplus</span> <span style="color:#94a3b8">■ Min</span></div>
+        <div class="hvac-sched">${Array.from({length:24},(_,h)=>{
+          const mode = (z.sched||{})[h]||'minimum';
+          return `<div class="hvac-sched-cell ${mode}" title="${h}:00" onclick="wizCycleSched(${zi},${h})">${h}</div>`;
+        }).join('')}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4rem;margin-top:.4rem">
+          <div class="wiz-field"><label>Comfort °C</label><input type="number" value="${z.temp_comfort||21}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_comfort=+this.value"></div>
+          <div class="wiz-field"><label>Surplus °C</label><input type="number" value="${z.temp_surplus||23}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_surplus=+this.value"></div>
+          <div class="wiz-field"><label>Minimum °C</label><input type="number" value="${z.temp_min||18}" step="0.5" oninput="wizCfg.hvac_zones[${zi}].temp_min=+this.value"></div>
+        </div>` : '';
+      return `<div class="hvac-zone">
+        <div class="hvac-zone-hdr">
+          <span class="hvac-zone-title">🌡️ ${z.name||'Zone '+(zi+1)}</span>
+          ${zi>0?`<button class="hvac-zone-del" onclick="wizDelHvacZone(${zi})">Remove</button>`:''}
+        </div>
+        <input class="entity-select" value="${z.name||''}" placeholder="Zone name (e.g. Ground floor)" style="margin-bottom:.4rem" oninput="wizCfg.hvac_zones[${zi}].name=this.value">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem">
+          <div class="entity-picker"><div class="entity-picker-label">Climate entity</div>
+            <input class="entity-select" id="wiz-hvac-cli-${zi}" value="${z.climate||''}" placeholder="climate.aerotermia" oninput="wizCfg.hvac_zones[${zi}].climate=this.value;_wizRenderCands('hvac_mode','wiz-hvac-cli-'+zi,'wiz-hvac-cli-'+zi+'-cands',null,null)">
+            <div id="wiz-hvac-cli-${zi}-cands" class="entity-cands"></div></div>
+          <div class="entity-picker"><div class="entity-picker-label">Temp sensor</div>
+            <input class="entity-select" id="wiz-hvac-ts-${zi}" value="${z.temp_sensor||''}" placeholder="sensor.indoor_temp" oninput="wizCfg.hvac_zones[${zi}].temp_sensor=this.value;_wizRenderCands('temp_indoor','wiz-hvac-ts-'+zi,'wiz-hvac-ts-'+zi+'-cands',null,null)">
+            <div id="wiz-hvac-ts-${zi}-cands" class="entity-cands"></div></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.3rem">
+          <div class="entity-picker"><div class="entity-picker-label">Heat setpoint</div>
+            <input class="entity-select" id="wiz-hvac-ht-${zi}" value="${z.temp_heat||''}" placeholder="number.ebusd_heat_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_heat=this.value;_wizRenderCands('hvac_temp_heat','wiz-hvac-ht-'+zi,'wiz-hvac-ht-'+zi+'-cands',null,null)">
+            <div id="wiz-hvac-ht-${zi}-cands" class="entity-cands"></div></div>
+          <div class="entity-picker"><div class="entity-picker-label">Cool setpoint</div>
+            <input class="entity-select" id="wiz-hvac-cl-${zi}" value="${z.temp_cool||''}" placeholder="number.ebusd_cool_setpoint" oninput="wizCfg.hvac_zones[${zi}].temp_cool=this.value;_wizRenderCands('hvac_temp_cool','wiz-hvac-cl-'+zi,'wiz-hvac-cl-'+zi+'-cands',null,null)">
+            <div id="wiz-hvac-cl-${zi}-cands" class="entity-cands"></div></div>
+        </div>
+        ${schedHtml}
+      </div>`;
+    }).join('');
+    sections.push(`<div class="wiz-card" style="margin-top:.7rem">
+      <div class="wiz-card-title" style="font-size:1rem">🌡️ HVAC Zones</div>
+      ${zoneHtml}
+      <button class="btn btn-sm" onclick="wizAddHvacZone()" style="margin-top:.4rem">+ Add zone</button>
     </div>`);
-  if (hw.includes('pool')) sections.push(`
+  }
+
+  // ── Pool ──
+  if (hw.includes('pool')) sections.push(`<div class="wiz-card" style="margin-top:.7rem">
+    <div class="wiz-card-title" style="font-size:1rem">🏊 Pool</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
-      <div class="entity-picker"><div class="entity-picker-label">Pool pump switch</div>
-        <input class="entity-select" id="wiz-pool-sw" placeholder="switch.pool_pump" oninput="wizCfg.sensors.pool_switch=this.value">
+      <div class="entity-picker"><div class="entity-picker-label">Filter pump switch</div>
+        <input class="entity-select" id="wiz-pool-sw" value="${wizCfg.sensors.pool_switch||''}" placeholder="" oninput="wizCfg.sensors.pool_switch=this.value;_wizRenderCands('pool_switch','wiz-pool-sw','wiz-pool-sw-cands',null,null)">
         <div id="wiz-pool-sw-cands" class="entity-cands"></div></div>
-      <div class="entity-picker"><div class="entity-picker-label">Pool cleaner switch (optional)</div>
-        <input class="entity-select" id="wiz-pool-cl" placeholder="switch.pool_cleaner" oninput="wizCfg.sensors.pool_cleaner=this.value">
+      <div class="entity-picker"><div class="entity-picker-label">Cleaner switch (optional)</div>
+        <input class="entity-select" id="wiz-pool-cl" value="${wizCfg.sensors.pool_cleaner||''}" placeholder="" oninput="wizCfg.sensors.pool_cleaner=this.value;_wizRenderCands('pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands',null,null)">
         <div id="wiz-pool-cl-cands" class="entity-cands"></div></div>
-    </div>`);
-  if (hw.includes('ev')) sections.push(`
-    <div class="entity-picker"><div class="entity-picker-label">EV charger entity</div>
-      <input class="entity-select" id="wiz-ev" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value">
-      <div id="wiz-ev-cands" class="entity-cands"></div></div>`);
-  if (hw.includes('dishwasher')) sections.push(`
-    <div class="entity-picker"><div class="entity-picker-label">Dishwasher state sensor</div>
-      <input class="entity-select" id="wiz-dw" placeholder="sensor.dishwasher_operation_state" oninput="wizCfg.sensors.dishwasher_state=this.value">
-      <div id="wiz-dw-cands" class="entity-cands"></div></div>`);
-  document.getElementById('wiz-loads-entities').innerHTML = sections.length
-    ? `<div class="wiz-card" style="margin-top:.7rem"><div class="wiz-card-title" style="font-size:1rem">Entity mapping</div>${sections.join('')}</div>`
-    : '';
-  // Render candidates for newly created inputs
-  setTimeout(() => {
-    [['hvac_mode','wiz-hvac-mode','wiz-hvac-mode-cands'],
-     ['hvac_temp_heat','wiz-hvac-heat','wiz-hvac-heat-cands'],
-     ['hvac_temp_cool','wiz-hvac-cool','wiz-hvac-cool-cands'],
-     ['temp_outdoor','wiz-temp-out','wiz-temp-out-cands'],
-     ['temp_indoor','wiz-temp-in','wiz-temp-in-cands'],
-     ['pool_switch','wiz-pool-sw','wiz-pool-sw-cands'],
-     ['pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands'],
-     ['ev_charger','wiz-ev','wiz-ev-cands'],
-     ['dishwasher_state','wiz-dw','wiz-dw-cands'],
-    ].forEach(([role,inp,cands]) => {
-      if (document.getElementById(inp)) _wizRenderCands(role,inp,cands,null);
-    });
-  }, 50);
+    </div></div>`);
+
+  // ── Dishwasher ──
+  if (hw.includes('dishwasher')) sections.push(_wizApplianceSection('dishwasher','🍽️','Dishwasher','dishwasher_state','washer_power'));
+
+  // ── Washer ──
+  if (hw.includes('washer')) sections.push(_wizApplianceSection('washer','👕','Washing Machine','washer_state','washer_power'));
+
+  // ── Dryer ──
+  if (hw.includes('dryer')) sections.push(_wizApplianceSection('dryer','🌀','Dryer','dryer_state','dryer_power'));
+
+  // ── EV ──
+  if (hw.includes('ev')) sections.push(`<div class="wiz-card" style="margin-top:.7rem">
+    <div class="wiz-card-title" style="font-size:1rem">🚗 EV Charger</div>
+    <div class="entity-picker"><div class="entity-picker-label">EV charger entity (switch / number)</div>
+      <input class="entity-select" id="wiz-ev" value="${wizCfg.sensors.ev_charger||''}" placeholder="switch.wallbox" oninput="wizCfg.sensors.ev_charger=this.value;_wizRenderCands('ev_charger','wiz-ev','wiz-ev-cands',null,null)">
+      <div id="wiz-ev-cands" class="entity-cands"></div></div></div>`);
+
+  // ── Custom loads ──
+  if (hw.includes('custom')) sections.push(_wizCustomLoadsSection());
+
+  document.getElementById('wiz-loads-entities').innerHTML = sections.join('');
+  setTimeout(()=>_wizLoadsRenderCands(), 50);
 }
 
-function wizBuildSummary() {
-  const rows = [
-    ['Location', wizCfg.location.latitude ? `${wizCfg.location.latitude}, ${wizCfg.location.longitude}` : '—'],
-    ['Timezone', wizCfg.location.timezone || '—'],
-    ['Grid sensor', wizCfg.sensors.grid_power || '—'],
-    ['Solar sensor', wizCfg.sensors.solar_power || '—'],
-    ['Battery SOC', wizCfg.sensors.battery_soc || '—'],
-    ['Battery power', wizCfg.sensors.battery_power || '—'],
-    ['Battery mode', wizCfg.sensors.battery_mode_select || '—'],
-    ['Battery capacity', (wizCfg.battery_capacity_kwh||'—') + ' kWh'],
-    ['Hardware', wizCfg.hardware.join(', ') || '—'],
-    ['Weather entity', wizCfg.sensors.weather || '—'],
-    ['Contracted power', (wizCfg.tariff?.contracted_kw||'—') + ' kW'],
+function _wizApplianceSection(key, icon, label, stateRole, powerRole) {
+  return `<div class="wiz-card" style="margin-top:.7rem">
+    <div class="wiz-card-title" style="font-size:1rem">${icon} ${label}</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+      <div class="entity-picker"><div class="entity-picker-label">State sensor</div>
+        <input class="entity-select" id="wiz-${key}-state" value="${wizCfg.sensors[stateRole]||''}" placeholder="sensor.${key}_operation_state" oninput="wizCfg.sensors['${stateRole}']=this.value;_wizRenderCands('${stateRole}','wiz-${key}-state','wiz-${key}-state-cands',null,null)">
+        <div id="wiz-${key}-state-cands" class="entity-cands"></div></div>
+      <div class="entity-picker"><div class="entity-picker-label">Power meter (W)</div>
+        <input class="entity-select" id="wiz-${key}-power" value="${wizCfg.sensors[powerRole]||''}" placeholder="sensor.${key}_power" oninput="wizCfg.sensors['${powerRole}']=this.value;_wizRenderCands('${powerRole}','wiz-${key}-power','wiz-${key}-power-cands',null,null)">
+        <div id="wiz-${key}-power-cands" class="entity-cands"></div></div>
+    </div></div>`;
+}
+
+function _wizCustomLoadsSection() {
+  if (!wizCfg.custom_loads) wizCfg.custom_loads = [];
+  const items = wizCfg.custom_loads;
+  const schedOpts = [
+    {v:'valley',l:'🌙 Valley tariff only'},{v:'solar',l:'☀️ Solar surplus only'},
+    {v:'both',l:'☀️🌙 Solar + Valley'},{v:'hours',l:'⏱ Custom hours'},
   ];
-  document.getElementById('wiz-summary-table').innerHTML =
-    rows.map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
-  // Collect tariff data
+  const rows = items.map((item,i) => `
+    <div class="custom-load-row">
+      <div style="display:grid;grid-template-columns:1fr auto;gap:.4rem;align-items:center;margin-bottom:.35rem">
+        <input class="entity-select" value="${item.name||''}" placeholder="Device name (e.g. Irrigation pump)"
+          oninput="wizCfg.custom_loads[${i}].name=this.value" style="font-weight:600">
+        <div style="display:flex;align-items:center;gap:.3rem">
+          <input type="number" value="${item.watts||0}" min="0" max="20000" step="50" style="width:72px"
+            oninput="wizCfg.custom_loads[${i}].watts=+this.value">
+          <span style="font-size:.65rem;color:var(--m)">W</span>
+        </div>
+      </div>
+      <div class="entity-picker">
+        <div class="entity-picker-label">Switch entity</div>
+        <input class="entity-select" id="wiz-cl-sw-${i}" value="${item.switch||''}" placeholder="switch.my_device"
+          oninput="wizCfg.custom_loads[${i}].switch=this.value;_wizRenderCands('pool_switch','wiz-cl-sw-'+${i},'wiz-cl-sw-'+${i}+'-cands',null,null)">
+        <div id="wiz-cl-sw-${i}-cands" class="entity-cands"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.4rem;margin-top:.3rem">
+        <div class="wiz-field"><label>Schedule</label>
+          <select onchange="wizCfg.custom_loads[${i}].schedule=this.value;_wizRenderCustomLoads()">
+            ${schedOpts.map(o=>`<option value="${o.v}"${item.schedule===o.v?' selected':''}>${o.l}</option>`).join('')}
+          </select>
+        </div>
+        ${item.schedule==='hours'?`<div class="wiz-field"><label>Hours (e.g. 10-14,22-06)</label>
+          <input value="${item.hours||''}" placeholder="10-14" oninput="wizCfg.custom_loads[${i}].hours=this.value"></div>`:'<div></div>'}
+      </div>
+      <button class="btn btn-sm" style="margin-top:.3rem;color:#ef4444;border-color:#ef4444"
+        onclick="wizDelCustomLoad(${i})">✕ Remove</button>
+    </div>`).join('<hr style="border-color:var(--b);margin:.4rem 0">');
+  return `<div class="wiz-card" style="margin-top:.7rem">
+    <div class="wiz-card-title" style="font-size:1rem">⚙️ Custom Loads</div>
+    <div style="font-size:.7rem;color:var(--m);margin-bottom:.6rem">
+      Any switch-controlled load. The engine schedules them during cheapest / greenest windows.</div>
+    <div id="wiz-custom-loads-list">${rows}</div>
+    <button class="btn btn-sm" onclick="wizAddCustomLoad()" style="margin-top:.5rem">+ Add device</button>
+  </div>`;
+}
+function _wizRenderCustomLoads() {
+  const el = document.getElementById('wiz-loads-entities');
+  if (el) { el.innerHTML = _wizCustomLoadsSection(); setTimeout(_wizAddSearchButtons,60); }
+}
+function wizAddCustomLoad() {
+  if (!wizCfg.custom_loads) wizCfg.custom_loads = [];
+  wizCfg.custom_loads.push({name:'',switch:'',watts:0,schedule:'valley',hours:''});
+  _wizRenderCustomLoads();
+}
+function wizDelCustomLoad(i) {
+  wizCfg.custom_loads.splice(i,1);
+  _wizRenderCustomLoads();
+}
+
+function _wizLoadsRenderCands() {
+  const map = [
+    ['hvac_mode','wiz-hvac-cli-0','wiz-hvac-cli-0-cands'],
+    ['hvac_temp_heat','wiz-hvac-ht-0','wiz-hvac-ht-0-cands'],
+    ['hvac_temp_cool','wiz-hvac-cl-0','wiz-hvac-cl-0-cands'],
+    ['temp_indoor','wiz-hvac-ts-0','wiz-hvac-ts-0-cands'],
+    ['pool_switch','wiz-pool-sw','wiz-pool-sw-cands'],
+    ['pool_cleaner','wiz-pool-cl','wiz-pool-cl-cands'],
+    ['ev_charger','wiz-ev','wiz-ev-cands'],
+    ['dishwasher_state','wiz-dishwasher-state','wiz-dishwasher-state-cands'],
+    ['washer_power','wiz-dishwasher-power','wiz-dishwasher-power-cands'],
+    ['washer_state','wiz-washer-state','wiz-washer-state-cands'],
+    ['washer_power','wiz-washer-power','wiz-washer-power-cands'],
+    ['dryer_state','wiz-dryer-state','wiz-dryer-state-cands'],
+    ['dryer_power','wiz-dryer-power','wiz-dryer-power-cands'],
+  ];
+  map.forEach(([role,inp,cands]) => {
+    if (document.getElementById(inp)) _wizRenderCands(role,inp,cands,null,null);
+  });
+  // Extra HVAC zones if present
+  (wizCfg.hvac_zones||[]).forEach((_,i) => {
+    if (i===0) return;
+    [['hvac_mode',`wiz-hvac-cli-${i}`,`wiz-hvac-cli-${i}-cands`],
+     ['hvac_temp_heat',`wiz-hvac-ht-${i}`,`wiz-hvac-ht-${i}-cands`],
+     ['hvac_temp_cool',`wiz-hvac-cl-${i}`,`wiz-hvac-cl-${i}-cands`],
+     ['temp_indoor',`wiz-hvac-ts-${i}`,`wiz-hvac-ts-${i}-cands`],
+    ].forEach(([r,ip,cp])=>{ if(document.getElementById(ip)) _wizRenderCands(r,ip,cp,null,null); });
+  });
+}
+
+// ── HVAC zone management ───────────────────────────────────────────────────────
+function wizAddHvacZone() {
+  wizCfg.hvac_zones.push({name:'Zone '+(wizCfg.hvac_zones.length+1),climate:'',temp_heat:'',temp_cool:'',temp_sensor:'',sched:{},temp_comfort:21,temp_surplus:23,temp_min:18});
+  wizRenderLoadsEntities();
+}
+function wizDelHvacZone(i) {
+  wizCfg.hvac_zones.splice(i,1);
+  wizRenderLoadsEntities();
+}
+function wizCycleSched(zi, h) {
+  const z = wizCfg.hvac_zones[zi];
+  if (!z.sched) z.sched = {};
+  const order = ['minimum','comfort','surplus'];
+  const cur = z.sched[h]||'minimum';
+  z.sched[h] = order[(order.indexOf(cur)+1)%3];
+  wizRenderLoadsEntities();
+}
+
+// ── Summary & save ─────────────────────────────────────────────────────────────
+function wizBuildSummary() {
   wizCfg.tariff = wizCfg.tariff || {};
   wizCfg.tariff.contracted_kw = parseFloat(document.getElementById('wiz-contracted-kw')?.value) || 5.75;
   wizCfg.tariff.type = document.getElementById('wiz-tariff-type')?.value || 'es_2td';
-  // Location
   wizCfg.location.latitude  = parseFloat(document.getElementById('wiz-lat')?.value) || null;
   wizCfg.location.longitude = parseFloat(document.getElementById('wiz-lon')?.value) || null;
   wizCfg.location.timezone  = document.getElementById('wiz-tz')?.value || null;
-  // Battery capacity
   wizCfg.battery_capacity_kwh = parseFloat(document.getElementById('wiz-batt-cap')?.value) || 10;
-  // Grid flip
   wizCfg.grid_flip = document.getElementById('wiz-grid-flip')?.checked || false;
-  // Re-render with final values
+  const ok = v => v ? `<span class="ent-ok">✓</span> ${v}` : `<span class="ent-miss">✗</span> <em>not set</em>`;
+  const rows = [
+    ['Data source',    wizCfg.data_source === 'influxdb' ? '🗄️ InfluxDB' : '🏠 HA Recorder'],
+    ['Location',       wizCfg.location.latitude ? `${wizCfg.location.latitude}, ${wizCfg.location.longitude}` : '—'],
+    ['Timezone',       wizCfg.location.timezone || '—'],
+    ['Grid sensor',    ok(wizCfg.sensors.grid_power)],
+    ['Solar sensor',   ok(wizCfg.sensors.solar_power)],
+    ['Battery SOC',    ok(wizCfg.sensors.battery_soc)],
+    ['Battery power',  ok(wizCfg.sensors.battery_power)],
+    ['Battery capacity',(wizCfg.battery_capacity_kwh||'—') + ' kWh'],
+    ['HVAC zones',     wizCfg.hvac_zones.length ? wizCfg.hvac_zones.map(z=>z.name||'Zone').join(', ') : '—'],
+    ['Other devices',  wizCfg.hardware.filter(h=>h!=='hvac').join(', ') || '—'],
+    ['Weather entity', ok(wizCfg.sensors.weather)],
+    ['Tariff',         (wizCfg.tariff.type||'—') + ' · ' + (wizCfg.tariff.contracted_kw||'—') + ' kW'],
+  ];
   document.getElementById('wiz-summary-table').innerHTML =
     rows.map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+
+  // Data quality summary panel
+  const totalSamples = Object.values(wizDQSamples).reduce((a,b)=>a+(b||0),0);
+  const src = wizCfg.data_source === 'influxdb' ? 'InfluxDB' : 'HA Recorder';
+  const days = wizCfg.data_source === 'influxdb' ? 90 : 14;
+  const keySensors = ['grid_power','solar_power','battery_soc','battery_power'];
+  const missing = keySensors.filter(r=>!wizCfg.sensors[r]);
+  const hasAll = missing.length === 0;
+  const qualLabel = totalSamples > 20000 ? ['Excellent 🟢','R² likely > 0.90 — highly accurate forecasts']
+                  : totalSamples > 5000  ? ['Good 🟡','R² likely 0.75–0.90 — solid predictions']
+                  : totalSamples > 500   ? ['Fair 🟠','R² likely 0.50–0.75 — usable but will improve over time']
+                  :                        ['Learning 🔴','Not enough data yet — model will improve as data accumulates'];
+  const dqEl = document.getElementById('wiz-dq-summary');
+  const detEl = document.getElementById('wiz-dq-detail');
+  if (dqEl && detEl) {
+    dqEl.style.display = '';
+    detEl.innerHTML = `
+      <b>Source:</b> ${src} (up to ${days} days of history)<br>
+      <b>Samples found:</b> ${totalSamples.toLocaleString()} across ${Object.keys(wizDQSamples).length} entities<br>
+      <b>Prediction quality:</b> ${qualLabel[0]} — ${qualLabel[1]}<br>
+      ${!hasAll ? `<span style="color:var(--y)">⚠ Missing sensors: ${missing.join(', ')} — accuracy will be lower</span><br>` : ''}
+      <span style="color:var(--m);font-size:.68rem">Model trains automatically tonight at 03:00. More history = better predictions.</span>`;
+  }
 }
 
 async function wizSave() {
   wizBuildSummary();
-  document.getElementById('wiz-save-status').textContent = 'Saving...';
+  document.getElementById('wiz-save-status').textContent = 'Saving…';
   try {
     const r = await fetch(BASE+'/api/wizard/config', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(wizCfg)
     }).then(r=>r.json());
     if (r.ok) {
       document.getElementById('wiz-save-status').innerHTML =
-        '<span style="color:var(--g);font-size:1rem">✓ Configuration saved! The optimizer will use your new settings immediately.</span>';
+        '<span style="color:var(--g);font-size:1rem">✓ Configuration saved! The optimizer will use your new settings on the next cycle.</span>';
       notify('✓ Wizard configuration saved!', 'ok', 5000);
+      setTimeout(wizFetchDQ, 1000);
     } else {
       document.getElementById('wiz-save-status').textContent = 'Error: ' + (r.error||'unknown');
     }
   } catch(e) {
     document.getElementById('wiz-save-status').textContent = 'Network error: ' + e.message;
   }
+}
+
+function wizToggleBattSplit() {
+  const on = document.getElementById('wiz-batt-split')?.checked;
+  document.getElementById('wiz-batt-power-row').style.display  = on ? 'none' : '';
+  document.getElementById('wiz-batt-split-row').style.display  = on ? 'grid' : 'none';
+  wizCfg.battery_power_split = !!on;
 }
 
 function _wizPopulateFields() {
@@ -2572,10 +4394,18 @@ function _wizPopulateFields() {
     if (el) el.value = wizCfg.battery_capacity_kwh;
   }
   if (wizCfg.hardware) {
-    document.querySelectorAll('.hw-card').forEach(c => {
-      c.classList.toggle('selected', wizCfg.hardware.includes(c.dataset.hw));
-    });
+    document.querySelectorAll('.hw-card').forEach(c => c.classList.toggle('selected', wizCfg.hardware.includes(c.dataset.hw)));
   }
+  // Influx fields
+  if (wizCfg.influxdb) {
+    const f = wizCfg.influxdb;
+    if (f.host)     { const el=document.getElementById('wiz-influx-host'); if(el) el.value=f.host; }
+    if (f.port)     { const el=document.getElementById('wiz-influx-port'); if(el) el.value=f.port; }
+    if (f.db)       { const el=document.getElementById('wiz-influx-db');   if(el) el.value=f.db; }
+    if (f.username) { const el=document.getElementById('wiz-influx-user'); if(el) el.value=f.username; }
+    if (f.password) { const el=document.getElementById('wiz-influx-pass'); if(el) el.value=f.password; }
+  }
+  wizSelectDS(wizCfg.data_source || 'influxdb');
   const fieldMap = {
     grid_power:'wiz-grid-entity', solar_power:'wiz-solar-entity',
     solar_fc_today:'wiz-fc-today', solar_fc_tomorrow:'wiz-fc-tomorrow',
@@ -2587,26 +4417,57 @@ function _wizPopulateFields() {
   };
   Object.entries(fieldMap).forEach(([role,id]) => {
     const el = document.getElementById(id);
-    if (el && wizCfg.sensors && wizCfg.sensors[role]) el.value = wizCfg.sensors[role];
+    if (el && wizCfg.sensors?.[role]) el.value = wizCfg.sensors[role];
+  });
+  // Restore split battery sensor mode
+  if (wizCfg.battery_power_split) {
+    const cb = document.getElementById('wiz-batt-split');
+    if (cb) { cb.checked = true; wizToggleBattSplit(); }
+  }
+  const chgEl = document.getElementById('wiz-batt-chg');
+  const disEl = document.getElementById('wiz-batt-dis');
+  if (chgEl && wizCfg.sensors?.battery_charge_entity)    chgEl.value = wizCfg.sensors.battery_charge_entity;
+  if (disEl && wizCfg.sensors?.battery_discharge_entity) disEl.value = wizCfg.sensors.battery_discharge_entity;
+}
+
+function _wizAddSearchButtons() {
+  document.querySelectorAll('.entity-picker').forEach(picker => {
+    if (picker.querySelector('.ent-search-btn')) return;
+    const input = picker.querySelector('input.entity-select');
+    if (!input || !input.id) return;
+    const candsId = input.id + '-cands';
+    const oninp = input.getAttribute('oninput') || '';
+    const rm = oninp.match(/_wizRenderCands\('["']?([^'"]+)['"]?/);
+    const wm = oninp.match(/wizEntityTyped\('["']?([^'"]+)['"]?/);
+    const role = (rm && rm[1]) || (wm && wm[1]) || '';
+    const row = document.createElement('div');
+    row.className = 'entity-picker-row';
+    input.parentNode.insertBefore(row, input);
+    row.appendChild(input);
+    const btn = document.createElement('button');
+    btn.className = 'ent-search-btn';
+    btn.title = 'Browse entities';
+    btn.textContent = '🔍';
+    btn.type = 'button';
+    btn.onclick = () => { input.value = ''; _wizRenderCands(role, input.id, candsId, null, null); input.focus(); };
+    row.appendChild(btn);
   });
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 load();
 loadWeather();
-loadCharts();
 setInterval(load,30000);
 setInterval(loadWeather,300000);
-setInterval(loadCharts,120000);
 </script>
 </body></html>"""
 
 # ── API endpoints ────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    # Inject HA ingress base path so JS fetch() calls reach this add-on, not HA core
     base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-    return PANEL.replace("__BASE__", base)
+    ver = "v" + ADD_ON_VERSION
+    return PANEL.replace("__BASE__", base).replace("__VERSION__", ver)
 
 @app.route("/api/status")
 def api_status():
@@ -2621,8 +4482,90 @@ def api_status():
             pass
     optimal = calculate_optimal_soc(sensors)
     storm   = is_storm_forecast()
+    # Energy-balance sanity check: solar = house + bat_charge + grid_export.
+    # Surface the residual so the UI can flag stale sensor reads (Huawei Luna2000
+    # modbus often lags during transitions, especially in taper near full SOC).
+    solar_w = sensors.get("solar_power") or 0
+    grid_w  = sensors.get("grid_power")  or 0
+    bat_w   = sensors.get("battery_power") or 0
+    balance = {
+        "implied_house_w": round(solar_w - grid_w - bat_w, 1),
+        "residual_w":      round(min(0, solar_w - grid_w - bat_w), 1),
+    }
+    if balance["implied_house_w"] < -80:
+        log.warning(f"  Energy balance off by {balance['implied_house_w']:.0f}W "
+                    f"(solar={solar_w:.0f}, grid={grid_w:+.0f}, bat={bat_w:+.0f}) "
+                    f"— sensor likely stale (battery reading typically lags)")
     return jsonify({"sensors": sensors, "tariff": tariff, "model": model,
-                    "optimal": optimal, "storm": storm})
+                    "optimal": optimal, "storm": storm, "balance": balance,
+                    "consumption_baseline_kw": _get_avg_night_consumption_kw()})
+
+@app.route("/api/debug/sensors")
+def api_debug_sensors():
+    """Show resolved entity IDs and raw HA values for every key sensor role."""
+    roles = {
+        "solar_power":        ("sensor_solar_power",       ""),
+        "grid_power":         ("sensor_grid_power",        ""),
+        "battery_soc":        ("sensor_battery_soc",       "sensor.battery_state_of_capacity"),
+        "temp_outdoor":       ("sensor_temp_outdoor",      ""),
+        "temp_indoor":        ("sensor_temp_salon",        ""),
+        "solar_fc_today":     ("sensor_solar_today",       "sensor.energy_production_today"),
+        "solar_fc_tomorrow":  ("sensor_solar_tomorrow",    "sensor.energy_production_tomorrow"),
+        "pool_switch":        ("switch_pool",              ""),
+    }
+    result = {}
+    for role, (cfg_key, fallback) in roles.items():
+        entity_id = _wiz(role, cfg_key, fallback)
+        state_obj = ha_state(entity_id)
+        raw_state  = state_obj.get("state") if state_obj else None
+        try:
+            parsed = float(raw_state) if raw_state not in (None, "unavailable", "unknown") else None
+        except (ValueError, TypeError):
+            parsed = None
+        result[role] = {
+            "entity_id": entity_id,
+            "source": ("wizard" if _WIZARD.get("sensors", {}).get(role)
+                       else "options" if cfg(cfg_key, "")
+                       else "fallback"),
+            "raw_state": raw_state,
+            "parsed_float": parsed,
+        }
+    # Battery power: single signed sensor OR split charge/discharge (Deye/Solarman)
+    if _WIZARD.get("battery_power_split"):
+        sc = _WIZARD.get("sensors", {})
+        for sub_role, wiz_key in (("battery_charge_entity", "battery_charge_entity"),
+                                   ("battery_discharge_entity", "battery_discharge_entity")):
+            entity_id = sc.get(wiz_key, "")
+            state_obj = ha_state(entity_id) if entity_id else None
+            raw_state = state_obj.get("state") if state_obj else None
+            try:
+                parsed = float(raw_state) if raw_state not in (None, "unavailable", "unknown") else None
+            except (ValueError, TypeError):
+                parsed = None
+            result[sub_role] = {
+                "entity_id": entity_id,
+                "source": "wizard" if entity_id else "fallback",
+                "raw_state": raw_state,
+                "parsed_float": parsed,
+            }
+    else:
+        entity_id = _wiz("battery_power", "sensor_battery_power",
+                         "sensor.battery_charge_discharge_power")
+        state_obj = ha_state(entity_id)
+        raw_state = state_obj.get("state") if state_obj else None
+        try:
+            parsed = float(raw_state) if raw_state not in (None, "unavailable", "unknown") else None
+        except (ValueError, TypeError):
+            parsed = None
+        result["battery_power"] = {
+            "entity_id": entity_id,
+            "source": ("wizard" if _WIZARD.get("sensors", {}).get("battery_power")
+                       else "options" if cfg("sensor_battery_power", "")
+                       else "fallback"),
+            "raw_state": raw_state,
+            "parsed_float": parsed,
+        }
+    return jsonify(result)
 
 @app.route("/api/decisions")
 def api_decisions():
@@ -2674,6 +4617,11 @@ def api_setup_post():
         "battery_storm_threshold":        lambda v: clamp(int(v), 50, 100),
         "decision_interval_minutes":      lambda v: clamp(int(v), 5, 60),
         "battery_capacity_kwh":           lambda v: clamp(float(v), 2.0, 30.0),
+        "battery_health_mode":            lambda v: str(v) if str(v) in ("bill_reducer","optimized","battery_guard") else "bill_reducer",
+        "influxdb_url":                   lambda v: str(v)[:200].strip(),
+        "influxdb_db":                    lambda v: str(v)[:100].strip(),
+        "influxdb_user":                  lambda v: str(v)[:100].strip(),
+        "influxdb_password":              lambda v: str(v)[:200],
     }
     validated = {}
     for key, coerce in allowed.items():
@@ -2685,11 +4633,194 @@ def api_setup_post():
     save_setup(validated)
     return jsonify({"ok": True})
 
+def _hourly_from_decisions(date_str: str) -> dict:
+    """Aggregate decisions.json into hourly kWh buckets for a given YYYY-MM-DD date."""
+    K = 0.25 / 1000  # 15-min interval → kWh factor
+    hours: dict = {h: {"sol": [], "grid": [], "bat": [], "soc": []} for h in range(24)}
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str or ts_str[:10] != date_str:
+                    continue
+                try:
+                    h = datetime.fromisoformat(ts_str).hour
+                except ValueError:
+                    continue
+                s = dec.get("sensors", {})
+                hours[h]["sol"].append(s.get("solar_power") or 0)
+                hours[h]["grid"].append(s.get("grid_power") or 0)
+                hours[h]["bat"].append(s.get("battery_power") or 0)
+                if s.get("battery_soc") is not None:
+                    hours[h]["soc"].append(float(s["battery_soc"]))
+        except Exception:
+            pass
+
+    res: dict = {k: [] for k in ("labels","solar","grid_import","grid_export",
+                                  "bat_charge","bat_discharge","consumption","soc")}
+    for h in range(24):
+        res["labels"].append(f"{h:02d}:00")
+        d = hours[h]
+        if not d["sol"]:
+            for k in res:
+                if k != "labels":
+                    res[k].append(None)
+            continue
+        sol  = sum(d["sol"]) * K
+        gimp = sum(max(-g, 0) for g in d["grid"]) * K
+        gexp = sum(max(g, 0) for g in d["grid"]) * K
+        bchg = sum(max(-b, 0) for b in d["bat"]) * K
+        bdis = sum(max(b, 0) for b in d["bat"]) * K
+        cons = max(0.0, sol + bdis + gimp - gexp - bchg)
+        res["solar"].append(round(sol, 3))
+        res["grid_import"].append(round(gimp, 3))
+        res["grid_export"].append(round(gexp, 3))
+        res["bat_charge"].append(round(bchg, 3))
+        res["bat_discharge"].append(round(bdis, 3))
+        res["consumption"].append(round(cons, 3))
+        res["soc"].append(round(sum(d["soc"]) / len(d["soc"]), 1) if d["soc"] else None)
+
+    # Daily KPIs
+    nn = lambda lst: [v for v in lst if v is not None]
+    total_sol  = sum(nn(res["solar"]))
+    total_imp  = sum(nn(res["grid_import"]))
+    total_exp  = sum(nn(res["grid_export"]))
+    total_cons = sum(nn(res["consumption"]))
+    self_suff  = round(min(100, (1 - total_imp / max(total_cons, 0.01)) * 100), 1) if total_cons else 0
+    solar_sc   = round(min(100, (1 - total_exp / max(total_sol, 0.01)) * 100), 1) if total_sol else 0
+    res["kpi"] = {
+        "solar_kwh":             round(total_sol,  2),
+        "import_kwh":            round(total_imp,  2),
+        "export_kwh":            round(total_exp,  2),
+        "consumption_kwh":       round(total_cons, 2),
+        "self_sufficiency_pct":  self_suff,
+        "solar_self_consumed_pct": solar_sc,
+    }
+    return res
+
+
+def _live_averages_7d() -> dict:
+    """W-level 7-day averages from 15-min decision samples.
+
+    SOL: mean only when > 0  (real production during daylight hours)
+    RED: net mean  (+ = export, - = import)
+    BAT: net mean  (+ = charging / bat>0, - = discharging / bat<0)
+    CASA: mean of (solar - grid - bat) per sample
+    """
+    cutoff = datetime.now() - timedelta(days=7)
+    sol_v, red_v, bat_v, casa_v = [], [], [], []
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                s    = dec.get("sensors", {})
+                sol  = s.get("solar_power")  or 0
+                red  = s.get("grid_power")   or 0
+                bat  = s.get("battery_power") or 0
+                casa = sol - red - bat
+                if sol > 0:
+                    sol_v.append(sol)
+                red_v.append(red)
+                bat_v.append(bat)
+                if casa > 0:
+                    casa_v.append(casa)
+        except Exception:
+            pass
+    def avg(lst): return round(sum(lst) / len(lst)) if lst else None
+    return {
+        "samples":  len(red_v),
+        "avg_sol":  avg(sol_v),   # W, solar-hours only
+        "avg_red":  avg(red_v),   # W, net (+ export / - import)
+        "avg_bat":  avg(bat_v),   # W, net (+ charge / - discharge)
+        "avg_casa": avg(casa_v),  # W, house consumption
+    }
+
+
+def _daily_kpi_averages() -> dict:
+    """Average daily kWh KPIs aggregated from all decisions.json history.
+
+    decisions.json convention: bat > 0 = discharging (raw Huawei sensor).
+    Returns separate stats for all_time and last_12m.
+    """
+    K = 0.25 / 1000  # 15-min interval → kWh
+    days: dict = {}
+    if DECISIONS_FILE.exists():
+        try:
+            for dec in json.loads(DECISIONS_FILE.read_text()):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                date = ts_str[:10]
+                s    = dec.get("sensors", {})
+                sol  = s.get("solar_power") or 0
+                grid = s.get("grid_power") or 0
+                bat  = s.get("battery_power") or 0
+                d = days.setdefault(date, {"sol": 0.0, "gimp": 0.0, "gexp": 0.0,
+                                           "bchg": 0.0, "bdis": 0.0})
+                d["sol"]  += max(sol, 0) * K
+                d["gimp"] += max(-grid, 0) * K
+                d["gexp"] += max(grid, 0) * K
+                d["bdis"] += max(bat, 0) * K   # bat > 0 = discharging
+                d["bchg"] += max(-bat, 0) * K  # bat < 0 = charging
+        except Exception:
+            pass
+
+    if not days:
+        return {}
+
+    cutoff_12m = (datetime.now().date() - timedelta(days=365)).isoformat()
+
+    def _stats(day_list: list) -> dict:
+        if not day_list:
+            return {}
+        n     = len(day_list)
+        conss = [max(0.0, d["sol"] + d["bdis"] + d["gimp"] - d["gexp"] - d["bchg"])
+                 for d in day_list]
+        ss    = [min(100.0, (1 - d["gimp"] / max(c, 0.01)) * 100)
+                 for d, c in zip(day_list, conss)]
+        return {
+            "n_days":                   n,
+            "avg_solar_kwh":            round(sum(d["sol"] for d in day_list) / n, 2),
+            "avg_import_kwh":           round(sum(d["gimp"] for d in day_list) / n, 2),
+            "avg_export_kwh":           round(sum(d["gexp"] for d in day_list) / n, 2),
+            "avg_consumption_kwh":      round(sum(conss) / n, 2),
+            "avg_self_sufficiency_pct": round(sum(ss) / n, 1),
+        }
+
+    all_vals    = list(days.values())
+    recent_vals = [v for k, v in days.items() if k >= cutoff_12m]
+    return {
+        "all_time": _stats(all_vals),
+        "last_12m": _stats(recent_vals),
+    }
+
+
+@app.route("/api/averages")
+def api_averages():
+    return jsonify(_daily_kpi_averages())
+
+
 @app.route("/api/chart-data")
 def api_chart_data():
     from datetime import timezone as _tz
-    soc_entity = cfg("sensor_battery_soc", "sensor.battery_state_of_capacity")
-    influx_u   = cfg("influxdb_url", "").strip()
+    date_param = request.args.get("date") or datetime.now().strftime("%Y-%m-%d")
+    soc_entity = _wiz("battery_soc", "sensor_battery_soc", "sensor.battery_state_of_capacity")
+    # InfluxDB source: wizard config takes precedence over legacy cfg
+    _wiz_influx = _WIZARD.get("influxdb", {})
+    influx_u    = (_wiz_influx.get("host") and
+                   f"http://{_wiz_influx['host']}:{_wiz_influx.get('port',8086)}") or \
+                  cfg("influxdb_url", "").strip()
+    influx_db   = _wiz_influx.get("db") or cfg("influxdb_db", "homeassistant").strip()
+    influx_user = _wiz_influx.get("username") or cfg("influxdb_user", "").strip()
+    influx_pass = _wiz_influx.get("password") or cfg("influxdb_password", "")
 
     # ── SOC — 15-min bucket grid, align actual + predicted ────────────────────
     if influx_u:
@@ -2764,12 +4895,13 @@ def api_chart_data():
     sensors = read_sensors()
     if MODEL_FILE.exists():
         try:
-            art   = joblib.load(MODEL_FILE)
-            now   = datetime.now()
-            soc_f = sensors["battery_soc"]
+            art      = joblib.load(MODEL_FILE)
+            mdl_feats = art.get("features", BASE_FEATURES)
+            now      = datetime.now()
+            soc_f    = sensors.get("battery_soc", 50.0) or 50.0
             for h in range(1, 9):
-                ft    = now + timedelta(hours=h)
-                X = pd.DataFrame([{
+                ft = now + timedelta(hours=h)
+                row = {
                     "hour":        ft.hour,
                     "weekday":     ft.weekday(),
                     "month":       ft.month,
@@ -2777,8 +4909,17 @@ def api_chart_data():
                     "lag4":        soc_f,
                     "roll4":       soc_f,
                     "solar_proxy": _solar_proxy_for_hour(ft.hour, ft.month),
-                }])
-                pred  = float(art["pipeline"].predict(X[FEATURES])[0])
+                    "temp_out":    sensors.get("temp_outdoor", 15.0),
+                    "temp_out_lag4": sensors.get("temp_outdoor", 15.0),
+                    "solar_lag1":  sensors.get("solar_power", 0) / 1000,
+                    "solar_roll4": sensors.get("solar_power", 0) / 1000,
+                    "grid_lag1":   sensors.get("grid_power", 0) / 1000,
+                    "grid_roll4":  sensors.get("grid_power", 0) / 1000,
+                    "grid_abs_lag1": abs(sensors.get("grid_power", 0)) / 1000,
+                }
+                X    = pd.DataFrame([row])
+                cols = [c for c in mdl_feats if c in X.columns]
+                pred = float(art["pipeline"].predict(X[cols])[0])
                 soc_f = round(max(0.0, min(100.0, pred)), 1)
                 future_labels.append(ft.strftime("%H:%M"))
                 future_predicted.append(soc_f)
@@ -2799,9 +4940,7 @@ def api_chart_data():
                                tzinfo=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         q_sol = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{solar_entity_id}\' '
                  f'AND time >= \'{yest_start}\' AND time < \'{today_start}\'')
-        r_sol, _, _ = _influx_query(
-            influx_u, cfg("influxdb_db", "homeassistant").strip(), q_sol,
-            cfg("influxdb_user", "").strip(), cfg("influxdb_password", ""))
+        r_sol, _, _ = _influx_query(influx_u, influx_db, q_sol, influx_user, influx_pass)
         if r_sol:
             try:
                 s = r_sol.json()["results"][0].get("series", [])
@@ -2875,10 +5014,8 @@ def api_chart_data():
     solar_12m_labels, solar_12m_actual, solar_12m_forecast = [], [], []
 
     if influx_u:
-        sol_tmrw_id = cfg("sensor_solar_tomorrow", "sensor.energy_production_tomorrow").split(".")[-1]
-        influx_db   = cfg("influxdb_db", "homeassistant").strip()
-        influx_user = cfg("influxdb_user", "").strip()
-        influx_pass = cfg("influxdb_password", "")
+        sol_tmrw_id = _wiz("solar_fc_tomorrow", "sensor_solar_tomorrow",
+                           "sensor.energy_production_tomorrow").split(".")[-1]
 
         # Daily MAX actual + daily LAST forecast — 395d covers 13 months
         q_act = (f'SELECT MAX("value") FROM /.*/ WHERE "entity_id" = \'{solar_entity_id}\' '
@@ -2952,6 +5089,31 @@ def api_chart_data():
             solar_12m_actual.append(round(m_actual[m], 1) if m_cnt_a.get(m) else None)
             solar_12m_forecast.append(round(m_forecast[m], 1) if m_cnt_f.get(m) else None)
 
+    # ── Power flow 24h from decisions.json ───────────────────────────────────
+    pf_labels, pf_solar, pf_grid, pf_battery = [], [], [], []
+    now_local_pf = datetime.now()
+    cutoff_pf    = now_local_pf - timedelta(hours=24)
+    if DECISIONS_FILE.exists():
+        try:
+            history_pf = json.loads(DECISIONS_FILE.read_text())
+            for dec in sorted(history_pf, key=lambda d: d.get("timestamp", "")):
+                ts_str = dec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if ts < cutoff_pf:
+                    continue
+                sens = dec.get("sensors", {})
+                pf_labels.append(ts.strftime("%H:%M"))
+                pf_solar.append(round((sens.get("solar_power") or 0) / 1000, 2))
+                pf_grid.append(round((sens.get("grid_power") or 0) / 1000, 2))
+                pf_battery.append(round((sens.get("battery_power") or 0) / 1000, 2))
+        except Exception:
+            pass
+
     return jsonify({
         "soc": {
             "labels":           soc_labels,
@@ -2970,6 +5132,11 @@ def api_chart_data():
         "solar_12m":     {"labels": solar_12m_labels, "actual": solar_12m_actual,
                           "forecast": solar_12m_forecast},
         "savings_daily": {"labels": savings_labels, "values": savings_values},
+        "power_flow":    {"labels": pf_labels, "solar": pf_solar,
+                          "grid": pf_grid, "battery": pf_battery},
+        "hourly":        _hourly_from_decisions(date_param),
+        "averages":      _live_averages_7d(),
+        "date":          date_param,
     })
 
 @app.route("/api/run", methods=["POST"])
@@ -3094,7 +5261,7 @@ def api_influx_debug():
 
 @app.route("/api/weather")
 def api_weather():
-    entity = cfg("sensor_weather", "weather.aemet")
+    entity = cfg("sensor_weather", "")
     s = ha_state(entity)
     if not s:
         return jsonify({"ok": False, "error": "weather entity unavailable"})
@@ -3173,6 +5340,127 @@ def api_wizard_post():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/api/wizard/data-quality", methods=["GET", "POST"])
+def api_wizard_data_quality():
+    """Test data sources and return sample counts + quality score per entity."""
+    data = {}
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+
+    influx_cfg = data.get("influxdb") or _WIZARD.get("influxdb", {})
+    sensors    = data.get("sensors")  or _WIZARD.get("sensors", {})
+    data_source = _WIZARD.get("data_source", "ha_recorder")
+
+    samples: dict[str, int] = {}
+    source_ok = False
+    source_label = "none"
+
+    # ── Try InfluxDB v1 (official HA integration, user/password auth) ────────
+    if influx_cfg.get("host"):
+        try:
+            url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
+            db   = influx_cfg.get("db", "homeassistant")
+            user = influx_cfg.get("username", "")
+            pwd  = influx_cfg.get("password", "")
+            for role, entity_id in sensors.items():
+                if not entity_id:
+                    continue
+                entity_short = entity_id.split(".")[-1] if "." in entity_id else entity_id
+                q = f'SELECT count("value") FROM "{entity_short}" WHERE time > now()-60d'
+                resp, err, _ = _influx_query(url, db, q, user, pwd)
+                if err or not resp:
+                    continue
+                try:
+                    count = resp["results"][0]["series"][0]["values"][0][1]
+                    if count:
+                        samples[entity_id] = int(count)
+                except (KeyError, IndexError, TypeError):
+                    pass
+            source_ok    = True
+            source_label = "influxdb"
+        except Exception as e:
+            log.warning(f"InfluxDB quality check failed: {e}")
+
+    # ── Fall back to HA recorder ─────────────────────────────────────────────
+    if not source_ok:
+        source_label = "ha_recorder"
+        for role, entity_id in sensors.items():
+            if not entity_id:
+                continue
+            try:
+                hist = ha_history(entity_id, days=14)
+                rows = hist[0] if hist else []
+                if rows:
+                    samples[entity_id] = len(rows)
+            except Exception:
+                pass
+
+    # ── Score 0-100 ──────────────────────────────────────────────────────────
+    key_roles   = ["grid_power", "solar_power", "battery_soc", "battery_power"]
+    bonus_roles = ["solar_fc_today", "temp_outdoor", "temp_indoor", "battery_mode_select"]
+    filled_key   = sum(1 for r in key_roles   if sensors.get(r))
+    filled_bonus = sum(1 for r in bonus_roles if sensors.get(r))
+    source_bonus = 30 if source_label == "influxdb" else 10
+    avg_samples  = (sum(samples.values()) / max(len(samples), 1)) if samples else 0
+    sample_score = min(30, int(avg_samples / 500 * 30))   # max 30 pts at 500+ samples/entity
+    sensor_score = int(filled_key / len(key_roles) * 25) + int(filled_bonus / len(bonus_roles) * 15)
+    score = min(100, source_bonus + sensor_score + sample_score)
+
+    # ── Push sensor to HA ────────────────────────────────────────────────────
+    ha_post("/api/states/sensor.energy_optimizer_data_quality", {
+        "state": str(score),
+        "attributes": {
+            "unit_of_measurement": "%",
+            "friendly_name":       "Energy Optimizer Data Quality",
+            "icon":                "mdi:database-check",
+            "source":              source_label,
+            "total_samples":       sum(samples.values()),
+            "entities_with_data":  len(samples),
+        }
+    })
+
+    # ── Get oldest record (first_ts) from InfluxDB ──────────────────────────
+    first_ts = None
+    if influx_cfg.get("host"):
+        try:
+            url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
+            db   = influx_cfg.get("db", "homeassistant")
+            user = influx_cfg.get("username", "")
+            pwd  = influx_cfg.get("password", "")
+            probe = next((v for v in sensors.values() if v), None) or cfg("sensor_battery_soc", "")
+            if probe:
+                meas = probe.split(".")[-1] if "." in probe else probe
+                resp_f, _, _ = _influx_query(url, db, f'SELECT * FROM "{meas}" ORDER BY time ASC LIMIT 1', user, pwd)
+                if resp_f:
+                    try:
+                        first_ts = resp_f["results"][0]["series"][0]["values"][0][0][:10]
+                    except (KeyError, IndexError, TypeError):
+                        pass
+            if not first_ts:
+                resp_m, _, _ = _influx_query(url, db, "SHOW MEASUREMENTS LIMIT 5", user, pwd)
+                if resp_m:
+                    try:
+                        for row in resp_m["results"][0]["series"][0]["values"]:
+                            resp_f, _, _ = _influx_query(url, db, f'SELECT * FROM "{row[0]}" ORDER BY time ASC LIMIT 1', user, pwd)
+                            if resp_f:
+                                first_ts = resp_f["results"][0]["series"][0]["values"][0][0][:10]
+                                break
+                    except (KeyError, IndexError, TypeError):
+                        pass
+        except Exception as e:
+            log.debug(f"first_ts query failed: {e}")
+
+    return jsonify({
+        "ok":            True,
+        "score":         score,
+        "source":        source_label,
+        "samples":       samples,
+        "total_samples": sum(samples.values()),
+        "first_ts":      first_ts,
+        "error":         None,
+    })
+
+
 @app.route("/api/wizard/test-entity")
 def api_wizard_test_entity():
     entity_id = request.args.get("entity_id", "")
@@ -3197,7 +5485,7 @@ def main():
     _load_wizard_cache()
 
     log.info("═══════════════════════════════════════")
-    log.info("   Energy Optimizer v3.0.0 — HAOS")
+    log.info("   Energy Optimizer v3.1.6 — HAOS")
     log.info("═══════════════════════════════════════")
     log.info(f"  Supervisor token:        {'OK' if HA_TOKEN else 'NOT FOUND'}")
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")

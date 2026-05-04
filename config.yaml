@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "3.0.0"
+version: "3.4.1"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -20,16 +20,16 @@ map:
     read_only: true
 
 options:
-  # ── General ────────────────────────────────────────────────────────────────
+  # ── General ────────────────────────────────────────────────────────────────────────────────────────
   decision_interval_minutes: 15
   retrain_cron: "0 3 * * *"
   log_level: "info"
 
-  # ── Seasons ────────────────────────────────────────────────────────────────
+  # ── Seasons ────────────────────────────────────────────────────────────────────────────────────────
   summer_start_month: 6
   summer_end_month: 9
 
-  # ── Battery thresholds ─────────────────────────────────────────────────────
+  # ── Battery thresholds ─────────────────────────────────────────────────────────────────────────────
   solar_tomorrow_irrisoria_kwh: 2.0
   battery_emergency_threshold: 10
   battery_low_threshold: 30
@@ -37,61 +37,61 @@ options:
   battery_storm_threshold: 80
   battery_capacity_kwh: 10.0
 
-  # ── Electrical sensors ─────────────────────────────────────────────────────
+  # ── Electrical sensors ─────────────────────────────────────────────────────────────────────────────
   sensor_battery_soc: "sensor.battery_state_of_capacity"
   sensor_battery_power: "sensor.battery_charge_discharge_power"
-  sensor_grid_power: "sensor.acometida_general_power"
-  sensor_solar_power: "sensor.produccion_placas_power"
+  sensor_grid_power: ""
+  sensor_solar_power: ""
 
-  # ── Solar forecast sensors ─────────────────────────────────────────────────
+  # ── Solar forecast sensors ─────────────────────────────────────────────────────────────────────────
   sensor_solar_current_hour: "sensor.energy_current_hour"
   sensor_solar_next_hour: "sensor.energy_next_hour"
   sensor_solar_today: "sensor.energy_production_today"
   sensor_solar_tomorrow: "sensor.energy_production_tomorrow"
 
-  # ── Temperature sensors ────────────────────────────────────────────────────
-  sensor_temp_outdoor: "sensor.ebusd_broadcast_outsidetemp_temp2"
-  sensor_temp_salon: "sensor.media_salon"
+  # ── Temperature sensors ────────────────────────────────────────────────────────────────────────────
+  sensor_temp_outdoor: ""
+  sensor_temp_salon: ""
 
-  # ── Pool pump ──────────────────────────────────────────────────────────────
-  sensor_pool_hours_day: "sensor.depuradora_encendida_24h"
-  sensor_pool_hours_week: "sensor.depuradora_encendida_semana"
-  switch_pool: "switch.depuradora"
+  # ── Pool pump ─────────────────────────────────────────────────────────────────────────────────────
+  sensor_pool_hours_day: ""
+  sensor_pool_hours_week: ""
+  switch_pool: ""
 
   # ── Pool cleaner (limpiafondos, ~1.5 kWh) — auto-runs first 15 min with pump
-  switch_pool_cleaner: "switch.limpiafondos"
+  switch_pool_cleaner: ""
 
-  # ── Heat pump actuators ────────────────────────────────────────────────────
-  number_hvac_cool: "number.ebusd_ctls2_z1coolingtemp_tempv"
-  number_hvac_heat: "number.ebusd_ctls2_z1manualtemp_tempv"
+  # ── Heat pump actuators ────────────────────────────────────────────────────────────────────────────
+  number_hvac_cool: ""
+  number_hvac_heat: ""
 
-  # ── Battery direct control (Huawei Luna2000) ───────────────────────────────
+  # ── Battery direct control (Huawei Luna2000) ──────────────────────────────────────────────────────
   number_battery_charge_cutoff: "number.battery_grid_charge_cutoff_soc"
-  number_battery_charge_power: "a186f9599e9cad7127bca381f7a8bfb2"
-  number_battery_backup_soc: "de4a2bf18222f354228cdb112b65e882"
-  switch_battery_force_charge: "02db00e10018b01211507db92819a25a"
+  number_battery_charge_power: ""
+  number_battery_backup_soc: ""
+  switch_battery_force_charge: ""
   select_battery_mode: "select.battery_working_mode"
 
-  # ── Dishwasher (monitored, included in consumption predictions) ────────────
-  sensor_dishwasher_state: "sensor.lavavajillas_operation_state"
+  # ── Dishwasher (monitored, included in consumption predictions) ────────────────────────────────────
+  sensor_dishwasher_state: ""
   switch_dishwasher: ""
 
-  # ── Weather (AEMET OpenData) for storm protection ──────────────────────────
+  # ── Weather (AEMET OpenData) for storm protection ─────────────────────────────────────────────────
   sensor_weather: "weather.aemet"
 
-  # ── InfluxDB (optional — enables years of history for ML training) ───────────
+  # ── InfluxDB (optional — enables years of history for ML training) ────────────────────────────────
   influxdb_url: "http://172.30.32.1:8086"
   influxdb_db: "homeassistant"
   influxdb_user: ""
   influxdb_password: ""
 
-  # ── Daily summary notifications ────────────────────────────────────────────
+  # ── Daily summary notifications ───────────────────────────────────────────────────────────────────
   notify_daily_time: "23:00"
-  notify_email_service: "correo_gmail_com"
+  notify_email_service: ""
   notify_email_target: ""
-  notify_telegram_service: "telegramsergio"
+  notify_telegram_service: ""
 
-  # ── Notification toggles (can also be set from the GUI Setup panel) ────────
+  # ── Notification toggles (can also be set from the GUI Setup panel) ───────────────────────────────
   notify_email_enabled: true
   notify_telegram_daily_enabled: true
   notify_telegram_alerts_enabled: true

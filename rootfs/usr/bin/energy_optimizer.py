@@ -5356,28 +5356,44 @@ def api_wizard_data_quality():
     source_label = "none"
 
     # ── Try InfluxDB v1 (official HA integration, user/password auth) ────────
+    # In the old HA→Influx integration the MEASUREMENT is the unit (%, W, kWh…)
+    # and entity_id is a TAG (without domain prefix). Querying FROM "<entity>"
+    # therefore returns nothing — we must regex-match all measurements and
+    # filter by the entity_id tag, same pattern used in ha_history_influx().
     if influx_cfg.get("host"):
         try:
             url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
             db   = influx_cfg.get("db", "homeassistant")
             user = influx_cfg.get("username", "")
             pwd  = influx_cfg.get("password", "")
+            any_response = False
             for role, entity_id in sensors.items():
                 if not entity_id:
                     continue
                 entity_short = entity_id.split(".")[-1] if "." in entity_id else entity_id
-                q = f'SELECT count("value") FROM "{entity_short}" WHERE time > now()-60d'
+                q = (f'SELECT count("value") FROM /.*/ '
+                     f'WHERE "entity_id" = \'{entity_short}\' AND time > now() - 60d')
                 resp, err, _ = _influx_query(url, db, q, user, pwd)
                 if err or not resp:
                     continue
+                any_response = True
                 try:
-                    count = resp["results"][0]["series"][0]["values"][0][1]
-                    if count:
-                        samples[entity_id] = int(count)
-                except (KeyError, IndexError, TypeError):
+                    # Sum across every series (one per matching measurement).
+                    total = 0
+                    for series in resp.json()["results"][0].get("series", []):
+                        cols = series.get("columns", [])
+                        ci   = cols.index("count") if "count" in cols else 1
+                        for v in series.get("values", []):
+                            total += int(v[ci] or 0)
+                    if total:
+                        samples[entity_id] = total
+                except (KeyError, IndexError, TypeError, ValueError):
                     pass
-            source_ok    = True
-            source_label = "influxdb"
+            # Only claim "influxdb" as the source when at least one query
+            # returned data; otherwise let the HA recorder fallback try.
+            if any_response and samples:
+                source_ok    = True
+                source_label = "influxdb"
         except Exception as e:
             log.warning(f"InfluxDB quality check failed: {e}")
 
@@ -5420,6 +5436,8 @@ def api_wizard_data_quality():
     })
 
     # ── Get oldest record (first_ts) from InfluxDB ──────────────────────────
+    # Query by entity_id tag across all measurements (see comment above on
+    # the wrong "FROM <entity>" pattern that this used to use).
     first_ts = None
     if influx_cfg.get("host"):
         try:
@@ -5429,23 +5447,17 @@ def api_wizard_data_quality():
             pwd  = influx_cfg.get("password", "")
             probe = next((v for v in sensors.values() if v), None) or cfg("sensor_battery_soc", "")
             if probe:
-                meas = probe.split(".")[-1] if "." in probe else probe
-                resp_f, _, _ = _influx_query(url, db, f'SELECT * FROM "{meas}" ORDER BY time ASC LIMIT 1', user, pwd)
+                short = probe.split(".")[-1] if "." in probe else probe
+                resp_f, _, _ = _influx_query(
+                    url, db,
+                    f'SELECT "value" FROM /.*/ WHERE "entity_id" = \'{short}\' '
+                    f'ORDER BY time ASC LIMIT 1',
+                    user, pwd)
                 if resp_f:
                     try:
-                        first_ts = resp_f["results"][0]["series"][0]["values"][0][0][:10]
-                    except (KeyError, IndexError, TypeError):
-                        pass
-            if not first_ts:
-                resp_m, _, _ = _influx_query(url, db, "SHOW MEASUREMENTS LIMIT 5", user, pwd)
-                if resp_m:
-                    try:
-                        for row in resp_m["results"][0]["series"][0]["values"]:
-                            resp_f, _, _ = _influx_query(url, db, f'SELECT * FROM "{row[0]}" ORDER BY time ASC LIMIT 1', user, pwd)
-                            if resp_f:
-                                first_ts = resp_f["results"][0]["series"][0]["values"][0][0][:10]
-                                break
-                    except (KeyError, IndexError, TypeError):
+                        data = resp_f.json()
+                        first_ts = data["results"][0]["series"][0]["values"][0][0][:10]
+                    except (KeyError, IndexError, TypeError, ValueError):
                         pass
         except Exception as e:
             log.debug(f"first_ts query failed: {e}")

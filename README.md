@@ -1,24 +1,66 @@
 # Energy Optimizer — Home Assistant Add-on
 
-Smart energy management add-on for Home Assistant OS. Combines a **scikit-learn ML model** with dynamic electricity tariff rules to automatically control a solar battery (Huawei Luna2000), heat pump (ebusd), pool pump, pool cleaner, and dishwasher.
+Smart energy management add-on for Home Assistant OS. Its primary goal is to **minimise your electricity bill** — whether you have a solar battery, a set of schedulable loads (heat pump, EV charger, pool pump, irrigation…), or both. A **scikit-learn ML model** combined with dynamic tariff rules decides in real time when to charge or discharge the battery, when to shift loads to cheap/solar windows, and how much to pre-charge at night — so you import as little peak-rate energy as possible and export as little solar as possible.
+
+> 🔒 **100% local — no cloud, no telemetry.** Everything runs inside the Docker container on your own hardware. Your energy data, sensor readings, and ML model never leave your home network. The add-on only communicates with your local Home Assistant instance and, optionally, a local InfluxDB instance.
+<img width="1157" height="1113" alt="image" src="https://github.com/user-attachments/assets/f2235103-6d81-4d58-b8ca-00148d9acd58" />
 
 > **Installation:** Settings → Add-ons → Add-on store → ⋮ → Repositories → add `https://github.com/hirofairlane/ha-energy-optimizer`
+
+### Python dependencies (bundled in Docker image)
+
+| Library | Version | Purpose |
+|---|---|---|
+| **scikit-learn** | ≥ 1.3 | `GradientBoostingRegressor` + `Pipeline` + `StandardScaler` for SOC prediction |
+| Flask | ≥ 3.0 | Internal API and web panel (port 8765) |
+| APScheduler | ≥ 3.10 | Decision cycle and retrain scheduling |
+| requests | — | Home Assistant REST API client |
+| numpy / pandas | — | Feature engineering and time-series resampling |
 
 ---
 
 ## Table of contents
 
-1. [Features](#features)
-2. [Web panel](#web-panel)
-3. [Battery charging logic](#battery-charging-logic)
-4. [Savings calculation](#savings-calculation)
-5. [ML model](#ml-model)
-6. [Solar terrain correction](#solar-terrain-correction)
-7. [InfluxDB integration](#influxdb-integration)
-8. [Configuration reference](#configuration-reference)
-9. [Electricity tariff](#electricity-tariff)
-10. [Persistent data](#persistent-data)
-11. [Changelog](#changelog)
+1. [Installation](#installation)
+2. [Features](#features)
+3. [Setup Wizard](#setup-wizard)
+4. [Web panel](#web-panel)
+5. [Energy flow diagram](#energy-flow-diagram)
+6. [Battery charging logic](#battery-charging-logic)
+7. [Savings calculation](#savings-calculation)
+8. [ML model](#ml-model)
+9. [Solar terrain correction](#solar-terrain-correction)
+10. [InfluxDB integration](#influxdb-integration)
+11. [Configuration reference](#configuration-reference)
+12. [Electricity tariff](#electricity-tariff)
+13. [Persistent data](#persistent-data)
+14. [Changelog](#changelog)
+
+---
+
+## Installation
+
+**Requirements:** Home Assistant OS or Supervised (any architecture: amd64, aarch64, armv7).
+
+1. In HA go to **Settings → Add-ons → Add-on store → ⋮ menu → Repositories** and add:
+   ```
+   https://github.com/hirofairlane/ha-energy-optimizer
+   ```
+2. Find **Energy Optimizer** in the store and click **Install**.
+3. Start the add-on and open the web panel — the **Setup Wizard** will guide you through the rest.
+
+No YAML editing required. All configuration is done through the wizard and the web panel.
+
+### What you need
+
+| | Required | Optional but recommended |
+|---|---|---|
+| **Battery** | Any smart battery with HA entities for SOC + charge/discharge power | Working mode select, cutoff SOC, force-charge switch (Huawei Luna2000 natively supported) |
+| **Solar** | Forecast.Solar or PVforecast integration | Real-time production sensor |
+| **History** | HA Recorder (14-day window) | InfluxDB for 90-day ML training window |
+| **Schedulable loads** | At least one (heat pump, pool pump, EV charger, or any `switch.*`) | Multiple loads — each adds a scheduling optimisation layer |
+
+The add-on is useful even with **no battery** if you have loads you can shift: it will schedule them to coincide with solar surplus or valley-tariff windows.
 
 ---
 
@@ -26,33 +68,219 @@ Smart energy management add-on for Home Assistant OS. Combines a **scikit-learn 
 
 | Feature | Description |
 |---|---|
-| **Smart valley charging** | Calculates exactly how much battery to charge from the grid at night (valley rate) to cover tomorrow's peak demand — no more, no less |
-| **Solar terrain correction** | Learns your real production vs HA forecast from InfluxDB history. Corrects for local shading (hills, buildings) automatically |
-| **Temperature-aware target** | Cold days = more heat pump during peak hours → charges more battery. Hot days = more cooling → same adjustment |
-| **Storm protection** | Reads AEMET weather data; pre-charges to a configurable reserve when adverse weather is imminent |
+| **Setup Wizard** | 8-step guided configuration — auto-discovers your HA entities with ML-based scoring. No YAML editing required |
+<img width="952" height="862" alt="image" src="https://github.com/user-attachments/assets/92348e09-e4ba-4a80-b406-7add53b455a5" />
+| **Smart valley charging** | Calculates exactly how much battery to charge from the grid at night to cover tomorrow's peak demand — no more, no less |
+| **Energy flow diagram** | Animated SVG showing real-time power flows between Solar, Battery, Grid, and House nodes |
+<img width="556" height="312" alt="image" src="https://github.com/user-attachments/assets/0d08be64-683c-4aac-a5c1-02898d194154" />
+
+| **Live 7-day averages** | Each sensor card shows instantaneous value + Ø7d rolling average (solar: daylight hours only) |
+| **Solar terrain correction** | Learns your real production vs HA forecast from InfluxDB history — corrects for local shading automatically |
+| **Temperature-aware target** | Cold days = more heat pump during peak hours → charges more battery |
+| **Storm protection** | Reads weather entity; pre-charges to a configurable reserve when adverse weather is imminent |
 | **Heat pump control** | Adjusts setpoints based on season, indoor temperature, and free solar surplus (SOC ≥ 99%) |
 | **Pool pump** | Runs during solar surplus or valley tariff to meet daily/weekly runtime targets |
 | **Pool cleaner** | Auto-starts with pool pump, auto-stops after 15 min (~1.5 kWh) |
-| **Dishwasher** | Monitored; can be controlled to run during surplus or valley |
-| **ML SOC prediction** | GradientBoostingRegressor trained on up to 365 days of InfluxDB history (R²≈0.998) |
+| **Dishwasher** | Monitored; recommendation to run during surplus or valley |
+| **ML SOC prediction** | GradientBoostingRegressor trained on up to 90 days of history. Dynamic features from wizard config |
 | **Prediction accuracy chart** | Live SOC: actual vs ML-predicted (24h) + 8h forward forecast. Shows MAE badge |
-| **Solar history charts** | 7-day and 12-month Actual vs HA Forecast line charts — reveals systematic forecast deviations |
-| **Daily savings chart** | 7-day bar chart with € value labels; uses counterfactual method vs no-battery baseline |
+| **Solar history charts** | 7-day and 12-month Actual vs HA Forecast line charts |
+| **Daily savings chart** | 7-day bar chart with € value labels; counterfactual method |
+| **Historical averages** | Day view KPI cards show all-time Ø below each value. History tab adds a 5-card summary with all-time and last-12-months averages for solar, consumption, export, import, and self-sufficiency |
+| **Battery ROI calculator** | Enter cost + capacity of additional storage — calculates payback period from your actual average daily savings |
+| **Battery health mode** | Three operating modes in Tweaks: ⚡ Bill Reducer (10–95%), ⚖️ Optimized (20–90%), 🛡️ Battery Guard (25–85%). Controls the SOC range used for the nightly charge target |
+| **Split battery sensors** | For inverters that report charge and discharge as two separate positive entities (Deye, Solarman, Growatt…), enable the "Split sensors" toggle in the Battery wizard step and pick the two entity IDs. The add-on combines them automatically (`charge − discharge`) |
 | **Telegram instant alerts** | Emergency charge, storm mode, forced grid charge |
 | **Daily summary** | HTML email + Telegram report at configurable time |
+| **Debug section** | Tweaks tab shows how each sensor role resolves (wizard → options → fallback) with live HA value |
+
+---
+
+## Setup Wizard
+
+The wizard is the recommended way to configure the add-on. It runs through 8 steps and auto-discovers your HA entities using a keyword + device class + unit scoring algorithm.
+
+
+<img width="969" height="267" alt="Data → Location → Grid → Solar → Battery → Loads → Tariff → Done" src="https://github.com/user-attachments/assets/ca98e827-4d50-4e98-99ca-a615ee265e30" />
+
+
+### Steps
+
+| Step | What it configures |
+|---|---|
+| **Data** | History source: InfluxDB v2 (recommended, 90 days) or HA Recorder (14 days) |
+| **Location** | GPS coordinates and timezone — used for solar geometry and ML features |
+| **Grid** | Grid meter sensor (import/export) |
+| **Solar** | Production sensor + Forecast.Solar sensors (today/tomorrow/hourly) |
+| **Battery** | SOC sensor, charge/discharge power, working mode select, charge cutoff, backup SOC, force charge switch |
+| **Loads** | Per-device sub-wizards for each enabled appliance (see [Supported loads](#supported-loads)) |
+| **Tariff** | Contracted power, tariff type, peak/shoulder/valley prices |
+| **Done** | Data quality score summary and save |
+
+### Data Quality Thermometer
+
+The wizard header shows a live quality score (0–100%):
+
+| Score | Meaning |
+|---|---|
+| ≥ 70% 🟢 | Enough data for reliable ML predictions |
+| 40–70% 🟠 | Partial data — predictions will work but with higher uncertainty |
+| < 40% 🔴 | Insufficient data — add InfluxDB or wait for recorder history to accumulate |
+
+Score factors: history source (30 pts) + key sensor coverage (25 pts) + sample count bonus (30 pts) + optional sensors (15 pts).
+
+### Entity auto-discovery
+
+For each sensor role, the wizard queries all HA entities and scores them:
+
+| Signal | Points |
+|---|---|
+| Matching `device_class` | +50 |
+| Matching unit of measurement | +40 |
+| Each matching keyword in entity ID | +25 |
+
+Top candidates are shown as clickable cards. The selected entity is saved to `wizard_config.json` and takes precedence over `options.json` for all decisions.
+
+### Supported loads
+
+The Loads step shows a card for each appliance type. Select the ones present in your installation — the wizard then walks through a sub-wizard for each one. Each selected device also appears as a small emoji dot in the wizard navigation bar.
+
+| Load | Icon | What you configure | What the engine does |
+|---|---|---|---|
+| **HVAC** | 🌡️ | Climate entity or heat/cool setpoint numbers per zone. 24h schedule with Comfort 🟢 / Surplus 🔵 / Minimum ⚫ temperature tiers | Raises/lowers setpoints based on tariff period, solar surplus (SOC ≥ 99%), and indoor temperature. Multi-zone supported |
+| **Pool pump** | 🏊 | Pool switch + optional runtime sensors (daily/weekly hours) | Runs during solar surplus (SOC ≥ 99%) or valley tariff to meet runtime targets |
+| **Pool cleaner** | 🤿 | Cleaner switch entity | Auto-starts with the pool pump, auto-stops after 15 min (~1.5 kWh) |
+| **Dishwasher** | 🍽️ | State sensor + optional switch | Monitors cycle state; recommends (or triggers) start during solar surplus or valley |
+| **Washing machine** | 👕 | State sensor + power meter | Monitors cycle; recommends start during cheapest/greenest window |
+| **Dryer** | 🌀 | State sensor + power meter | Same as washing machine |
+| **EV Charger** | 🚗 | Switch or number entity (Wallbox, OCPP, Zappi…) | Schedules charging during valley tariff or solar surplus |
+| **Custom** | ⚙️ | Any `switch.*` entity + estimated watts + schedule preference | Schedules any switch-controlled load (irrigation pump, water heater, etc.) according to the selected window |
+
+#### Custom load scheduling options
+
+When adding a Custom load you choose one of four scheduling modes:
+
+| Mode | When the switch is turned on |
+|---|---|
+| 🌙 **Valley tariff only** | During the cheapest grid tariff window (typically 00:00–08:00) |
+| ☀️ **Solar surplus only** | When solar production exceeds house consumption (SOC ≥ 99%) |
+| ☀️🌙 **Solar + Valley** | Either of the above |
+| ⏱ **Custom hours** | A fixed time range you specify (e.g. `10-14,22-06`) |
+
+Multiple Custom loads can be added (e.g. irrigation pump + water heater), each with its own entity, wattage, and schedule.
 
 ---
 
 ## Web panel
 
-Four tabs, accessible via HA ingress (port 8765, no external port needed):
+Five tabs, accessible via HA ingress (port 8765, no external port needed):
 
 | Tab | Contents |
 |---|---|
-| 📊 Dashboard | Live KPIs · battery card with manual charge buttons · smart target reasoning · recent decision log |
-| 📈 Charts | SOC actual vs predicted (24h) + MAE · Solar 7d actual vs forecast · Solar 12m actual vs forecast · Daily savings 7d |
-| ⚡ Tariff | Per-day weekend config · per-hour timeline · price editor · Reset to defaults |
-| ⚙️ Setup | Notification toggles · battery threshold sliders · decision interval · Data Sources debug panel |
+| 📊 **Dashboard** | Live KPIs · 4-card power panel · animated energy flow diagram · battery card with manual charge buttons · smart target reasoning · recent decision log |
+| 📈 **Charts** | SOC actual vs predicted (24h) + MAE · Solar 7d actual vs forecast · Solar 12m actual vs forecast · Daily savings 7d · Power flow 24h |
+| ⚡ **Tariff** | Per-day weekend config · per-hour timeline · price editor · Reset to defaults |
+| ⚙️ **Setup (Tweaks)** | Notification toggles · battery threshold sliders · decision interval · Data Sources connectivity test · **Debug: sensor resolution table** |
+| 🧙 **Wizard** | Full setup wizard (see above) |
+
+### Setup (Tweaks) tab
+
+The Tweaks tab is the runtime control panel — all changes take effect immediately without restarting the add-on.
+
+| Section | What it does |
+|---|---|
+| **Battery health mode** | Three-button selector controlling the SOC operating range for the nightly charge target (see below). |
+| **Notifications** | Enable/disable email daily summary, Telegram daily summary, and instant Telegram alerts individually. |
+| **Battery thresholds** | Sliders for emergency, low, medium, and storm SOC thresholds. Adjust without editing `config.yaml`. |
+| **Decision interval** | How often (in minutes) the optimization engine runs. Default 15 min. |
+| **Data Sources** | Connectivity test for InfluxDB and HA Recorder — shows last-read timestamp, row count, and active/fallback status. |
+| **Debug: sensor resolution** | Table that auto-loads when you open the tab and shows exactly how every sensor role was resolved. A **Refresh** button re-reads live HA values. |
+
+#### Battery health mode
+
+| Mode | SOC range | Description |
+|---|---|---|
+| ⚡ **Bill Reducer** | 10% – 95% | Default. Uses full battery capacity every cycle — maximum daily savings. |
+| ⚖️ **Optimized** | 20% – 90% | Sweet spot for most installations: ~95% of savings benefit with moderate cycle protection. |
+| 🛡️ **Battery Guard** | 25% – 85% | Prioritises longevity — recommended for batteries older than 3 years or with visible capacity degradation. |
+
+The selected mode clamps the nightly charge target: the engine will never set a target below the mode's minimum or above its maximum, regardless of the calculated optimal. Saved in `/data/setup.json` and applied immediately without restart.
+
+#### Debug sensor resolution table
+
+| Column | Meaning |
+|---|---|
+| **Role** | Internal name (e.g. `solar_power`, `battery_soc`) |
+| **Entity ID** | The HA entity resolved for this role |
+| **Source** | `wizard` (wizard_config.json) · `options` (config.yaml) · `fallback` (built-in default) |
+| **Value** | Current state read from HA at refresh time |
+| **Status** | ✓ valid reading · ⚠ entity exists but value is unexpected · ✗ not found or unavailable |
+
+This is the first place to look when a Dashboard card shows 0 W or "unavailable" — it shows whether the problem is entity resolution or a real sensor issue.
+
+---
+
+### Day view
+
+A date navigator (← Today →) plus five KPI cards: Solar / Consumed / Exported / Imported / Self-sufficiency. Each card shows the day's total and, below it, the **all-time daily average (Ø)** computed from all recorded days. Hover over a card for a tooltip explaining the calculation. Below the KPIs: a stacked hourly energy bar chart and a SOC line for the selected day.
+
+### History view
+
+A 5-card summary row at the top shows **all-time** and **last-12-months** daily averages for all five KPIs — useful for spotting seasonal patterns or tracking improvement over time.
+
+Below the charts, the **Battery ROI calculator** lets you enter the cost (€) and extra capacity (kWh) of additional storage and calculates:
+- Your current average daily savings (from `savings.json`)
+- Estimated extra savings proportional to the added capacity
+- Payback period in days or years
+
+> The calculator uses a linear proportionality assumption. Real results depend on your tariff, usage patterns, and how often the battery is the limiting factor.
+
+### Live power panel
+
+Four cards updated every 30 seconds, each showing instantaneous value + Ø7d rolling average:
+
+| Card | Color | Average logic |
+|---|---|---|
+| ☀️ Solar | Yellow | Mean only when solar > 0 W (excludes night) |
+| ⚡ Grid | Green (export) / Red (import) | Net mean (positive = selling) |
+| 🔋 Battery | Green (charging) / Red (discharging) | Net mean |
+| 🏠 House | Orange | Mean of consumption samples > 0 |
+
+---
+
+## Energy flow diagram
+
+An animated SVG diagram shows real-time power flows between four nodes:
+
+<img width="507" height="295" alt="image" src="https://github.com/user-attachments/assets/e7306a9c-eda7-4647-a7dd-02e24281e2d1" />
+
+
+### Sensor conventions
+
+| Sensor | Convention |
+|---|---|
+| `solar` | Always ≥ 0 W |
+| `grid` | Positive = exporting (selling), Negative = importing (buying) |
+| `battery` | Positive = charging (energy IN to battery), Negative = discharging (energy OUT) |
+
+**House balance:** `P_casa = solar − grid − battery`
+
+### Flow priority order
+
+```
+A. Solar → Casa  (first priority)
+   Solar → Battery  (surplus charging)
+   Solar → Grid  (remaining export)
+
+B. Battery → Casa  (discharge covers remaining house load)
+   Battery → Grid  (excess discharge if any)
+
+C. Grid → Battery  (emergency: grid covers what solar can't charge)
+   Grid → Casa  (grid covers remaining house load)
+```
+
+Each line is animated only when its flow exceeds 10 W. Animation speed is proportional to power:
+`speed = max(0.35, 2.4 − power/1800)` seconds per cycle.
 
 ---
 
@@ -60,7 +288,7 @@ Four tabs, accessible via HA ingress (port 8765, no external port needed):
 
 ### Core principle
 
-At night (00:00–08:00) the tariff is **valley** (cheapest: €0.1147/kWh). Importing from the grid at night is cheap — there is no benefit in using the battery to cover night consumption. The battery's job is to store cheap valley electricity so the house can avoid importing expensive **peak** electricity (€0.2234/kWh) the next day.
+At night (00:00–08:00) the tariff is **valley** (cheapest). Importing from the grid at night is cheap — the battery's job is to store cheap valley electricity so the house can avoid importing expensive **peak** electricity the next day.
 
 > **The question the system answers:**  
 > *"How full does the battery need to be at the start of tomorrow's peak hours so I never need to import from the grid at peak prices?"*
@@ -70,38 +298,26 @@ At night (00:00–08:00) the tariff is **valley** (cheapest: €0.1147/kWh). Imp
 **1. Solar forecast (terrain-corrected)**
 
 ```
-solar_forecast_raw   = sensor.energy_production_tomorrow   (HA / PVforecast)
-terrain_factor       = median(actual_daily / ha_forecast_daily)  over last 30 days
-solar_tomorrow       = solar_forecast_raw × terrain_factor
+solar_forecast_raw = tomorrow's production forecast (kWh)
+terrain_factor     = median(actual_day / forecast_day) over last 30 days
+solar_tomorrow     = solar_forecast_raw × terrain_factor
 ```
 
-The terrain factor is computed automatically from InfluxDB history. If a hill blocks your afternoon sun and HA consistently over-predicts by 15%, the factor will converge to ~0.85. See [Solar terrain correction](#solar-terrain-correction).
+**2. Solar during peak hours**
 
-**2. Solar energy available during peak hours**
-
-Peak tariff applies 10:00–14:00 and 18:00–22:00 (8 hours/day on weekdays).
-
-- The window 10:00–15:00 overlaps with the morning peak. Roughly **45% of daily solar production** falls in this window.
-- The evening peak (18:00–22:00) receives near-zero solar in mainland Spain regardless of season.
-
+~45% of daily production falls in the 10:00–15:00 morning peak window:
 ```
 solar_during_peak = solar_tomorrow × 0.45
 ```
 
 **3. Peak consumption estimate**
 
-Base load is estimated from the average grid power during the last 14 nights (22:00–08:00), queried from InfluxDB. Night hours are used because:
-- No solar interference
-- No big appliance cycles
-- Result reflects the true household base load
-
+From average grid power during the last 14 nights (22:00–08:00) via InfluxDB:
 ```
 peak_base_kwh = base_load_kW × 8   (8 peak hours)
 ```
 
 **4. Temperature correction**
-
-The heat pump (ebusd) is the dominant variable load. Cold days mean it runs harder and longer during peak hours:
 
 | Outdoor temperature | Correction |
 |---|---|
@@ -112,31 +328,12 @@ The heat pump (ebusd) is the dominant variable load. Cold days mean it runs hard
 | 25–30 °C | +0.5 kWh |
 | > 30 °C | +1.5 kWh |
 
-```
-peak_total_kwh = peak_base_kwh + temperature_correction_kwh
-```
-
 **5. Battery charge target**
 
 ```
-battery_gap_kwh = max(0,  peak_total_kwh − solar_during_peak_kwh)
-target_SOC      = (battery_gap_kwh / battery_capacity_kWh) × 100 + 5%  (safety buffer)
+battery_gap_kwh = max(0, peak_total_kwh − solar_during_peak_kwh)
+target_SOC      = (battery_gap_kwh / battery_capacity_kWh) × 100 + 5%
 target_SOC      = clamp(target_SOC, 30%, 95%)
-```
-
-The **30% floor** ensures the battery always has a minimum reserve. The **5% safety buffer** absorbs forecast errors.
-
-### Example
-
-> Outdoor temp: 8 °C · Solar tomorrow (corrected): 9.0 kWh · Base load: 0.98 kW · Battery: 10 kWh
-
-```
-solar_during_peak = 9.0 × 0.45 = 4.05 kWh
-peak_base_kwh     = 0.98 × 8   = 7.84 kWh
-temp_correction   =              2.00 kWh  (8 °C → 5–10 °C bracket)
-peak_total_kwh    =              9.84 kWh
-battery_gap_kwh   = 9.84 − 4.05 = 5.79 kWh
-target_SOC        = (5.79 / 10) × 100 + 5 = 63%
 ```
 
 The Dashboard "Smart target" line shows the full breakdown in real time.
@@ -146,8 +343,8 @@ The Dashboard "Smart target" line shows the full breakdown in real time.
 | Situation | Action |
 |---|---|
 | SOC < emergency threshold (default 10%) | Force-charge at any tariff, any time |
-| Storm forecast (AEMET) | Pre-charge to storm threshold (default 80%) |
-| Valley + SOC below smart target | Charge at configured power (default ~3 kW) |
+| Storm forecast | Pre-charge to storm threshold (default 80%) |
+| Valley + SOC below smart target | Charge at configured power |
 | Peak tariff | No grid charging under any normal circumstance |
 | SOC ≥ 99% (free solar surplus) | Heat pump boost / pool pump starts |
 
@@ -157,238 +354,149 @@ The Dashboard "Smart target" line shows the full breakdown in real time.
 
 ### Methodology: counterfactual baseline
 
-The system calculates savings by comparing **what actually happened** against the counterfactual of **no smart battery management** — i.e., if the battery were absent, the house would have imported everything from the grid at spot price and exported surplus solar at export price.
-
 For every 15-minute decision cycle:
 
-```
-# Sensor convention (sensor.acometida_general_power):
+```python
+# Sensor conventions:
 #   grid_power    < 0 → buying from grid (import)
 #   grid_power    > 0 → selling to grid  (export)
 #   battery_power > 0 → battery charging
 #   battery_power < 0 → battery discharging
 
-# Energy balance at the meter: P_grid = P_solar − P_house − P_bat
-# Without smart battery (P_bat = 0): P_grid_nb = P_solar − P_house = P_grid + P_bat
+# Without battery: what would the grid meter read?
 grid_without_battery = grid_power + battery_power
 
 def energy_cost(g, import_price, export_price):
     if g < 0:
-        return −g × (interval_hours / 1000) × import_price   # paying for import (positive cost)
+        return -g × interval_hours × import_price / 1000   # cost of import
     else:
-        return −g × (interval_hours / 1000) × export_price   # income from export (negative cost)
+        return -g × interval_hours × export_price / 1000   # income from export
 
-saving_interval = energy_cost(grid_without_battery) − energy_cost(grid_power)
+saving = energy_cost(grid_without_battery) - energy_cost(grid_power)
 ```
 
-Daily savings are the sum of all positive (and occasional negative) interval savings.
-
-### What this captures
-
-| Scenario | Effect |
-|---|---|
-| Battery discharging at peak → house self-sufficient | `grid_without` > 0, `grid_actual` ≈ 0 → large positive saving |
-| Battery charged from solar at midday, discharged at peak | Captured across the full cycle |
-| Battery charged from grid at valley, discharged at peak | Saving = peak_price − valley_price per kWh ≈ €0.11/kWh |
-| Battery management made no difference in a cycle | saving ≈ 0 |
-| Model charged when unnecessary (rare) | Small negative saving — honest accounting |
-
-### Savings reference prices (2.0TD Spain — all-in, taxes included)
-
-| Period | Hours | Price |
-|---|---|---|
-| Peak (Punta) | Weekdays 10–14h, 18–22h | €0.2234/kWh |
-| Shoulder (Llano) | Weekdays 08–10h, 14–18h, 22–00h | €0.1483/kWh |
-| Valley (Valle) | 00–08h · All day weekends | €0.1147/kWh |
-| Export (Excedentes) | — | €0.040/kWh |
-
-Prices are stored in `/data/tariff.json`. Use "↩ Reset to defaults" in the Tariff tab to restore these values.
+Daily savings are the sum of all interval savings.
 
 ---
 
-## ML model
+## ML model (scikit-learn)
+
+**scikit-learn** is bundled inside the Docker image — no manual installation needed.
 
 ### What it predicts
 
-A **GradientBoostingRegressor** predicts the battery SOC value for the current moment, given recent sensor readings. It is not a multi-step planner — it predicts "what the SOC should be right now" from features, which is then used as a sanity check and to populate the predicted-SOC line in the charts.
+A `GradientBoostingRegressor` wrapped in a scikit-learn `Pipeline(StandardScaler → GBR)` predicts the battery SOC for the current moment from recent sensor readings. Used as a sanity check and to populate the predicted-SOC line in Charts.
 
-### Features
+### Dynamic features
 
-| Feature | Description |
+The feature set is built from the sensors configured in the wizard. If a sensor has no history, it is excluded. The feature list is saved alongside the model:
+
+| Feature | Condition |
 |---|---|
-| `hour` | Hour of day (0–23) — captures daily production patterns |
-| `weekday` | Day of week (0–6) — captures pool/dishwasher schedules |
-| `month` | Month (1–12) — captures seasonal solar variation |
-| `lag1` | SOC 15 min ago |
-| `lag4` | SOC 1 h ago |
-| `roll4` | Rolling mean SOC over last 1 h |
-| `solar_proxy` | **Continuous** sun elevation angle 0–1 (see below) |
-
-### Solar proxy: continuous elevation angle
-
-Before v2.6.1, `solar_proxy` was a binary flag (1 if 08:00–19:00, 0 otherwise). This treated dawn, noon, and dusk identically.
-
-Since v2.6.1, it uses a geometric calculation for latitude 40.67°N (Guadarrama, Madrid):
-
-```python
-declination = 23.45° × sin(360/365 × (day_of_year − 81))
-hour_angle  = 15° × (hour − 13.5)   # solar noon ≈ 13:30 local in Madrid
-elevation   = arcsin(sin(lat) × sin(decl) + cos(lat) × cos(decl) × cos(h_angle))
-solar_proxy = max(0, elevation) / 70°   # 70° ≈ peak summer elevation at this lat
-```
-
-Resulting values (June, 40.67°N):
-
-| Hour | Elevation | Proxy |
-|---|---|---|
-| 07:00 | ~5° | 0.07 |
-| 09:00 | ~35° | 0.50 |
-| 13:30 | ~72° | 1.00 |
-| 17:00 | ~35° | 0.50 |
-| 19:00 | ~8° | 0.11 |
-| 20:00 | ~0° | 0.00 |
-
-This means the model can distinguish "afternoon with hill shadow" from "midday full sun" — the `hour` feature already captures the terrain effect implicitly through historical lag data, but the continuous proxy adds an explicit geometric signal.
+| `hour`, `weekday`, `month` | Always |
+| `lag1`, `lag4`, `roll4` (SOC lags) | Always |
+| `solar_proxy` (geometric sun elevation 0.0–1.0) | Always |
+| `temp_out`, `temp_out_lag4` | If outdoor temp sensor has history |
+| `solar_lag1`, `solar_roll4` | If solar sensor has history |
+| `grid_lag1`, `grid_roll4`, `grid_abs_lag1` | If grid sensor has history |
+| `sm_{name}_lag1` | For each configured sub-meter |
 
 ### Training
 
-- **Data source:** InfluxDB first (up to 365 days); falls back to HA recorder (progressive: 60→30→14→7 days)
-- **Schedule:** nightly at 03:00 (configurable via `retrain_cron`)
+- **Source:** InfluxDB v2 (wizard config, 90 days) → InfluxDB v1 (options, 60 days) → HA Recorder (14 days)
+- **Schedule:** nightly at 03:00 (`retrain_cron` option)
 - **Pipeline:** `StandardScaler → GradientBoostingRegressor(n_estimators=150, max_depth=4)`
-- **Validation:** 3-fold cross-validation R² reported in Dashboard KPI
-- **Auto-retrain on feature change:** `MODEL_FEATURE_VER` constant; if the saved model was trained with an older feature set, a background retrain is triggered automatically on the next cycle
+- **Validation:** 3-fold cross-validation R² shown in Dashboard
+- **Auto-retrain:** triggers when feature version changes
 
 ### 8-hour forward forecast
 
-The Charts tab shows a green dashed line extending 8 hours into the future. It is computed by chaining single-step predictions:
-
-```
-for h in 1..8:
-    solar_proxy_h = elevation_angle(now + h hours)
-    soc_h         = model.predict([hour, weekday, month, soc_{h-1}, soc_{h-1}, soc_{h-1}, solar_proxy_h])
-```
-
-Lag features are updated with each predicted value, so compounding errors grow with horizon. The line is indicative, not a precise forecast.
+Computed by chaining single-step predictions, updating lag features with each predicted value. Shown as a dashed line in Charts.
 
 ---
 
 ## Solar terrain correction
 
-HA solar forecast sensors (e.g. Forecast.Solar) use panel orientation and installed capacity but have no knowledge of local terrain. A hill, building, or tree can block the sun during specific hours every day, causing a **systematic over-prediction** that no amount of cloud adjustment will fix.
+HA solar forecast sensors (Forecast.Solar, etc.) use panel orientation and capacity but have no knowledge of local terrain. Hills or buildings cause systematic over-prediction that the system learns and corrects automatically.
 
-### How the correction is computed
-
-Every 6 hours the system queries InfluxDB for the last 30 days of:
-- `energy_production_today` — actual production (MAX per UTC day = full-day total)
-- `energy_production_tomorrow` — HA forecast (LAST value per day = the forecast for the next day)
-
+Every 6 hours, from 30 days of InfluxDB history:
 ```
 ratios = [actual_day_D / forecast_day_{D-1} for each day D]
-terrain_factor = median(ratios)   # median is robust against cloudy-day outliers
+terrain_factor = median(ratios)
 terrain_factor = clamp(terrain_factor, 0.30, 1.50)
 ```
 
-At least 7 days of data are required before the factor deviates from 1.0.
-
-### Where it is applied
-
-1. `calculate_optimal_soc()` — corrected solar feeds the charge target calculation
-2. Dashboard "Solar tomorrow" KPI — shows "Terrain factor: XX%" when ≠ 100%
-3. Decision log — charge reason includes terrain-corrected solar value
-
-### Example
-
-> HA forecast: 9.5 kWh · Terrain factor: 0.87 (hill blocks 13% of afternoon production)  
-> Corrected forecast used for decisions: 9.5 × 0.87 = **8.3 kWh**
-
-Without correction the system would assume more solar than it gets, potentially under-charging at night.
+The median is robust against cloudy-day outliers. Requires at least 7 days of data. Shown as "Terrain factor: XX%" in the Dashboard.
 
 ---
 
 ## InfluxDB integration
 
-InfluxDB (HAOS add-on v5.0.2, running InfluxDB 1.8.x) is the **primary data source** for ML training and for all multi-day chart data. HA recorder is only a fallback.
+InfluxDB is the primary data source for ML training and multi-day charts. HA Recorder is the fallback.
 
 ### Connection
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `influxdb_url` | `http://172.30.32.1:8086` | HA supervisor bridge IP |
+| `influxdb_url` | `http://172.30.32.1:8086` | HA supervisor bridge IP (standard for HAOS) |
 | `influxdb_db` | `homeassistant` | |
-| `influxdb_user` | _(empty)_ | Leave empty if auth is disabled |
+| `influxdb_user` | _(empty)_ | Leave empty if auth disabled |
 | `influxdb_password` | _(empty)_ | |
 
-Auth is auto-detected: the add-on tries with credentials first; if InfluxDB returns 401 (auth disabled on server), it retries without credentials.
+Auth is auto-detected: tries with credentials first, retries without if InfluxDB returns 401.
 
-### Data format (old HA integration)
+### Data format
 
 The HA→InfluxDB integration (pre-2023) stores data as:
-- **Measurement** = unit of the sensor (e.g. `%`, `W`, `kWh`, `°C`)
-- **Tag** `entity_id` = sensor name **without domain prefix** (e.g. `battery_state_of_capacity`, not `sensor.battery_state_of_capacity`)
-
-All InfluxDB queries in this add-on strip the domain prefix accordingly.
-
-### What is queried
-
-| Data | Query | Used for |
-|---|---|---|
-| Battery SOC history | `MAX("value")` per 15 min, last 365 days | ML training |
-| Grid power history | `MAX("value")` per raw point, last 14 days | Night consumption estimate |
-| Solar actual (daily) | `MAX("value") GROUP BY time(1d)` | Solar 7d/12m charts, terrain correction |
-| Solar forecast (daily) | `LAST("value") GROUP BY time(1d)` shifted +1d | Solar charts, terrain correction |
-| Solar yesterday | `MAX("value")` for previous UTC day | Charts |
-
-### Setup tab — Data Sources debug panel
-
-The **Setup** tab has a **Test connections** button that runs a live diagnostic:
-- InfluxDB reachability and auth mode
-- Available databases
-- Measurements list
-- Entity tag discovery for the battery SOC sensor
-- Sample record count (7 days)
+- **Measurement** = unit of the sensor (`%`, `W`, `kWh`, `°C`)
+- **Tag** `entity_id` = sensor name **without domain prefix** (e.g. `battery_state_of_capacity`)
 
 ---
 
 ## Configuration reference
 
-> Since v3.0 the **Setup wizard** (Setup tab → "Configure entities") is the recommended way to fill these. The wizard scans your HA states, scores candidates by name/unit/device_class and proposes the best match for each role. The fields below are still readable from `config.yaml` as a fallback, but most installations should leave them empty and let the wizard write them to `/data/wizard_config.json`.
+> Since v3.0 the **Setup wizard** (Setup tab → "Configure entities") is the recommended way to fill these. The wizard scans your HA states, scores candidates by name/unit/device_class and proposes the best match for each role. All options can also be set in the HA add-on Configuration UI as a fallback, but the wizard's `/data/wizard_config.json` takes priority over them for all sensor lookups.
 
 ### Sensors
 
-| Option | Description | Default |
+| Option | Default | Description |
 |---|---|---|
-| `sensor_battery_soc` | Battery state of charge (%) | `sensor.battery_state_of_capacity` (Huawei Modbus standard) |
-| `sensor_battery_power` | Charge/discharge power (W, +ve=charge) | `sensor.battery_charge_discharge_power` (Huawei Modbus standard) |
-| `sensor_grid_power` | Grid meter (W, **−ve=import, +ve=export**) | _(empty — set via wizard)_ |
-| `sensor_solar_power` | Panel output right now (W, live) | _(empty — set via wizard)_ |
-| `sensor_solar_current_hour` | Solar production this hour (kWh) | `sensor.energy_current_hour` (HA Energy dashboard) |
-| `sensor_solar_next_hour` | Solar forecast next hour (kWh) | `sensor.energy_next_hour` |
-| `sensor_solar_today` | Cumulative production today (kWh) | `sensor.energy_production_today` |
-| `sensor_solar_tomorrow` | Forecast for tomorrow (kWh) | `sensor.energy_production_tomorrow` |
-| `sensor_temp_outdoor` | Outdoor temperature (°C) | _(empty — set via wizard)_ |
-| `sensor_temp_salon` | Indoor temperature (°C) | _(empty — set via wizard)_ |
-| `sensor_weather` | AEMET weather entity | `weather.aemet` |
+| `sensor_battery_soc` | `sensor.battery_state_of_capacity` | Battery state of charge (%) — Huawei Modbus standard |
+| `sensor_battery_power` | `sensor.battery_charge_discharge_power` | Charge/discharge power (W, **+ve = charging**) — Huawei Modbus standard |
+| `sensor_grid_power` | _(empty)_ | Grid meter (W, **+ve = export, −ve = import**) |
+| `sensor_solar_power` | _(empty)_ | Panel output right now (W, always ≥ 0) |
+| `sensor_solar_current_hour` | `sensor.energy_current_hour` | Solar production this hour (kWh) — HA Energy dashboard |
+| `sensor_solar_next_hour` | `sensor.energy_next_hour` | Solar forecast next hour (kWh) |
+| `sensor_solar_today` | `sensor.energy_production_today` | Cumulative production today (kWh) |
+| `sensor_solar_tomorrow` | `sensor.energy_production_tomorrow` | Forecast for tomorrow (kWh) |
+| `sensor_temp_outdoor` | _(empty)_ | Outdoor temperature (°C) |
+| `sensor_temp_salon` | _(empty)_ | Indoor temperature (°C) |
+| `sensor_weather` | _(empty)_ | Weather entity (for storm detection) |
 
 ### Actuators
 
-| Option | Description | Default |
+| Option | Default | Description |
 |---|---|---|
-| `switch_pool` | Pool pump switch | _(empty — set via wizard)_ |
-| `switch_pool_cleaner` | Pool cleaner switch | _(empty — set via wizard)_ |
-| `number_hvac_cool` | Heat pump cooling setpoint | _(empty — set via wizard)_ |
-| `number_hvac_heat` | Heat pump heating setpoint | _(empty — set via wizard)_ |
-| `number_battery_charge_cutoff` | Battery grid charge cutoff SOC | `number.battery_grid_charge_cutoff_soc` (Huawei Modbus standard) |
-| `select_battery_mode` | Battery working mode select | `select.battery_working_mode` (Huawei Modbus standard) |
+| `switch_pool` | _(empty)_ | Pool pump switch |
+| `switch_pool_cleaner` | _(empty)_ | Pool cleaner switch |
+| `number_hvac_cool` | _(empty)_ | Heat pump cooling setpoint |
+| `number_hvac_heat` | _(empty)_ | Heat pump heating setpoint |
+| `number_battery_charge_cutoff` | `number.battery_grid_charge_cutoff_soc` | Battery grid charge cutoff SOC — Huawei Modbus standard |
+| `number_battery_charge_power` | _(empty)_ | Battery charge power limit |
+| `number_battery_backup_soc` | _(empty)_ | Battery backup SOC |
+| `switch_battery_force_charge` | _(empty)_ | Battery force charge switch |
+| `select_battery_mode` | `select.battery_working_mode` | Battery working mode select — Huawei Modbus standard |
+| `sensor_dishwasher_state` | _(empty)_ | Dishwasher state sensor |
 
 ### Battery thresholds
 
 | Option | Default | Description |
 |---|---|---|
 | `battery_emergency_threshold` | 10% | Force-charge below this SOC at any tariff |
-| `battery_low_threshold` | 30% | Low battery warning level |
+| `battery_low_threshold` | 30% | Low battery level |
 | `battery_medium_threshold` | 50% | Medium battery level |
 | `battery_storm_threshold` | 80% | Pre-charge target when storm is forecast |
-| `battery_capacity_kwh` | 10.0 | Total usable battery capacity |
+| `battery_capacity_kwh` | 10.0 | Total usable battery capacity (kWh) |
 
 ### Scheduling
 
@@ -403,9 +511,9 @@ The **Setup** tab has a **Test connections** button that runs a live diagnostic:
 
 | Option | Default | Description |
 |---|---|---|
-| `notify_email_service` | _(empty)_ | HA notify service name for email (e.g. `correo_gmail_com`) |
-| `notify_email_target` | _(empty)_ | Recipient email — set in HA add-on config UI, not in repo |
-| `notify_telegram_service` | _(empty)_ | HA notify service name for Telegram (e.g. `telegram`) |
+| `notify_email_service` | _(empty)_ | HA notify service name for email |
+| `notify_email_target` | _(empty)_ | Recipient email address — set in HA add-on config UI, not in repo |
+| `notify_telegram_service` | _(empty)_ | HA notify service name for Telegram |
 | `notify_daily_time` | `23:00` | Time to send daily summary |
 | `notify_email_enabled` | true | Enable email daily summary |
 | `notify_telegram_daily_enabled` | true | Enable Telegram daily summary |
@@ -415,7 +523,7 @@ The **Setup** tab has a **Test connections** button that runs a live diagnostic:
 
 ## Electricity tariff
 
-Default prices — **Spain 2.0TD (Energía Nufri), all costs prorated including taxes and IVA:**
+Default prices — **Spain 2.0TD, all costs prorated including taxes and IVA:**
 
 | Period | Hours | Price |
 |---|---|---|
@@ -424,7 +532,7 @@ Default prices — **Spain 2.0TD (Energía Nufri), all costs prorated including 
 | Valley (Valle) | 00–08h + all day weekends | **€0.1147/kWh** |
 | Export (Excedentes) | — | **€0.040/kWh** |
 
-Weekends can be configured per day-of-week in the **Tariff** tab. Prices are editable per hour slot. Use "↩ Reset to defaults" to restore the above values.
+All prices and weekend days are editable per-hour in the **Tariff** tab. Use "↩ Reset to defaults" to restore the above values.
 
 ---
 
@@ -434,7 +542,8 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 | File | Contents |
 |---|---|
-| `model.pkl` | Trained scikit-learn pipeline + metadata (R², n_samples, feature_version) |
+| `model.pkl` | Trained scikit-learn pipeline + metadata (R², feature list, feature version) |
+| `wizard_config.json` | Entity IDs, hardware selection, HVAC zones, tariff from the setup wizard |
 | `decisions.json` | Last 500 decision cycles — full sensor snapshot, tariff, actions, prediction |
 | `savings.json` | Cumulative kWh avoided at peak + EUR saved since first run |
 | `tariff.json` | Custom tariff configuration (periods, prices, weekend days) |
@@ -444,65 +553,59 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
-### v3.x — Setup wizard + dynamic ML
-- **7-step Setup wizard** (Location, Grid, Solar, Battery, Loads, Tariff, Summary) replaces manual `config.yaml` editing as the primary configuration path. Wizard state persists in `/data/wizard_config.json`; `config.yaml` defaults still work as fallback.
-- **Entity discovery**: scans HA states and proposes the most likely sensor/switch for each of ~25 roles (battery SOC, grid power, solar production, HVAC, pool, dishwasher…), ranked by friendly-name + unit + device_class scoring. New endpoints `/api/ha/entities`, `/api/ha/location`, `/api/wizard/config`, `/api/wizard/data-quality`, `/api/wizard/test-entity`.
-- **Dynamic ML features** (`MODEL_FEATURE_VER = 3`): training DataFrame is built from whatever sensors the wizard mapped (outdoor temp, solar, grid, submeters), instead of hardcoded entity IDs. Auto-retrain triggers when feature set changes.
-- **Multi-zone heat pump**: per-zone comfort/surplus/economy schedule with per-hour mode (`hvac_zones` list in wizard config). Legacy single-zone path kept as fallback when no zones defined.
-- **Battery health mode** (`bill_reducer` / `optimized` / `battery_guard`): selects the SOC operating band (10-95% / 20-90% / 25-85%) to trade off cycle life vs. savings.
-- **Data Quality sensor**: `sensor.energy_optimizer_data_quality` (0-100%) pushed to HA, scoring source quality (Influx>recorder), key-role coverage and per-entity sample volume. Visible as a live bar in the wizard.
-- **Comic-book UI theme** (Bangers font, speech bubbles, hardware cards, entity pickers) for the wizard pages.
+### v3.5.0
+- **Single source of truth for version:** `ADD_ON_VERSION` in `energy_optimizer.py` is now canonical. Build copies `config.yaml` to `/addon-config.yaml` and a startup check logs a warning if the two drift, so panel and Supervisor never disagree.
+- **Wizard data-quality fix:** the InfluxDB sample-count query was using `entity_id` as the measurement name. With the HA→InfluxDB integration the measurement is the unit (`%`, `W`, `kWh`, …) and `entity_id` is a tag — query corrected accordingly.
+- **Branch consolidation:** merges parallel v3.4.1 work that had diverged on a separate machine. No user-facing regressions; per-version entries below remain authoritative for individual features.
 
-### v2.6.4
-- **Grid power sign convention fixed:** `sensor.acometida_general_power` is negative = buying, positive = selling. Previous code had this backwards, producing incorrect savings figures.
-- **Savings formula corrected:** `grid_without_battery = grid + battery_power` (derived from energy balance P_grid = P_solar − P_house − P_bat). Cost function now properly handles negative import and positive export.
-- **New sensor `sensor_solar_power`:** reads `sensor.produccion_placas_power` (actual panel watts in real time). Pool pump and dishwasher surplus checks now prefer live watts (>1.2 kW / >1.5 kW) over the hourly kWh forecast. Dashboard KPI shows live kW alongside forecast.
+### v3.4.1
+- **Split battery sensors (Deye/Solarman/Growatt support):** The Battery step of the Setup Wizard now has a "Split sensors" toggle for inverters that report charge and discharge as two separate positive-valued entities instead of one signed sensor. Enable the toggle and select the two entities — the engine combines them as `charge − discharge` so the rest of the logic behaves identically. The debug table in Tweaks also adapts to show both entities when split mode is active.
 
-### v2.6.3
-- **Battery logic reoriented:** target SOC now based on covering tomorrow's PEAK demand (10-14h + 18-22h), not overnight consumption. Night is valley — cheap grid import is fine.
-- **Temperature correction:** outdoor temperature adjusts peak consumption estimate for heat pump / cooling load (+0 to +3 kWh depending on bracket).
-- Dashboard "Smart target" line shows full reasoning: peak demand · solar peak · battery gap · temp adjustment.
+### v3.4.0
+- **Average consumption metrics in Charts:** Day view KPI cards show all-time daily averages (Ø) below each value with tooltip explaining the calculation. History tab adds a full 5-card summary row with all-time and last-12-months averages for solar, consumption, export, import, and self-sufficiency.
+- **Battery ROI calculator:** New section in the History tab. Enter the cost and capacity of additional storage — the calculator uses your actual average daily savings to estimate payback time and projected annual gain.
+- **Battery health mode:** Three-button selector in the Tweaks tab controls the SOC operating range the engine targets: ⚡ **Bill Reducer** (10–95%, default), ⚖️ **Optimized** (20–90%), 🛡️ **Battery Guard** (25–85%). Affects the nightly charge target clamp. Persisted in `setup.json`.
 
-### v2.6.2
-- Fixed night consumption estimate: `sensor.acometida_general_power` was absent from HA recorder. Now queries InfluxDB first (320k+ records, 14d). Logs sample count for transparency.
+### v3.3.1
+- Removed all personal/installation-specific defaults from `config.yaml` and Python fallbacks. Add-on now ships clean for any installation.
 
-### v2.6.1
-- Continuous solar proxy: replaced binary `solar_proxy` (0/1) with geometric sun elevation angle (0.0–1.0) for latitude 40.67°N. Model now distinguishes dawn/noon/dusk.
-- Solar terrain correction factor: median actual/forecast ratio from InfluxDB (30d), cached 6h, applied to all solar-dependent decisions. Shown as "Terrain factor: XX%" in Dashboard.
-- Auto-retrain on feature version mismatch (`MODEL_FEATURE_VER`).
+### v3.3.0
+- **Sensor convention corrected:** `battery_power` is `+ve = charging, −ve = discharging` throughout display, flow physics, and averages.
+- House balance: `P_casa = solar − grid − battery`.
+- Flow vectors rewritten with correct priority order including emergency-charge-from-grid path.
+- Battery card: green = charging, red = discharging.
 
-### v2.6.0
-- Solar charts redesigned: two line charts (7d daily + 12m monthly), both Actual vs HA Forecast. Data from InfluxDB.
-- Savings bar chart: value labels (€X.XX) on each bar.
-- Savings formula: counterfactual grid-without-battery method. Previously only counted peak discharge events; now captures the full charge/discharge cycle value.
+### v3.2.9
+- **Debug section in Tweaks tab:** table showing sensor role resolution (wizard → options → fallback), raw HA state, parsed value, and ✓/⚠/✗ status. Auto-loads when tab opens.
 
-### v2.5.8
-- SOC predicted line was invisible: alignment now uses a 15-min bucket grid as common x-axis. Both actual (InfluxDB) and predicted (decisions.json) aligned by nearest timestamp (±7.5 min).
-- MAE badge on SOC chart title.
-- Solar "Today (forecast)" bar: yesterday's `solar_tomorrow` reading vs today's actual.
+### v3.2.6 – v3.2.8
+- `_live_averages_7d()`: W-level averages from 15-min decision samples. Solar average excludes night samples.
+- `/api/debug/sensors` endpoint added.
+- Physics-based flow animation: 7 computed flow vectors, speed proportional to power.
 
-### v2.5.7
-- `notify_email_target` default changed to `""` — email address removed from public repo. Set in HA add-on Configuration UI.
+### v3.0.0
+- **Setup Wizard:** 8-step guided configuration with entity auto-discovery, data quality thermometer, HVAC multi-zone scheduling, device sub-dots in nav bar.
+- **Dynamic ML features:** feature set built from wizard-configured sensors, saved alongside model.
+- **Multi-source history:** InfluxDB v2 → InfluxDB v1 → HA Recorder cascade.
+- **`_wiz()` resolution:** wizard_config.json → options.json → hardcoded fallback for every sensor role.
 
-### v2.5.6
-- InfluxDB as primary ML data source (365 days, R²=0.998 vs 0.066 with HA recorder).
-- Auth auto-detection: retries without credentials if InfluxDB returns 401.
-- Entity ID domain-prefix stripping for old HA integration format.
-- Data Sources debug panel in Setup tab.
-- Progressive history fallback: 60→30→14→7 days for HA recorder.
-- Charts: InfluxDB-backed actual SOC + 8h chained ML forecast.
+### v2.6.1 – v2.6.4
+- Grid power sign convention fixed.
+- Continuous solar proxy (geometric sun elevation 0.0–1.0).
+- Solar terrain correction factor (median actual/forecast, 30 days, cached 6h).
+- Battery logic reoriented to cover tomorrow's peak demand.
+- Temperature correction for heat pump load.
 
-### v2.5 – v2.4
-- Weather forecast widget (AEMET, 5-day, storm alert).
-- Real all-in tariff prices (2.0TD Spain).
-- Solar proxy using actual `sun.sun` elevation.
-- HA ingress fix: `__BASE__` replaced at request time with `X-Ingress-Path` header.
+### v2.5.6 – v2.6.0
+- InfluxDB as primary ML source (365 days) with auth auto-detection.
+- Data Sources debug panel in Setup.
+- Solar charts: Actual vs HA Forecast (7d + 12m).
+- Savings bar chart with € labels and counterfactual method.
+- 8-hour chained ML forecast.
 
-### v2.3
-- Ingress base-path fix for GUI buttons and charts.
-- Tariff editor: per-day weekend configuration.
-
-### v2.1 – v2.2
-- Initial public release.
+### v2.4 – v2.5
+- Weather forecast widget (5-day, storm alert).
+- HA ingress fix (`X-Ingress-Path` header).
+- Tariff editor with per-day weekend configuration.
 - Telegram instant alerts.
 - 4-tab GUI: Dashboard, Charts, Tariff, Setup.

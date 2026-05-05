@@ -1290,18 +1290,35 @@ def _load_savings() -> dict:
             "decisions_count": 0, "since": datetime.now().date().isoformat()}
 
 def _update_savings(sensors: dict, tariff: dict):
-    # grid_power: -ve = buying/importing, +ve = selling/exporting
-    # Only count savings when: peak tariff, battery is discharging (<0), and we're actually importing (grid < -500 W)
-    if tariff["period"] != "peak" or sensors["battery_power"] >= 0 or sensors["grid_power"] > -500:
+    # Counterfactual: cost with battery vs cost without battery (same consumption).
+    # grid_power: -ve = importing, +ve = exporting. battery_power: +ve = charging, -ve = discharging.
+    # Without the battery, its flow would have hit the grid: grid_cf = grid + battery.
+    grid = sensors.get("grid_power")
+    bat  = sensors.get("battery_power")
+    if grid is None or bat is None:
         return
-    savings    = _load_savings()
-    prices     = tariff["prices"]
     interval_h = cfg("decision_interval_minutes", 15) / 60
-    kwh        = min(abs(sensors["battery_power"]) * interval_h / 1000, 2.0)
-    eur        = kwh * (prices["peak"] - prices.get("export", 0.06))
-    savings["total_kwh_avoided_peak"] = round(savings.get("total_kwh_avoided_peak", 0) + kwh, 3)
-    savings["total_eur_saved"]        = round(savings.get("total_eur_saved", 0) + eur, 3)
-    savings["decisions_count"]        = savings.get("decisions_count", 0) + 1
+    prices     = tariff["prices"]
+    p_imp      = prices.get(tariff["period"], prices.get("mid", 0.15))
+    p_exp      = prices.get("export", 0.06)
+
+    def _net_cost_eur(grid_w: float) -> float:
+        kwh = grid_w * interval_h / 1000
+        return -kwh * p_imp if kwh < 0 else -kwh * p_exp
+
+    grid_cf  = grid + bat
+    delta    = _net_cost_eur(grid_cf) - _net_cost_eur(grid)   # +ve = battery saved money
+    if abs(delta) > 0.30:
+        log.warning(f"  [SAVINGS] delta {delta:.3f}€ exceeds ±0.30€/cycle cap — skipped (grid={grid:.0f}W bat={bat:.0f}W)")
+        return
+
+    savings = _load_savings()
+    savings["total_eur_saved"]      = round(savings.get("total_eur_saved", 0) + delta, 4)
+    savings["total_kwh_throughput"] = round(savings.get("total_kwh_throughput", 0) + abs(bat) * interval_h / 1000, 3)
+    if tariff["period"] == "peak" and bat < 0 and grid < -100:
+        kwh_peak = min(abs(bat) * interval_h / 1000, 2.0)
+        savings["total_kwh_avoided_peak"] = round(savings.get("total_kwh_avoided_peak", 0) + kwh_peak, 3)
+    savings["decisions_count"]      = savings.get("decisions_count", 0) + 1
     SAVINGS_FILE.write_text(json.dumps(savings, indent=2))
 
 # ── Decision cycle ───────────────────────────────────────────────────────────

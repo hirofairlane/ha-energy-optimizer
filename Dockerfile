@@ -18,7 +18,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     flask \
     apscheduler \
     pandas \
-    joblib
+    joblib \
+    pymysql
 
 COPY rootfs /
 COPY config.yaml /addon-config.yaml

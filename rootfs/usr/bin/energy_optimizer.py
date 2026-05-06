@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.5.0"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "3.5.2"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -806,8 +806,82 @@ def _influx_wizard_history(entity: str, days: int, influx_cfg: dict) -> list:
         log.debug(f"InfluxDB wizard history {entity}: {e}")
         return []
 
+def _mariadb_wizard_history(entity: str, days: int, mariadb_cfg: dict) -> list:
+    """Fetch entity history directly from a HA Recorder running on MariaDB/MySQL.
+
+    Bypasses HA REST API for users whose /api/history endpoint returns empty
+    (issue #2). Compatible with HA recorder schemas before and after the
+    states_meta migration (HA 2023.4+).
+    Returns HA-style rows: [{"last_changed": iso_str, "state": str}, ...]"""
+    try:
+        import pymysql
+    except ImportError:
+        log.warning("  pymysql not installed — MariaDB direct access unavailable")
+        return []
+    from datetime import timezone
+    try:
+        conn = pymysql.connect(
+            host=mariadb_cfg["host"],
+            port=int(mariadb_cfg.get("port", 3306)),
+            user=mariadb_cfg.get("username", ""),
+            password=mariadb_cfg.get("password", ""),
+            database=mariadb_cfg.get("db", "homeassistant"),
+            connect_timeout=10,
+            read_timeout=60,
+            charset="utf8mb4",
+        )
+    except Exception as e:
+        log.debug(f"MariaDB connect {entity}: {e}")
+        return []
+    try:
+        with conn.cursor() as cur:
+            # Detect post-2023.4 schema (states_meta JOIN) vs legacy (entity_id in states)
+            cur.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name = 'states_meta'"
+            )
+            has_meta = cur.fetchone()[0] > 0
+            if has_meta:
+                q = (
+                    "SELECT s.state, s.last_changed_ts "
+                    "FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id "
+                    "WHERE sm.entity_id = %s "
+                    "AND s.last_changed_ts > UNIX_TIMESTAMP(NOW() - INTERVAL %s DAY) "
+                    "AND s.state NOT IN ('unknown', 'unavailable', '') "
+                    "ORDER BY s.last_changed_ts ASC"
+                )
+            else:
+                q = (
+                    "SELECT state, last_changed FROM states "
+                    "WHERE entity_id = %s "
+                    "AND last_changed > NOW() - INTERVAL %s DAY "
+                    "AND state NOT IN ('unknown', 'unavailable', '') "
+                    "ORDER BY last_changed ASC"
+                )
+            cur.execute(q, (entity, days))
+            raw = cur.fetchall()
+        rows = []
+        for state, ts in raw:
+            if isinstance(ts, (int, float)):
+                iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            elif isinstance(ts, datetime):
+                iso = ts.isoformat() if ts.tzinfo else ts.replace(tzinfo=timezone.utc).isoformat()
+            else:
+                iso = str(ts)
+            rows.append({"last_changed": iso, "state": str(state)})
+        return rows
+    except Exception as e:
+        log.debug(f"MariaDB query {entity}: {e}")
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def _load_history_best_effort(entity: str, days: int) -> list:
-    """Unified history loader: wizard InfluxDB v1 → legacy InfluxDB v1 cfg → HA recorder.
+    """Unified history loader: wizard InfluxDB v1 → legacy InfluxDB v1 cfg
+    → wizard MariaDB direct → HA recorder REST.
     Always returns HA-style rows; empty list if nothing is available."""
     # 1. Wizard InfluxDB (v1 user/password, configured in wizard Data Sources step)
     influx_cfg = _WIZARD.get("influxdb", {})
@@ -822,7 +896,14 @@ def _load_history_best_effort(entity: str, days: int) -> list:
         if rows:
             log.debug(f"  [{entity}] {len(rows)} rows from InfluxDB v1 cfg")
             return rows
-    # 3. HA recorder (capped at 14 days — typical recorder retention)
+    # 3. Wizard MariaDB direct (bypasses HA REST for recorder-on-MariaDB setups)
+    mariadb_cfg = _WIZARD.get("mariadb", {})
+    if mariadb_cfg.get("host"):
+        rows = _mariadb_wizard_history(entity, days, mariadb_cfg)
+        if rows:
+            log.debug(f"  [{entity}] {len(rows)} rows from wizard MariaDB ({days}d)")
+            return rows
+    # 4. HA recorder REST (capped at 14 days — typical recorder retention)
     rows = ha_history(entity, days=min(days, 14))
     log.debug(f"  [{entity}] {len(rows)} rows from HA recorder")
     return rows
@@ -2256,15 +2337,20 @@ th{color:var(--m);font-weight:500}
       <div class="wiz-card">
         <div class="wiz-card-title">💾 History &amp; Data Source</div>
         <div class="wiz-robot">💾</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.8rem">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-bottom:.8rem">
           <div class="hw-card" id="ds-card-influx" data-ds="influxdb" onclick="wizSelectDS('influxdb')" style="border-color:var(--g);background:rgba(74,222,128,.06)">
             <div class="hw-icon">🗄️</div>
             <div class="hw-name">InfluxDB</div>
             <div class="hw-desc">60+ days, best accuracy</div>
           </div>
+          <div class="hw-card" id="ds-card-mariadb" data-ds="mariadb" onclick="wizSelectDS('mariadb')">
+            <div class="hw-icon">🐬</div>
+            <div class="hw-name">MariaDB / MySQL</div>
+            <div class="hw-desc">Direct recorder DB access</div>
+          </div>
           <div class="hw-card" id="ds-card-ha" data-ds="ha_recorder" onclick="wizSelectDS('ha_recorder')">
             <div class="hw-icon">🏠</div>
-            <div class="hw-name">HA Recorder</div>
+            <div class="hw-name">HA Recorder REST</div>
             <div class="hw-desc">Up to 14 days, always available</div>
           </div>
         </div>
@@ -2286,6 +2372,25 @@ th{color:var(--m);font-weight:500}
           <div class="wiz-field" style="margin-bottom:.6rem"><label>Password</label><input type="password" id="wiz-influx-pass" placeholder="(leave blank if none)"></div>
           <button class="btn btn-sm" onclick="wizTestInflux()" id="btn-test-influx">🔌 Test connection</button>
           <span id="wiz-influx-status" style="font-size:.72rem;margin-left:.5rem;color:var(--m)"></span>
+        </div>
+        <!-- MariaDB direct connection (recorder backend) -->
+        <div id="wiz-mariadb-ok" style="display:none;background:rgba(74,222,128,.08);border:1px solid rgba(74,222,128,.3);border-radius:.5rem;padding:.6rem .8rem;margin-bottom:.6rem;align-items:center;justify-content:space-between;gap:.6rem">
+          <div>
+            <span style="color:var(--g);font-weight:600">✓ Connected</span>
+            <span id="wiz-mariadb-ok-detail" style="font-size:.72rem;color:var(--m);margin-left:.5rem">—</span>
+          </div>
+          <button class="btn btn-sm" onclick="wizMariadbEdit()" style="flex-shrink:0">✏️ Edit</button>
+        </div>
+        <div id="wiz-mariadb-fields" style="display:none">
+          <div style="display:grid;grid-template-columns:1fr auto;gap:.5rem;margin-bottom:.4rem">
+            <div class="wiz-field"><label>Host / IP</label><input type="text" id="wiz-mariadb-host" placeholder="core-mariadb"></div>
+            <div class="wiz-field"><label>Port</label><input type="number" id="wiz-mariadb-port" value="3306" style="width:80px"></div>
+          </div>
+          <div class="wiz-field" style="margin-bottom:.4rem"><label>Database</label><input type="text" id="wiz-mariadb-db" placeholder="homeassistant"></div>
+          <div class="wiz-field" style="margin-bottom:.4rem"><label>Username</label><input type="text" id="wiz-mariadb-user" placeholder="homeassistant" autocomplete="off"></div>
+          <div class="wiz-field" style="margin-bottom:.6rem"><label>Password</label><input type="password" id="wiz-mariadb-pass" placeholder="(recorder DB password)"></div>
+          <button class="btn btn-sm" onclick="wizTestMariadb()" id="btn-test-mariadb">🔌 Test connection</button>
+          <span id="wiz-mariadb-status" style="font-size:.72rem;margin-left:.5rem;color:var(--m)"></span>
         </div>
       </div>
       <div class="wiz-nav">
@@ -3480,6 +3585,7 @@ let wizCfg = {
   location:{}, sensors:{}, hardware:['hvac','pool'], tariff:{},
   battery_capacity_kwh:10, data_source:'influxdb',
   influxdb:{host:'',port:8086,org:'homeassistant',token:'',bucket:'homeassistant'},
+  mariadb:{host:'',port:3306,db:'homeassistant',username:'',password:''},
   hvac_zones:[], grid_submeters:[]
 };
 
@@ -3525,6 +3631,7 @@ async function loadWizard() {
     if (r.sensors || r.location) wizCfg = Object.assign(wizCfg, r);
     // restore influxdb sub-object
     if (r.influxdb) wizCfg.influxdb = Object.assign(wizCfg.influxdb, r.influxdb);
+    if (r.mariadb)  wizCfg.mariadb  = Object.assign(wizCfg.mariadb,  r.mariadb);
     if (r.hvac_zones) wizCfg.hvac_zones = r.hvac_zones;
     if (r.grid_submeters) wizCfg.grid_submeters = r.grid_submeters;
   } catch(e) {}
@@ -3658,32 +3765,87 @@ async function wizSaveTariff() {
 // ── Data source step ───────────────────────────────────────────────────────────
 function wizSelectDS(ds) {
   wizCfg.data_source = ds;
-  ['influx','ha'].forEach(k => {
+  ['influx','mariadb','ha'].forEach(k => {
     const c = document.getElementById('ds-card-'+k);
     if (c) { c.style.borderColor = ''; c.style.background = ''; }
   });
-  const id = ds === 'influxdb' ? 'ds-card-influx' : 'ds-card-ha';
-  const card = document.getElementById(id);
+  const idMap = {influxdb:'ds-card-influx', mariadb:'ds-card-mariadb', ha_recorder:'ds-card-ha'};
+  const card = document.getElementById(idMap[ds]);
   if (card) { card.style.borderColor = 'var(--g)'; card.style.background = 'rgba(74,222,128,.06)'; }
+  // Hide all panels first, then show the selected one
+  ['influx','mariadb'].forEach(k => {
+    const ok = document.getElementById('wiz-'+k+'-ok');
+    const fl = document.getElementById('wiz-'+k+'-fields');
+    if (ok) ok.style.display = 'none';
+    if (fl) fl.style.display = 'none';
+  });
   if (ds === 'influxdb') {
-    // If already have a tested connection, show banner; else show form
     const host = wizCfg.influxdb?.host;
     const ft   = wizCfg.influxdb?.first_ts;
     if (host) {
       const detail = ft ? `${host} · data since ${ft}` : `${host} · checking…`;
       document.getElementById('wiz-influx-ok-detail').textContent = detail;
       const _okEl=document.getElementById('wiz-influx-ok'); if(_okEl){_okEl.style.display='flex';};
-      document.getElementById('wiz-influx-fields').style.display = 'none';
       if (!ft) setTimeout(_wizAutoTestInflux, 200);
     } else {
-      document.getElementById('wiz-influx-ok').style.display = 'none';
       document.getElementById('wiz-influx-fields').style.display = '';
-
     }
-  } else {
-    document.getElementById('wiz-influx-ok').style.display = 'none';
-    document.getElementById('wiz-influx-fields').style.display = 'none';
+  } else if (ds === 'mariadb') {
+    const host = wizCfg.mariadb?.host;
+    const verified = wizCfg.mariadb?.verified;
+    if (host && verified) {
+      document.getElementById('wiz-mariadb-ok-detail').textContent = `${host} · connected`;
+      const _okEl=document.getElementById('wiz-mariadb-ok'); if(_okEl){_okEl.style.display='flex';};
+    } else {
+      document.getElementById('wiz-mariadb-fields').style.display = '';
+      const m = wizCfg.mariadb||{};
+      if (m.host) document.getElementById('wiz-mariadb-host').value = m.host;
+      if (m.port) document.getElementById('wiz-mariadb-port').value = m.port;
+      if (m.db)   document.getElementById('wiz-mariadb-db').value   = m.db;
+      if (m.username) document.getElementById('wiz-mariadb-user').value = m.username;
+    }
   }
+}
+function wizMariadbEdit() {
+  document.getElementById('wiz-mariadb-ok').style.display = 'none';
+  document.getElementById('wiz-mariadb-fields').style.display = '';
+  const m = wizCfg.mariadb||{};
+  if (m.host) document.getElementById('wiz-mariadb-host').value = m.host;
+  if (m.port) document.getElementById('wiz-mariadb-port').value = m.port;
+  if (m.db)   document.getElementById('wiz-mariadb-db').value   = m.db;
+  if (m.username) document.getElementById('wiz-mariadb-user').value = m.username;
+}
+async function wizTestMariadb() {
+  const btn = document.getElementById('btn-test-mariadb');
+  const st  = document.getElementById('wiz-mariadb-status');
+  btn.disabled = true; st.textContent = 'Testing…';
+  wizCfg.mariadb = {
+    host:     document.getElementById('wiz-mariadb-host').value.trim(),
+    port:     parseInt(document.getElementById('wiz-mariadb-port').value) || 3306,
+    db:       document.getElementById('wiz-mariadb-db').value.trim() || 'homeassistant',
+    username: document.getElementById('wiz-mariadb-user').value.trim(),
+    password: document.getElementById('wiz-mariadb-pass').value,
+  };
+  try {
+    const r = await fetch(BASE+'/api/wizard/data-quality', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mariadb: wizCfg.mariadb, sensors: wizCfg.sensors, only: 'mariadb'})
+    }).then(r=>r.json());
+    if (r.ok && r.source === 'mariadb') {
+      st.style.color = 'var(--g)';
+      st.textContent = `✓ Connected — ${r.total_samples||0} samples found`;
+      wizUpdateDQ(r.score||0);
+      wizDQSamples = r.samples||{};
+      wizCfg.mariadb.verified = true;
+      document.getElementById('wiz-mariadb-ok-detail').textContent = `${wizCfg.mariadb.host} · ${r.total_samples||0} samples`;
+      const _okEl=document.getElementById('wiz-mariadb-ok'); if(_okEl){_okEl.style.display='flex';};
+      document.getElementById('wiz-mariadb-fields').style.display = 'none';
+    } else {
+      st.style.color = '#ef4444';
+      st.textContent = '✗ ' + (r.source !== 'mariadb' ? 'Connection failed or no data found' : (r.error||'Connection failed'));
+    }
+  } catch(e) { st.style.color='#ef4444'; st.textContent='✗ Network error'; }
+  btn.disabled = false;
 }
 function wizInfluxEdit() {
   document.getElementById('wiz-influx-ok').style.display = 'none';
@@ -3709,7 +3871,7 @@ async function wizTestInflux() {
   try {
     const r = await fetch(BASE+'/api/wizard/data-quality', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({influxdb: wizCfg.influxdb, sensors: wizCfg.sensors})
+      body: JSON.stringify({influxdb: wizCfg.influxdb, sensors: wizCfg.sensors, only: 'influxdb'})
     }).then(r=>r.json());
     if (r.ok) {
       st.style.color = 'var(--g)';
@@ -4942,13 +5104,11 @@ def api_chart_data():
                     "lag4":        soc_f,
                     "roll4":       soc_f,
                     "solar_proxy": _solar_proxy_for_hour(ft.hour, ft.month),
-                    "temp_out":    sensors.get("temp_outdoor", 15.0),
-                    "temp_out_lag4": sensors.get("temp_outdoor", 15.0),
+                    "temp_outdoor": sensors.get("temp_outdoor", 15.0),
                     "solar_lag1":  sensors.get("solar_power", 0) / 1000,
                     "solar_roll4": sensors.get("solar_power", 0) / 1000,
                     "grid_lag1":   sensors.get("grid_power", 0) / 1000,
                     "grid_roll4":  sensors.get("grid_power", 0) / 1000,
-                    "grid_abs_lag1": abs(sensors.get("grid_power", 0)) / 1000,
                 }
                 X    = pd.DataFrame([row])
                 cols = [c for c in mdl_feats if c in X.columns]
@@ -5380,9 +5540,15 @@ def api_wizard_data_quality():
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
 
-    influx_cfg = data.get("influxdb") or _WIZARD.get("influxdb", {})
-    sensors    = data.get("sensors")  or _WIZARD.get("sensors", {})
+    influx_cfg  = data.get("influxdb") or _WIZARD.get("influxdb", {})
+    mariadb_cfg = data.get("mariadb")  or _WIZARD.get("mariadb",  {})
+    sensors     = data.get("sensors")  or _WIZARD.get("sensors",  {})
     data_source = _WIZARD.get("data_source", "ha_recorder")
+    # When the wizard tests one source explicitly (Test connection button),
+    # restrict the cascade to that source so the user gets a clear OK/FAIL
+    # for the source they're configuring instead of falling through to a
+    # different one that already worked.
+    only = (data.get("only") or "").strip().lower() or None
 
     samples: dict[str, int] = {}
     source_ok = False
@@ -5393,7 +5559,7 @@ def api_wizard_data_quality():
     # and entity_id is a TAG (without domain prefix). Querying FROM "<entity>"
     # therefore returns nothing — we must regex-match all measurements and
     # filter by the entity_id tag, same pattern used in ha_history_influx().
-    if influx_cfg.get("host"):
+    if (only in (None, "influxdb")) and influx_cfg.get("host"):
         try:
             url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
             db   = influx_cfg.get("db", "homeassistant")
@@ -5430,15 +5596,29 @@ def api_wizard_data_quality():
         except Exception as e:
             log.warning(f"InfluxDB quality check failed: {e}")
 
-    # ── Fall back to HA recorder ─────────────────────────────────────────────
-    if not source_ok:
+    # ── Try MariaDB direct (HA recorder backed by MariaDB/MySQL) ─────────────
+    if (only in (None, "mariadb")) and not source_ok and mariadb_cfg.get("host"):
+        try:
+            for role, entity_id in sensors.items():
+                if not entity_id:
+                    continue
+                rows = _mariadb_wizard_history(entity_id, 60, mariadb_cfg)
+                if rows:
+                    samples[entity_id] = len(rows)
+            if samples:
+                source_ok    = True
+                source_label = "mariadb"
+        except Exception as e:
+            log.warning(f"MariaDB quality check failed: {e}")
+
+    # ── Fall back to HA recorder REST ────────────────────────────────────────
+    if (only in (None, "ha_recorder")) and not source_ok:
         source_label = "ha_recorder"
         for role, entity_id in sensors.items():
             if not entity_id:
                 continue
             try:
-                hist = ha_history(entity_id, days=14)
-                rows = hist[0] if hist else []
+                rows = ha_history(entity_id, days=14)
                 if rows:
                     samples[entity_id] = len(rows)
             except Exception:
@@ -5449,7 +5629,9 @@ def api_wizard_data_quality():
     bonus_roles = ["solar_fc_today", "temp_outdoor", "temp_indoor", "battery_mode_select"]
     filled_key   = sum(1 for r in key_roles   if sensors.get(r))
     filled_bonus = sum(1 for r in bonus_roles if sensors.get(r))
-    source_bonus = 30 if source_label == "influxdb" else 10
+    source_bonus = (30 if source_label == "influxdb"
+                    else 20 if source_label == "mariadb"
+                    else 10)
     avg_samples  = (sum(samples.values()) / max(len(samples), 1)) if samples else 0
     sample_score = min(30, int(avg_samples / 500 * 30))   # max 30 pts at 500+ samples/entity
     sensor_score = int(filled_key / len(key_roles) * 25) + int(filled_bonus / len(bonus_roles) * 15)

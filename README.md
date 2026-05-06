@@ -403,7 +403,7 @@ The feature set is built from the sensors configured in the wizard. If a sensor 
 
 ### Training
 
-- **Source:** InfluxDB v2 (wizard config, 90 days) → InfluxDB v1 (options, 60 days) → HA Recorder (14 days)
+- **Source:** InfluxDB v2 (wizard config, 90 days) → InfluxDB v1 (options, 60 days) → MariaDB direct (60 days, recorder DB) → HA Recorder REST (14 days)
 - **Schedule:** nightly at 03:00 (`retrain_cron` option)
 - **Pipeline:** `StandardScaler → GradientBoostingRegressor(n_estimators=150, max_depth=4)`
 - **Validation:** 3-fold cross-validation R² shown in Dashboard
@@ -450,6 +450,27 @@ Auth is auto-detected: tries with credentials first, retries without if InfluxDB
 The HA→InfluxDB integration (pre-2023) stores data as:
 - **Measurement** = unit of the sensor (`%`, `W`, `kWh`, `°C`)
 - **Tag** `entity_id` = sensor name **without domain prefix** (e.g. `battery_state_of_capacity`)
+
+---
+
+## MariaDB / MySQL recorder integration
+
+If your HA recorder is backed by MariaDB or MySQL and the REST history endpoint returns empty results (a known issue for some installations — see GitHub issue #2), the add-on can read history directly from the recorder database, bypassing the REST API.
+
+Configured from the Setup Wizard's first step. The schema is auto-detected:
+- **Modern (HA ≥ 2023.4)**: `JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = ?`
+- **Legacy**: `WHERE entity_id = ?` directly on `states`
+
+Connection parameters (kept in `wizard_config.json` only — no secrets in `options`):
+
+| Field | Typical value |
+|---|---|
+| Host / IP | `core-mariadb` (HA add-on) or your MariaDB server |
+| Port | `3306` |
+| Database | `homeassistant` |
+| Username / Password | as configured in the recorder `db_url` |
+
+The Test connection button counts samples for every configured sensor over the last 60 days; if any returns rows, MariaDB is used as the active source on subsequent cycles. Falls back to HA Recorder REST otherwise.
 
 ---
 
@@ -552,6 +573,14 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 ---
 
 ## Changelog
+
+### v3.5.2
+- **MariaDB / MySQL recorder support (issue #2):** wizard now offers a third data source besides InfluxDB and HA Recorder REST. When the HA recorder is backed by MariaDB and the REST endpoint returns nothing (a known issue for some installations), the add-on can read history directly from the recorder DB. New section in the Setup Wizard's first step: host, port, database, user, password, and a Test connection button. Schema is auto-detected (legacy `states.entity_id` vs post-2023.4 `states_meta` JOIN).
+- **ML predict feature-name fix:** the chained 8 h SOC forecast was passing `temp_out` to a model trained with `temp_outdoor`, raising a sklearn warning every cycle. Renamed to match the trained feature; dropped two stale features (`temp_out_lag4`, `grid_abs_lag1`) that were never trained.
+- **Version drift fix:** `ADD_ON_VERSION` was 3.5.0 while `config.yaml` was 3.5.1; aligned both to 3.5.2.
+
+### v3.5.1
+- **Savings counter rewritten with counterfactual method:** the previous filter (peak hours + battery discharging + grid import > 500 W) was under-counting by ~97 % because it ignored self-consumption in valley/off-peak and the cases where the battery covered 100 % of the load. New logic compares grid cost with battery against a hypothetical no-battery scenario per cycle (`grid_cf = grid + battery`). JSON is backwards-compatible: `total_eur_saved` stays primary, `total_kwh_avoided_peak` is kept as secondary, `total_kwh_throughput` added for diagnostics. Per-cycle delta is capped at ±0.30 € as sanity.
 
 ### v3.5.0
 - **Single source of truth for version:** `ADD_ON_VERSION` in `energy_optimizer.py` is now canonical. Build copies `config.yaml` to `/addon-config.yaml` and a startup check logs a warning if the two drift, so panel and Supervisor never disagree.

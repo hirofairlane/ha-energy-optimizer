@@ -574,6 +574,9 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v3.5.3
+- **MariaDB direct query fix (issue #2, reported by @Karplyak):** the recorder query was filtering by `last_changed_ts`, which HA only populates when the state value actually changes. Power sensors that emit the same reading repeatedly, or rows where only attributes were updated, leave `last_changed_ts` NULL and got silently dropped → 0 rows returned. Switched to `last_updated_ts` (and the legacy `last_updated`), which is populated on every write. Hotfix on top of v3.5.2.
+
 ### v3.5.2
 - **MariaDB / MySQL recorder support (issue #2):** wizard now offers a third data source besides InfluxDB and HA Recorder REST. When the HA recorder is backed by MariaDB and the REST endpoint returns nothing (a known issue for some installations), the add-on can read history directly from the recorder DB. New section in the Setup Wizard's first step: host, port, database, user, password, and a Test connection button. Schema is auto-detected (legacy `states.entity_id` vs post-2023.4 `states_meta` JOIN).
 - **ML predict feature-name fix:** the chained 8 h SOC forecast was passing `temp_out` to a model trained with `temp_outdoor`, raising a sklearn warning every cycle. Renamed to match the trained feature; dropped two stale features (`temp_out_lag4`, `grid_abs_lag1`) that were never trained.

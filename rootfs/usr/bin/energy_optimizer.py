@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.5.2"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "3.5.3"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -841,22 +841,28 @@ def _mariadb_wizard_history(entity: str, days: int, mariadb_cfg: dict) -> list:
                 "WHERE table_schema = DATABASE() AND table_name = 'states_meta'"
             )
             has_meta = cur.fetchone()[0] > 0
+            # NOTE: HA recorder writes `last_changed_ts` only when the state
+            # actually changes; for sensors that emit the same value repeatedly
+            # (or when only attributes update) it stays NULL, and the timestamp
+            # filter below silently drops those rows. `last_updated_ts` is
+            # populated on every write and is what we want for history queries.
+            # Reported as a fix by @Karplyak in issue #2.
             if has_meta:
                 q = (
-                    "SELECT s.state, s.last_changed_ts "
+                    "SELECT s.state, s.last_updated_ts "
                     "FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id "
                     "WHERE sm.entity_id = %s "
-                    "AND s.last_changed_ts > UNIX_TIMESTAMP(NOW() - INTERVAL %s DAY) "
+                    "AND s.last_updated_ts > UNIX_TIMESTAMP(NOW() - INTERVAL %s DAY) "
                     "AND s.state NOT IN ('unknown', 'unavailable', '') "
-                    "ORDER BY s.last_changed_ts ASC"
+                    "ORDER BY s.last_updated_ts ASC"
                 )
             else:
                 q = (
-                    "SELECT state, last_changed FROM states "
+                    "SELECT state, last_updated FROM states "
                     "WHERE entity_id = %s "
-                    "AND last_changed > NOW() - INTERVAL %s DAY "
+                    "AND last_updated > NOW() - INTERVAL %s DAY "
                     "AND state NOT IN ('unknown', 'unavailable', '') "
-                    "ORDER BY last_changed ASC"
+                    "ORDER BY last_updated ASC"
                 )
             cur.execute(q, (entity, days))
             raw = cur.fetchall()

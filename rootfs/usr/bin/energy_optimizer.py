@@ -564,10 +564,18 @@ def _read_battery_power() -> float:
 
 
 def read_sensors() -> dict:
+    # Wizard exposes a "Flip sign (multiply by −1)" toggle on the Grid step
+    # for installations whose meter reports the opposite convention than the
+    # add-on assumes (we want +ve = exporting, −ve = importing). Apply once
+    # here so the rest of the engine sees the canonical sign.
+    grid_raw = ha_float(_wiz("grid_power", "sensor_grid_power", ""))
+    if _WIZARD.get("grid_flip") and grid_raw is not None:
+        grid_raw = -grid_raw
+
     s: dict = {
         "battery_soc":        ha_float(_wiz("battery_soc",        "sensor_battery_soc",       "sensor.battery_state_of_capacity")),
         "battery_power":      _read_battery_power(),
-        "grid_power":         ha_float(_wiz("grid_power",         "sensor_grid_power",         "")),
+        "grid_power":         grid_raw,
         "solar_power":        ha_float(_wiz("solar_power",        "sensor_solar_power",        "")),
         "solar_current_hour": ha_float(_wiz("solar_fc_h0",        "sensor_solar_current_hour", "sensor.energy_current_hour")),
         "solar_next_hour":    ha_float(_wiz("solar_fc_h1",        "sensor_solar_next_hour",    "sensor.energy_next_hour")),
@@ -778,26 +786,41 @@ BASE_FEATURES = ["hour", "weekday", "month", "lag1", "lag4", "roll4", "solar_pro
 def _influx_wizard_history(entity: str, days: int, influx_cfg: dict) -> list:
     """Fetch entity history from InfluxDB v1 (InfluxQL) configured in the wizard.
     The official HA InfluxDB integration uses v1 user/password auth.
+
+    HA→Influx integration stores rows with measurement = unit (`%`, `W`, `kWh`,
+    `°C`) and entity_id as a TAG without the domain prefix. Querying
+    `FROM "<entity_short>"` returns nothing — must scan all measurements with
+    `FROM /.*/` and filter by the tag, same pattern used in `ha_history_influx`.
+
     Returns HA-style rows: [{"last_changed": iso_str, "state": str_value}, ...]"""
     try:
         url  = f"http://{influx_cfg['host']}:{influx_cfg.get('port', 8086)}"
         db   = influx_cfg.get("db", "homeassistant")
         user = influx_cfg.get("username", "")
         pwd  = influx_cfg.get("password", "")
-        # HA stores entity_id without domain as the measurement name
         entity_short = entity.split(".")[-1] if "." in entity else entity
         q = (
-            f'SELECT mean("value") FROM "{entity_short}" '
-            f'WHERE time > now()-{days}d '
+            f'SELECT mean("value") AS "value" FROM /.*/ '
+            f"WHERE \"entity_id\" = '{entity_short}' "
+            f'AND time > now()-{days}d '
             f'GROUP BY time(15m) fill(previous)'
         )
         resp, err, _ = _influx_query(url, db, q, user, pwd)
         if err or not resp:
             return []
         rows = []
-        for series in resp.get("results", [{}])[0].get("series", []):
+        # Multiple measurements may match (same entity_id reported under several
+        # units, e.g. a power sensor that also has kWh). Concat all series; the
+        # 15-min resampler downstream will collapse duplicate timestamps.
+        for series in resp.json().get("results", [{}])[0].get("series", []):
+            cols = series.get("columns", [])
+            try:
+                ti = cols.index("time")
+                vi = cols.index("value")
+            except ValueError:
+                continue
             for point in series.get("values", []):
-                ts, val = point[0], point[1]
+                ts, val = point[ti], point[vi]
                 if val is None:
                     continue
                 rows.append({"last_changed": ts, "state": str(val)})
@@ -5549,12 +5572,24 @@ def api_wizard_data_quality():
     influx_cfg  = data.get("influxdb") or _WIZARD.get("influxdb", {})
     mariadb_cfg = data.get("mariadb")  or _WIZARD.get("mariadb",  {})
     sensors     = data.get("sensors")  or _WIZARD.get("sensors",  {})
+    submeters   = data.get("grid_submeters") or _WIZARD.get("grid_submeters", [])
     data_source = _WIZARD.get("data_source", "ha_recorder")
     # When the wizard tests one source explicitly (Test connection button),
     # restrict the cascade to that source so the user gets a clear OK/FAIL
     # for the source they're configuring instead of falling through to a
     # different one that already worked.
     only = (data.get("only") or "").strip().lower() or None
+
+    # Build a single entity dict spanning both sensor roles AND submeter
+    # entities so the data-quality counts include the Meross/etc that are
+    # configured as `grid_submeters`. Without this, the wizard score reports
+    # OK while the submeter feeds for ML training are silently ignored.
+    all_entities: dict[str, str] = dict(sensors)
+    for sm in submeters:
+        sm_name = (sm.get("name") or "").strip()
+        sm_eid  = sm.get("entity", "")
+        if sm_name and sm_eid:
+            all_entities[f"submeter_{sm_name}"] = sm_eid
 
     samples: dict[str, int] = {}
     source_ok = False
@@ -5572,7 +5607,7 @@ def api_wizard_data_quality():
             user = influx_cfg.get("username", "")
             pwd  = influx_cfg.get("password", "")
             any_response = False
-            for role, entity_id in sensors.items():
+            for role, entity_id in all_entities.items():
                 if not entity_id:
                     continue
                 entity_short = entity_id.split(".")[-1] if "." in entity_id else entity_id
@@ -5605,7 +5640,7 @@ def api_wizard_data_quality():
     # ── Try MariaDB direct (HA recorder backed by MariaDB/MySQL) ─────────────
     if (only in (None, "mariadb")) and not source_ok and mariadb_cfg.get("host"):
         try:
-            for role, entity_id in sensors.items():
+            for role, entity_id in all_entities.items():
                 if not entity_id:
                     continue
                 rows = _mariadb_wizard_history(entity_id, 60, mariadb_cfg)
@@ -5620,7 +5655,7 @@ def api_wizard_data_quality():
     # ── Fall back to HA recorder REST ────────────────────────────────────────
     if (only in (None, "ha_recorder")) and not source_ok:
         source_label = "ha_recorder"
-        for role, entity_id in sensors.items():
+        for role, entity_id in all_entities.items():
             if not entity_id:
                 continue
             try:

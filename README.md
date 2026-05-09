@@ -574,6 +574,11 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v3.5.4
+- **Wizard "Flip sign" toggle on the Grid step actually does something now.** It was being saved to `wizard_config.json` as `grid_flip` but never read back — users whose meter reports `+ve = importing from grid` had a no-op toggle and the engine kept seeing inverted signs (battery decisions + savings counter all biased). Reported by @Karplyak in issue #2 after testing v3.5.3.
+- **`_influx_wizard_history` query corrected.** Was using `FROM "<entity_short>"` while the HA→Influx integration stores `measurement = unit` + `entity_id` as TAG. The query returned an empty result for every entity and the loader silently fell back to `ha_history_influx`. Worked for setups with the legacy `influxdb_url` option populated; broken for users configuring InfluxDB only through the wizard. Switched to the same `FROM /.*/ WHERE entity_id = ...` pattern as the rest of the code.
+- **`/api/wizard/data-quality` now counts `grid_submeters`.** The endpoint iterated only over the wizard's `sensors` dict — the score reported OK while sub-meter feeds (Meross, etc.) used as `sm_<name>` features in ML training were silently uncounted. Built a unified `all_entities` dict spanning both, used in the InfluxDB / MariaDB / HA-Recorder loops.
+
 ### v3.5.3
 - **MariaDB direct query fix (issue #2, reported by @Karplyak):** the recorder query was filtering by `last_changed_ts`, which HA only populates when the state value actually changes. Power sensors that emit the same reading repeatedly, or rows where only attributes were updated, leave `last_changed_ts` NULL and got silently dropped → 0 rows returned. Switched to `last_updated_ts` (and the legacy `last_updated`), which is populated on every write. Hotfix on top of v3.5.2.
 

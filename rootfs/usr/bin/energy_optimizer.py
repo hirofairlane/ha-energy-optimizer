@@ -564,10 +564,18 @@ def _read_battery_power() -> float:
 
 
 def read_sensors() -> dict:
+    # Wizard exposes a "Flip sign (multiply by −1)" toggle on the Grid step
+    # for installations whose meter reports the opposite convention than the
+    # add-on assumes (we want +ve = exporting, −ve = importing). Apply once
+    # here so the rest of the engine sees the canonical sign.
+    grid_raw = ha_float(_wiz("grid_power", "sensor_grid_power", ""))
+    if _WIZARD.get("grid_flip") and grid_raw is not None:
+        grid_raw = -grid_raw
+
     s: dict = {
         "battery_soc":        ha_float(_wiz("battery_soc",        "sensor_battery_soc",       "sensor.battery_state_of_capacity")),
         "battery_power":      _read_battery_power(),
-        "grid_power":         ha_float(_wiz("grid_power",         "sensor_grid_power",         "")),
+        "grid_power":         grid_raw,
         "solar_power":        ha_float(_wiz("solar_power",        "sensor_solar_power",        "")),
         "solar_current_hour": ha_float(_wiz("solar_fc_h0",        "sensor_solar_current_hour", "sensor.energy_current_hour")),
         "solar_next_hour":    ha_float(_wiz("solar_fc_h1",        "sensor_solar_next_hour",    "sensor.energy_next_hour")),

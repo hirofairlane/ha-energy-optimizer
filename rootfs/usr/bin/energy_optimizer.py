@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.5.4"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "3.5.5"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1389,6 +1389,109 @@ def decide_dishwasher(sensors: dict, tariff: dict) -> dict:
                 "reason": f"Peak tariff ({prices['peak']}€/kWh) — waiting", "state": state}
     return {"action": False, "reason": "Mid tariff — waiting for solar or valley", "state": state}
 
+# ── Custom loads (user-defined switch-controlled devices) ────────────────────
+# The wizard's Loads step lets the user add arbitrary `custom_loads`: each one
+# has a switch entity, an estimated wattage, and a scheduling mode (`valley`,
+# `solar`, `both`, `hours`). Until now the wizard saved these but no Python
+# code consumed them — reported as a bug by @Karplyak in issue #4 (a load
+# configured to fire 04-07 was being switched 23-07 by something else
+# entirely, because the engine was simply not driving the switch at all).
+
+def _hours_active(hour: int, spec: str) -> bool:
+    """Return True if `hour` falls inside any range in `spec`.
+
+    `spec` is the comma-separated string the user entered (e.g. `10-14,22-06`).
+    Ranges where start > end wrap around midnight (`22-06` covers 22, 23, 0..5).
+    Single-hour bare values (`12`) and malformed segments are ignored.
+    """
+    if not spec:
+        return False
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" not in part:
+            continue
+        try:
+            s_raw, e_raw = part.split("-", 1)
+            s, e = int(s_raw.strip()) % 24, int(e_raw.strip()) % 24
+        except (ValueError, AttributeError):
+            continue
+        if s == e:
+            continue
+        if s < e:
+            if s <= hour < e:
+                return True
+        else:  # wraps midnight
+            if hour >= s or hour < e:
+                return True
+    return False
+
+
+def decide_custom_loads(sensors: dict, tariff: dict) -> list:
+    """Decide on/off for every configured custom_load. Returns a list of
+    {switch, name, want_on, current, reason} for loads that need a state
+    change; loads already in the desired state are NOT included so the cycle
+    doesn't spam the bus with redundant service calls."""
+    loads      = _WIZARD.get("custom_loads", []) or []
+    grid       = sensors.get("grid_power", 0) or 0   # +ve = exporting
+    soc        = sensors.get("battery_soc", 0) or 0
+    period     = tariff.get("period", "mid")
+    hour       = datetime.now().hour
+    decisions  = []
+
+    for ld in loads:
+        switch = (ld.get("switch") or "").strip()
+        if not switch:
+            continue
+        sched = (ld.get("schedule") or "valley").strip()
+        try:
+            watts = float(ld.get("watts") or 0)
+        except (TypeError, ValueError):
+            watts = 0.0
+        name = ld.get("name") or switch.split(".")[-1]
+
+        in_valley = (period == "valley")
+        # Solar surplus = exporting more than this load would draw (so flipping
+        # it on doesn't import). Require SOC > 30% as cushion against clouds.
+        in_solar  = (grid > max(watts, 50.0)) and (soc > 30)
+
+        if sched == "valley":
+            want_on = in_valley
+            reason  = ("Valley tariff active" if want_on
+                       else f"Outside valley (period={period})")
+        elif sched == "solar":
+            want_on = in_solar
+            reason  = (f"Solar surplus (export {grid:.0f}W ≥ {watts:.0f}W, SOC={soc:.0f}%)"
+                       if want_on
+                       else f"Insufficient surplus (export {grid:.0f}W, SOC={soc:.0f}%)")
+        elif sched == "both":
+            want_on = in_valley or in_solar
+            if in_valley:
+                reason = "Valley tariff active"
+            elif in_solar:
+                reason = f"Solar surplus (export {grid:.0f}W ≥ {watts:.0f}W)"
+            else:
+                reason = f"No valley, no surplus (period={period}, export {grid:.0f}W)"
+        elif sched == "hours":
+            spec    = ld.get("hours") or ""
+            want_on = _hours_active(hour, spec)
+            reason  = (f"In hours range {spec} (h={hour:02d})" if want_on
+                       else f"Outside hours range {spec} (h={hour:02d})")
+        else:
+            log.warning(f"  [CUSTOM LOAD/{name}] Unknown schedule '{sched}' — skipped")
+            continue
+
+        st = ha_state(switch)
+        if not st:
+            log.debug(f"  [CUSTOM LOAD/{name}] {switch} unavailable — skipped")
+            continue
+        cur_on = st.get("state") == "on"
+        if want_on == cur_on:
+            continue  # already in desired state, no action
+
+        decisions.append({"switch": switch, "name": name, "want_on": want_on,
+                          "current": cur_on, "reason": reason, "schedule": sched})
+    return decisions
+
 # ── Savings tracker ──────────────────────────────────────────────────────────
 def _load_savings() -> dict:
     if SAVINGS_FILE.exists():
@@ -1505,6 +1608,15 @@ def run_cycle() -> dict:
         log.info(f"  [DISHWASHER] Waiting — {dw['reason']}")
     else:
         log.info(f"  [DISHWASHER] {dw['reason']}")
+
+    # 4b. Custom loads — user-defined switch-controlled devices (issue #4)
+    for cl in decide_custom_loads(sensors, tariff):
+        ok = ha_switch(cl["switch"], cl["want_on"])
+        state_word = "ON" if cl["want_on"] else "OFF"
+        decision["actions"].append({"type": "custom_load", "switch": cl["switch"],
+            "name": cl["name"], "action": state_word.lower(),
+            "schedule": cl["schedule"], "reason": cl["reason"], "ok": ok})
+        log.info(f"  [CUSTOM LOAD/{cl['name']}] {state_word} — {cl['reason']}")
 
     # 5. Washer / Dryer — state monitoring + valley recommendation
     for appliance, state_key, power_key in [

@@ -574,6 +574,14 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v3.5.5
+- **Custom loads scheduler actually drives the switches now (issue #4, reported by @Karplyak).** The wizard's Loads step lets the user add `custom_loads` with a switch entity, watts estimate, and a scheduling mode (`valley`, `solar`, `both`, `hours`). The wizard was persisting them correctly to `wizard_config.json`, but **no Python code on the engine side was consuming them** — the switches were never being turned on/off by the optimizer. Implemented `decide_custom_loads()` and wired it into the decision cycle:
+  - `valley` → on during P3 tariff only
+  - `solar` → on when grid export ≥ load wattage and SOC > 30 %
+  - `both` → on if either of the above
+  - `hours` → on when current hour is inside any range in the user's spec (`10-14,22-06` style, ranges wrap midnight)
+  Only emits a service call when the desired state differs from the current one, so quiet hours don't spam the bus.
+
 ### v3.5.4
 - **Wizard "Flip sign" toggle on the Grid step actually does something now.** It was being saved to `wizard_config.json` as `grid_flip` but never read back — users whose meter reports `+ve = importing from grid` had a no-op toggle and the engine kept seeing inverted signs (battery decisions + savings counter all biased). Reported by @Karplyak in issue #2 after testing v3.5.3.
 - **`_influx_wizard_history` query corrected.** Was using `FROM "<entity_short>"` while the HA→Influx integration stores `measurement = unit` + `entity_id` as TAG. The query returned an empty result for every entity and the loader silently fell back to `ha_history_influx`. Worked for setups with the legacy `influxdb_url` option populated; broken for users configuring InfluxDB only through the wizard. Switched to the same `FROM /.*/ WHERE entity_id = ...` pattern as the rest of the code.

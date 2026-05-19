@@ -574,6 +574,25 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v4.0.0 — Decision engine rewrite + transparency layer
+
+Major release. The internal decision engine has been rewritten to (a) respect every user-configurable setting that was previously silently overridden, and (b) explain what it did and why, in every cycle.
+
+**The two visible changes for everyone:**
+
+1. **Every decision now ships an `explanation` dict** with `what`, `why`, the `inputs` used, the `formula` applied, the actual `calculation`, and the `alternatives_rejected`. The Activity tab renders an expandable row per decision (click the ▶ in front of any reason) that shows the full reasoning. The legacy `reason` short string is kept on every decision for backwards compatibility with downstream consumers.
+2. **The smart battery target SOC adapts to your actual tariff geometry**, not a hardcoded Spanish 2.0TD shape. Users with longer/shorter peak windows (Ukraine 16h peak, Australia 4h peak, Germany variable, …) now get targets that match their real consumption profile.
+
+**Decision engine fixes**, by impact:
+
+- **`calculate_optimal_soc` peak-hour scaling.** The previous `peak_base_kwh = base_kw × 8` hardcode caused systematic 2× errors on tariffs with non-Spanish peak length. Surfaced by @Karplyak in issue #5 (Ukrainian 16h peak ⇒ target stuck at ~36 % when ~70 % was right). Now scales with `len(tariff.peak_hours)`.
+- **`calculate_optimal_soc` solar-overlap.** Previously `solar_during_peak = solar_tomorrow × 0.45` (Spanish heuristic). Now computed as the overlap between the user's actual peak window and a 7-19h "useful sun" window, divided by that window's length.
+- **Temperature adjustment scales with peak length.** The HVAC-load bands (0/0.5/1/2/3 kWh) were tuned for an 8h peak. Now multiplied by `peak_h_ratio = len(peak_hours) / 8`.
+- **`decide_battery` respects `battery_health_mode`.** Previously hardcoded `target_soc: 30/40` and `if soc >= 95` ignored the user's selected profile, meaning Battery Guard (25-85 %) users would "never reach full" according to the engine. Now resolves the floor as `max(30, health_mode_min)` and the ceiling as `health_mode_max`.
+- **`decide_battery` uses configurable `battery_low_threshold`.** Previously hardcoded `if soc < 20` ignored the option even though it was configurable. Now reads `cfg("battery_low_threshold", 30)`.
+- **`decide_battery` uses the configured `battery_charge_power` entity.** Previously hardcoded 1500/2000/3000 W. Now reads the wizard's configured charge-power number entity and caps emergency charges to it.
+- **Mid-tariff opportunistic top-up.** Previously mid-period only reacted to dangerously low SOC. Now also tops up toward the smart target if mid is the cheapest period available before peak (for tariffs where mid-hours overlap with daytime sun, e.g. Spanish 2.0TD 14-18h).
+
 ### v3.5.5
 - **Custom loads scheduler actually drives the switches now (issue #4, reported by @Karplyak).** The wizard's Loads step lets the user add `custom_loads` with a switch entity, watts estimate, and a scheduling mode (`valley`, `solar`, `both`, `hours`). The wizard was persisting them correctly to `wizard_config.json`, but **no Python code on the engine side was consuming them** — the switches were never being turned on/off by the optimizer. Implemented `decide_custom_loads()` and wired it into the decision cycle:
   - `valley` → on during P3 tariff only

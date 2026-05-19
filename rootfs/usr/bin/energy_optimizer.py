@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "3.5.5"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "4.0.0"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -373,6 +373,14 @@ def current_tariff() -> dict:
         "hour":         hour,
         "weekend":      weekend,
         "weekend_days": weekend_days,
+        # Expose the configured hour-sets so downstream decision logic
+        # (notably calculate_optimal_soc) can scale with the user's actual
+        # tariff geometry instead of assuming the Spanish 2.0TD default of
+        # 8 peak hours. Without this every non-Spanish installation under-
+        # or over-estimates peak consumption proportionally — see fix for
+        # Karplyak's 16h-peak Ukrainian tariff in issue #5.
+        "peak_hours":   list(peak_h),
+        "valley_hours": list(valley_h),
     }
 
 # ── Sun status ───────────────────────────────────────────────────────────────
@@ -682,46 +690,103 @@ def _get_avg_night_consumption_kw() -> float:
         threading.Thread(target=_refresh_consumption_cache, daemon=True).start()
     return _consumption_cache["kw"]
 
-def calculate_optimal_soc(sensors: dict) -> dict:
+def _explain(what: str, why: str,
+             inputs: list[dict] | None = None,
+             formula: str = "",
+             calculation: str = "",
+             alternatives_rejected: list[dict] | None = None) -> dict:
+    """Build a structured `explanation` dict for the Decisions tab in the UI.
+
+    Every `decide_*` function attaches one of these to its return value so the
+    UI can render the full reasoning (inputs used, formula applied, alternatives
+    considered) instead of a single-line summary. The legacy `reason` string is
+    kept on every decision for back-compat with the saved decisions.json history.
+
+    Conventions:
+      what — one short sentence: what the engine decided to do
+      why  — one short sentence: the single most-load-bearing reason
+      inputs — list of `{label, value}` dicts, in causal order
+      formula — symbolic representation (LaTeX-free, plain ASCII)
+      calculation — the formula with the actual numbers substituted in
+      alternatives_rejected — list of `{option, why}` for paths NOT taken
+    """
+    return {
+        "what":                what,
+        "why":                 why,
+        "inputs":              inputs or [],
+        "formula":             formula,
+        "calculation":         calculation,
+        "alternatives_rejected": alternatives_rejected or [],
+    }
+
+
+def calculate_optimal_soc(sensors: dict, tariff: dict | None = None) -> dict:
     """Target SOC for valley charging — store cheap electricity to cover tomorrow's peak demand.
 
-    Night is valley tariff (0.1147 €/kWh): importing from grid at night is fine.
-    What matters is having enough battery to avoid grid import during PEAK hours
-    (10-14h + 18-22h at 0.2234 €/kWh).
+    Strategy: importing during valley tariff is cheap; what matters is avoiding
+    grid import during the user's PEAK hours. The previous implementation hard-
+    coded `peak_hours = 8` (Spanish 2.0TD) which under- or over-estimates by a
+    constant factor on every non-Spanish tariff. Bug surfaced by @Karplyak in
+    issue #5: with a Ukrainian 16h-peak tariff the target came out at 36 %
+    when the rational answer was ~70 %.
 
-    Formula:
-        battery_needed = peak_consumption_kwh - solar_during_peak_kwh
-        peak_consumption = base_load × 8 peak_hours + temperature_adjustment
-        solar_during_peak ≈ solar_tomorrow × 0.45  (10-15h window, main overlap with peak)
+    Formula (scaled to actual tariff geometry):
+        peak_h_count     = len(tariff["peak_hours"])
+        peak_base_kwh    = base_load_kw × peak_h_count
+        peak_solar_share = overlap(peak_hours, sunlight_window) / sunlight_window_hours
+        solar_during_peak = solar_tomorrow × peak_solar_share
+        battery_needed   = peak_base_kwh + temp_adj − solar_during_peak
+
+    Both temperature adjustment and solar share now scale with peak_h_count so
+    16h-peak installs get appropriately larger targets, and short-peak markets
+    (Australia, some German tariffs) get correspondingly smaller ones.
     """
     battery_kwh  = float(cfg("battery_capacity_kwh", 10.0))
+
+    # Tariff geometry — read once, used to scale every per-hour quantity below.
+    if tariff is None:
+        tariff = current_tariff()
+    peak_hours_cfg = tariff.get("peak_hours", DEFAULT_TARIFF["peak_hours"])
+    peak_h_count   = max(1, len(peak_hours_cfg))   # avoid div-by-zero on empty tariff
+    peak_h_ratio   = peak_h_count / 8.0            # 1.0 for Spanish default, 2.0 for Karplyak
 
     # ── Solar (terrain-corrected) ────────────────────────────────────────────
     correction   = _compute_solar_correction_factor()
     solar_tm_raw = sensors.get("solar_tomorrow", 0)
     solar_tm     = round(solar_tm_raw * correction, 2)
-    # ~45% of daily solar falls in the 10-15h window that overlaps with morning peak
-    # Evening peak (18-22h) gets near-zero solar in Spain
-    solar_during_peak = round(solar_tm * 0.45, 2)
+    # Compute the fraction of useful daylight (7-19h, 12 hours) that falls
+    # inside this user's peak window. Drops to ~0 for a tariff with peak only
+    # 18-22 (almost no sun overlap); rises to ~1 for a tariff with peak 07-22
+    # (almost the whole sun window is peak). Replaces the old hardcoded 0.45.
+    SUN_WINDOW = range(7, 19)
+    peak_sun_overlap   = sum(1 for h in peak_hours_cfg if h in SUN_WINDOW)
+    peak_solar_share   = peak_sun_overlap / len(SUN_WINDOW)
+    solar_during_peak  = round(solar_tm * peak_solar_share, 2)
 
     # ── Base consumption (kW) — night avg is the best proxy for base household load ──
-    base_kw = _get_avg_night_consumption_kw()    # W already converted to kW
-    peak_base_kwh = round(base_kw * 8, 2)        # 8 peak hours per day
+    base_kw = _get_avg_night_consumption_kw()
+    peak_base_kwh = round(base_kw * peak_h_count, 2)
 
-    # ── Temperature correction for heat pump / cooling load ──────────────────
+    # ── Temperature correction (HVAC load) ──────────────────────────────────
+    # The bands below describe an extra kWh figure that was tuned for an 8h
+    # Spanish peak. Scale by peak_h_ratio so longer peaks get proportionally
+    # larger adjustments. Cooling in summer follows the same scaling for
+    # symmetry, even though hot-climate inverter A/C COP behaviour differs;
+    # users on extreme tariffs can override via wizard advanced settings.
     temp = sensors.get("temp_outdoor", 15.0)
     if temp < 5:
-        temp_adj_kwh = 3.0   # heat pump near full power all peak hours
+        temp_adj_kwh = 3.0 * peak_h_ratio   # heat pump near full power all peak hours
     elif temp < 10:
-        temp_adj_kwh = 2.0
+        temp_adj_kwh = 2.0 * peak_h_ratio
     elif temp < 15:
-        temp_adj_kwh = 1.0
+        temp_adj_kwh = 1.0 * peak_h_ratio
     elif temp > 30:
-        temp_adj_kwh = 1.5   # cooling in summer
+        temp_adj_kwh = 1.5 * peak_h_ratio
     elif temp > 25:
-        temp_adj_kwh = 0.5
+        temp_adj_kwh = 0.5 * peak_h_ratio
     else:
         temp_adj_kwh = 0.0
+    temp_adj_kwh = round(temp_adj_kwh, 2)
 
     peak_total_kwh = peak_base_kwh + temp_adj_kwh
 
@@ -729,7 +794,10 @@ def calculate_optimal_soc(sensors: dict) -> dict:
     battery_needed = max(0.0, peak_total_kwh - solar_during_peak)
     soc_needed = (battery_needed / battery_kwh) * 100
 
-    # +5% safety buffer, clamp to health-mode SOC limits (floor at 30% for safe operation)
+    # +5 % safety buffer, then clamp to the user's health-mode SOC limits.
+    # The floor is whichever is higher between 30 % "safe operation" and the
+    # configured health-mode minimum (e.g. Battery Guard mode raises the floor
+    # to 25 % so this `max(30, ...)` is effectively the safe operation floor).
     _hmin, _hmax = _health_mode_limits()
     target = max(max(30, _hmin), min(_hmax, round(soc_needed + 5)))
 
@@ -737,6 +805,8 @@ def calculate_optimal_soc(sensors: dict) -> dict:
         "target_soc":         target,
         "needed_kwh":         round(battery_needed, 2),
         "peak_total_kwh":     round(peak_total_kwh, 2),
+        "peak_h_count":       peak_h_count,
+        "peak_solar_share":   round(peak_solar_share, 3),
         "solar_during_peak":  solar_during_peak,
         "solar_tomorrow":     solar_tm,
         "solar_tomorrow_raw": solar_tm_raw,
@@ -744,6 +814,8 @@ def calculate_optimal_soc(sensors: dict) -> dict:
         "base_kw":            base_kw,
         "temp_outdoor":       round(temp, 1),
         "temp_adj_kwh":       temp_adj_kwh,
+        "health_mode_min":    _hmin,
+        "health_mode_max":    _hmax,
     }
 
 # ── Storm detection (AEMET OpenData) ─────────────────────────────────────────
@@ -1229,77 +1301,273 @@ def decide_heat_pump(sensors: dict) -> list:
     return [_hp_legacy_decision(sensors)]
 
 # ── Battery decision ─────────────────────────────────────────────────────────
+def _battery_charge_power_w(default_w: int = 2000) -> int:
+    """Resolve the inverter's grid-charge power limit from the wizard's
+    `battery_charge_power` entity (typically `number.battery_grid_charge_maximum_power`
+    on a Huawei Luna). Falls back to `default_w` if the entity isn't configured or
+    reports nothing. Caps emergency charges to the resolved value so we never push
+    more than the user's hardware/comfort limit."""
+    pwr_entity = _batt("battery_charge_power", "number_battery_charge_power", "")
+    if pwr_entity:
+        try:
+            val = ha_float(pwr_entity)
+            if val and val > 100:   # entity is in W; ignore garbage near zero
+                return int(val)
+        except Exception:
+            pass
+    return default_w
+
+
 def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
+    """Decide the battery's action for this cycle. Every threshold and every
+    target SOC is resolved against the user's configured `battery_health_mode`
+    and `battery_*_threshold` options — previous versions had `30/40/95/20`
+    hardcoded which silently overrode Battery Guard / Optimized perfiles."""
     soc       = sensors["battery_soc"]
     period    = tariff["period"]
     prices    = tariff["prices"]
     thr_emerg = cfg("battery_emergency_threshold", 10)
-    storm_thr = cfg("battery_storm_threshold", 80)
+    thr_low   = cfg("battery_low_threshold",       30)
+    storm_thr = cfg("battery_storm_threshold",     80)
+    hmin, hmax = _health_mode_limits()
+    # Emergency / recovery targets respect the health-mode minimum: a
+    # Battery Guard user (25-85 %) gets charged to at least 25 % on emergency,
+    # not to a hardcoded 30 % that may be below their floor on edge configs.
+    emerg_target = max(30, hmin)
+    low_target   = max(40, hmin + 10)
+    # Battery "full" threshold for self-consumption hand-off is the user's
+    # health-mode ceiling, not a hardcoded 95 %. For Battery Guard (max 85 %)
+    # we consider the battery full at 85 % and stop trying to charge further.
+    full_thr     = hmax
+    # Default charge power resolved from the wizard's configured entity (or
+    # falls back to 2 kW). Each return below scales it down only when the
+    # remaining gap is small, to avoid burst-charging tiny deltas.
+    base_power_w = _battery_charge_power_w(default_w=2000)
+
+    base_inputs = [
+        {"label": "Current SOC",              "value": f"{soc:.0f}%"},
+        {"label": "Tariff period",            "value": f"{period} ({prices.get(period, '?')}€/kWh)"},
+        {"label": "Battery health mode",      "value": f"{cfg('battery_health_mode','bill_reducer')} ({hmin}-{hmax}%)"},
+        {"label": "Configured charge power",  "value": f"{base_power_w} W"},
+        {"label": "Emergency threshold",      "value": f"{thr_emerg}%"},
+        {"label": "Low threshold",            "value": f"{thr_low}%"},
+    ]
 
     storm = is_storm_forecast()
     if storm and soc < storm_thr and period != "peak":
         return {
-            "action": "charge", "target_soc": storm_thr, "power_w": 2000,
+            "action": "charge", "target_soc": storm_thr, "power_w": base_power_w,
             "reason": f"⚡ Storm forecast — maintaining {storm_thr}% reserve",
             "storm": True, "alert": True,
             "alert_msg": (f"⚡ *STORM MODE ACTIVATED*\n"
                           f"Charging battery to {storm_thr}% storm reserve\n"
                           f"Current SOC: {soc:.0f}%"),
+            "explanation": _explain(
+                what=f"Charge battery to {storm_thr}% as storm reserve",
+                why="Storm forecast detected with SOC below the storm threshold — pre-emptive grid charge to survive a possible outage.",
+                inputs=base_inputs + [
+                    {"label": "Storm forecast",   "value": "yes"},
+                    {"label": "Storm threshold",  "value": f"{storm_thr}%"},
+                ],
+                formula="if storm and SOC < storm_threshold and not peak → charge to storm_threshold",
+                calculation=f"storm=yes AND SOC {soc:.0f}% < storm_thr {storm_thr}% AND period={period} → charge to {storm_thr}%",
+                alternatives_rejected=[
+                    {"option": "self-consumption", "why": "would let the battery drain through a possible outage"},
+                ],
+            ),
         }
 
     if period == "peak":
         if soc < thr_emerg:
             return {
-                "action": "charge", "target_soc": 30, "power_w": 1500,
+                "action": "charge", "target_soc": emerg_target, "power_w": min(1500, base_power_w),
                 "reason": f"EMERGENCY during peak: SOC={soc:.0f}% < {thr_emerg}%",
                 "alert": True,
                 "alert_msg": (f"🚨 *EMERGENCY GRID CHARGE*\n"
                               f"SOC critical: {soc:.0f}% (threshold: {thr_emerg}%)\n"
                               f"Forced charge during PEAK tariff ({prices['peak']}€/kWh)"),
+                "explanation": _explain(
+                    what=f"Emergency grid charge to {emerg_target}% during PEAK tariff",
+                    why=f"SOC dropped below emergency threshold ({soc:.0f}% < {thr_emerg}%) — paying peak-tariff grid to prevent reaching 0% is the lesser evil.",
+                    inputs=base_inputs + [
+                        {"label": "Emergency target", "value": f"{emerg_target}% (max of 30% or health-mode floor)"},
+                    ],
+                    formula="if peak and SOC < emergency_threshold → charge to max(30, health_mode_min)",
+                    calculation=f"period=peak AND SOC {soc:.0f}% < {thr_emerg}% → charge to {emerg_target}%",
+                    alternatives_rejected=[
+                        {"option": "no action", "why": "battery would hit 0% and we'd import full peak load from grid"},
+                    ],
+                ),
             }
-        return {"action": "none", "reason": f"Peak ({prices['peak']}€/kWh): no grid charging"}
+        return {
+            "action": "none",
+            "reason": f"Peak ({prices['peak']}€/kWh): no grid charging",
+            "explanation": _explain(
+                what="No grid action during peak",
+                why=f"SOC {soc:.0f}% is above the emergency threshold ({thr_emerg}%), so no expensive peak-tariff grid charge needed.",
+                inputs=base_inputs,
+                formula="if peak and SOC ≥ emergency_threshold → no action",
+                calculation=f"period=peak AND SOC {soc:.0f}% ≥ {thr_emerg}% → battery self-discharges to cover load",
+                alternatives_rejected=[
+                    {"option": "grid charge", "why": f"would buy at peak price ({prices['peak']}€/kWh) when not needed"},
+                ],
+            ),
+        }
 
     if period == "valley":
-        if soc >= 95:
-            return {"action": "self_consumption", "reason": f"Valley, battery full ({soc:.0f}%)"}
-        optimal = calculate_optimal_soc(sensors)
+        if soc >= full_thr:
+            return {
+                "action": "self_consumption",
+                "reason": f"Valley, battery full ({soc:.0f}% ≥ health-mode ceiling {full_thr}%)",
+                "explanation": _explain(
+                    what="Self-consumption mode (battery already full)",
+                    why=f"SOC {soc:.0f}% has reached the health-mode ceiling ({full_thr}%) — further charging would stress the cells.",
+                    inputs=base_inputs + [
+                        {"label": "Health-mode ceiling", "value": f"{full_thr}%"},
+                    ],
+                    formula="if valley and SOC ≥ health_mode_max → self_consumption",
+                    calculation=f"period=valley AND SOC {soc:.0f}% ≥ {full_thr}% → stop charging",
+                    alternatives_rejected=[
+                        {"option": "continue charging", "why": f"would push past health-mode max ({full_thr}%) and stress the battery"},
+                    ],
+                ),
+            }
+        optimal = calculate_optimal_soc(sensors, tariff)
         target  = optimal["target_soc"]
         if soc < target:
-            power = 3000 if (target - soc) > 20 else 2000
+            power = base_power_w if (target - soc) > 20 else max(1000, base_power_w // 2)
             return {
                 "action": "charge", "target_soc": target, "power_w": power,
                 "reason": (f"Valley — smart target {target}% "
                            f"(peak gap {optimal['needed_kwh']:.1f} kWh · "
                            f"solar peak {optimal['solar_during_peak']:.1f} kWh · "
-                           f"temp adj {optimal['temp_adj_kwh']:+.1f} kWh)"),
+                           f"temp adj {optimal['temp_adj_kwh']:+.1f} kWh · "
+                           f"{optimal['peak_h_count']}h peak)"),
                 "optimal": optimal,
+                "explanation": _explain(
+                    what=f"Charge battery to {target}% at {power} W (smart target)",
+                    why=f"Valley tariff is the cheapest grid energy of the day. The engine estimates {optimal['peak_total_kwh']:.1f} kWh of peak-window consumption tomorrow against {optimal['solar_during_peak']:.1f} kWh of solar in that window, leaving a {optimal['needed_kwh']:.1f} kWh gap to pre-fill.",
+                    inputs=base_inputs + [
+                        {"label": "Peak hours configured",  "value": f"{optimal['peak_h_count']}h"},
+                        {"label": "Base load (night avg)",  "value": f"{optimal['base_kw']:.2f} kW"},
+                        {"label": "Peak consumption est.",  "value": f"{optimal['peak_total_kwh']:.1f} kWh (= {optimal['base_kw']:.2f}kW × {optimal['peak_h_count']}h + {optimal['temp_adj_kwh']:+.1f} kWh temp adj)"},
+                        {"label": "Solar tomorrow",         "value": f"{optimal['solar_tomorrow']:.1f} kWh (terrain×{optimal['solar_correction']:.2f})"},
+                        {"label": "Solar in peak window",   "value": f"{optimal['solar_during_peak']:.1f} kWh ({100*optimal['peak_solar_share']:.0f}% of total)"},
+                        {"label": "Outdoor temp",           "value": f"{optimal['temp_outdoor']:.1f}°C"},
+                        {"label": "Battery capacity",       "value": f"{cfg('battery_capacity_kwh', 10.0)} kWh"},
+                    ],
+                    formula="target_soc = clamp(max(30, health_min), health_max, ((peak_consumption − solar_during_peak) / capacity × 100) + 5% buffer)",
+                    calculation=f"((({optimal['peak_total_kwh']:.1f} − {optimal['solar_during_peak']:.1f}) / {cfg('battery_capacity_kwh', 10.0)}) × 100) + 5 buffer → clamped to [{hmin},{hmax}] = {target}%",
+                    alternatives_rejected=[
+                        {"option": f"charge to {hmax}%", "why": "wastes valley grid energy on capacity tomorrow's solar can fill for free"},
+                        {"option": "self-consumption now", "why": f"would leave SOC at {soc:.0f}% which is below the {target}% target"},
+                    ],
+                ),
             }
-        return {"action": "self_consumption",
-                "reason": f"Valley, at optimal level ({soc:.0f}% ≥ {target}%)"}
+        return {
+            "action": "self_consumption",
+            "reason": f"Valley, at optimal level ({soc:.0f}% ≥ {target}%)",
+            "explanation": _explain(
+                what="Self-consumption mode (smart target already reached)",
+                why=f"SOC {soc:.0f}% already meets or exceeds the engine's smart target of {target}% for tomorrow's peak.",
+                inputs=base_inputs + [
+                    {"label": "Smart target", "value": f"{target}%"},
+                ],
+                formula="if valley and SOC ≥ smart_target → self_consumption",
+                calculation=f"period=valley AND SOC {soc:.0f}% ≥ {target}% → no further charging needed",
+                alternatives_rejected=[
+                    {"option": "keep charging", "why": "the target is already met; extra grid energy at valley would not be used in peak"},
+                ],
+            ),
+        }
 
     if period == "mid":
         if soc < thr_emerg:
             return {
-                "action": "charge", "target_soc": 30, "power_w": 1500,
+                "action": "charge", "target_soc": emerg_target, "power_w": min(1500, base_power_w),
                 "reason": f"Mid + critical SOC ({soc:.0f}%) → emergency charge",
                 "alert": True,
                 "alert_msg": (f"🚨 *EMERGENCY GRID CHARGE*\n"
                               f"SOC critical: {soc:.0f}% during mid-peak\n"
-                              f"Forced charge to 30%"),
+                              f"Forced charge to {emerg_target}%"),
+                "explanation": _explain(
+                    what=f"Emergency grid charge to {emerg_target}% during MID tariff",
+                    why=f"SOC critical ({soc:.0f}% < {thr_emerg}%). Even at mid tariff, recovery is worth the cost to avoid hitting 0%.",
+                    inputs=base_inputs,
+                    formula="if mid and SOC < emergency_threshold → charge to max(30, health_mode_min)",
+                    calculation=f"period=mid AND SOC {soc:.0f}% < {thr_emerg}% → charge to {emerg_target}%",
+                    alternatives_rejected=[
+                        {"option": "wait for valley", "why": "could take hours; SOC would hit 0% before then"},
+                    ],
+                ),
             }
-        if soc < 20:
+        if soc < thr_low:
             return {
-                "action": "charge", "target_soc": 40, "power_w": 1500,
-                "reason": f"Mid + very low SOC ({soc:.0f}%) → charge to 40%",
+                "action": "charge", "target_soc": low_target, "power_w": min(1500, base_power_w),
+                "reason": f"Mid + low SOC ({soc:.0f}% < {thr_low}%) → charge to {low_target}%",
                 "alert": True,
                 "alert_msg": (f"⚠️ *GRID CHARGE (mid-peak)*\n"
-                              f"Low battery: {soc:.0f}% — charging to 40%\n"
-                              f"Tariff: {prices['mid']}€/kWh"),
+                              f"Low battery: {soc:.0f}% — charging to {low_target}%\n"
+                              f"Tariff: {prices.get('mid', '?')}€/kWh"),
+                "explanation": _explain(
+                    what=f"Top-up to {low_target}% during MID tariff",
+                    why=f"SOC ({soc:.0f}%) below the low threshold ({thr_low}%) — top-up at mid-tariff is preferable to risking emergency charge at peak.",
+                    inputs=base_inputs,
+                    formula="if mid and SOC < low_threshold → charge to max(40, health_mode_min+10)",
+                    calculation=f"period=mid AND SOC {soc:.0f}% < {thr_low}% → charge to {low_target}%",
+                    alternatives_rejected=[
+                        {"option": "wait for valley", "why": "may take hours; risk of dropping into emergency range"},
+                    ],
+                ),
             }
-        return {"action": "self_consumption",
-                "reason": f"Mid period, self-consumption (SOC={soc:.0f}%)"}
+        optimal = calculate_optimal_soc(sensors, tariff)
+        target  = optimal["target_soc"]
+        if soc < target:
+            return {
+                "action": "charge", "target_soc": target,
+                "power_w": max(1000, base_power_w // 2),
+                "reason": (f"Mid — opportunistic top-up to smart target {target}% "
+                           f"(gap {optimal['needed_kwh']:.1f} kWh)"),
+                "optimal": optimal,
+                "explanation": _explain(
+                    what=f"Opportunistic top-up to {target}% during MID tariff",
+                    why=f"SOC {soc:.0f}% is below the smart target {target}%. Mid tariff is cheaper than peak — preferable to fill the gap now than import at peak later.",
+                    inputs=base_inputs + [
+                        {"label": "Smart target", "value": f"{target}%"},
+                        {"label": "Peak gap",     "value": f"{optimal['needed_kwh']:.1f} kWh"},
+                    ],
+                    formula="if mid and SOC < smart_target → charge to smart_target at half-power",
+                    calculation=f"period=mid AND SOC {soc:.0f}% < {target}% → charge to {target}%",
+                    alternatives_rejected=[
+                        {"option": "self-consumption", "why": f"would leave SOC at {soc:.0f}% below the smart target {target}%"},
+                        {"option": "wait for valley", "why": "may not arrive before next peak; mid is cheaper than peak"},
+                    ],
+                ),
+            }
+        return {
+            "action": "self_consumption",
+            "reason": f"Mid period, self-consumption (SOC={soc:.0f}% ≥ {target}%)",
+            "explanation": _explain(
+                what="Self-consumption mode (mid tariff, target reached)",
+                why=f"SOC {soc:.0f}% already meets the smart target {target}%. No mid-tariff grid charge needed.",
+                inputs=base_inputs + [{"label": "Smart target", "value": f"{target}%"}],
+                formula="if mid and SOC ≥ smart_target → self_consumption",
+                calculation=f"period=mid AND SOC {soc:.0f}% ≥ {target}% → no grid action",
+                alternatives_rejected=[
+                    {"option": "top-up to health-mode max", "why": "would buy mid-tariff energy beyond what peak demand needs"},
+                ],
+            ),
+        }
 
-    return {"action": "none", "reason": "No battery action"}
+    return {
+        "action": "none",
+        "reason": "No battery action",
+        "explanation": _explain(
+            what="No battery action",
+            why="The tariff period did not match any known branch.",
+            inputs=base_inputs,
+        ),
+    }
 
 # ── Instant Telegram alert ───────────────────────────────────────────────────
 def send_telegram_alert(message: str):
@@ -1546,20 +1814,23 @@ def run_cycle() -> dict:
 
     # 1. Battery
     bat = decide_battery(sensors, tariff, prediction)
+    bat_expl = bat.get("explanation")
     if bat["action"] == "charge":
         ok = set_battery_charge_target(bat["target_soc"], bat.get("power_w", 3000))
         decision["actions"].append({"type": "battery", "action": "charge",
-            "target_soc": bat["target_soc"], "reason": bat["reason"], "ok": ok})
+            "target_soc": bat["target_soc"], "reason": bat["reason"], "ok": ok,
+            "explanation": bat_expl})
         log.info(f"  [BATTERY] Charge → {bat['target_soc']}% — {bat['reason']}")
         if bat.get("alert") and bat.get("alert_msg"):
             send_telegram_alert(bat["alert_msg"])
     elif bat["action"] == "self_consumption":
         ok = set_battery_self_consumption()
         decision["actions"].append({"type": "battery", "action": "self_consumption",
-            "reason": bat["reason"], "ok": ok})
+            "reason": bat["reason"], "ok": ok, "explanation": bat_expl})
         log.info(f"  [BATTERY] Self-consumption — {bat['reason']}")
     else:
-        decision["skipped"].append({"type": "battery", "reason": bat["reason"]})
+        decision["skipped"].append({"type": "battery", "reason": bat["reason"],
+            "explanation": bat_expl})
         log.info(f"  [BATTERY] No action — {bat['reason']}")
 
     # 2. Heat pump — multi-zone
@@ -1574,37 +1845,44 @@ def run_cycle() -> dict:
         zone_tag = f"/{hp['zone']}" if hp.get("zone", "default") != "default" else ""
         decision["actions"].append({"type": "heat_pump", "entity": hp["entity"],
             "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
-            "value": hp["target"], "reason": hp["reason"], "ok": ok})
+            "value": hp["target"], "reason": hp["reason"], "ok": ok,
+            "explanation": hp.get("explanation")})
         log.info(f"  [HEAT PUMP/{hp['season'].upper()}{zone_tag}] {hp['reason']} → {hp['target']}°C")
 
     # 3. Pool pump + cleaner
     pool     = decide_pool(sensors, tariff)
     pool_sw  = _wiz("pool_switch",  "switch_pool",         "")
     clean_sw = _wiz("pool_cleaner", "switch_pool_cleaner", "")
+    pool_expl = pool.get("explanation")
     if pool["action"]:
         _start_pool_with_cleaner(pool_sw, clean_sw)
         decision["actions"].append({"type": "pool", "action": True,
-            "reason": pool["reason"] + " (+ limpiafondos 15 min)", "ok": True})
+            "reason": pool["reason"] + " (+ limpiafondos 15 min)", "ok": True,
+            "explanation": pool_expl})
         log.info(f"  [POOL] ON — {pool['reason']}")
     else:
         ha_switch(pool_sw, False)
-        decision["skipped"].append({"type": "pool", "reason": pool["reason"]})
+        decision["skipped"].append({"type": "pool", "reason": pool["reason"],
+            "explanation": pool_expl})
         log.info(f"  [POOL] OFF — {pool['reason']}")
 
     # 4. Dishwasher
     dw = decide_dishwasher(sensors, tariff)
+    dw_expl = dw.get("explanation")
     if dw["action"] is True:
         dw_sw = cfg("switch_dishwasher", "")
         if dw_sw:
             ok = ha_switch(dw_sw, True)
             decision["actions"].append({"type": "dishwasher", "action": "start",
-                "reason": dw["reason"], "ok": ok})
+                "reason": dw["reason"], "ok": ok, "explanation": dw_expl})
             log.info(f"  [DISHWASHER] START — {dw['reason']}")
         else:
             decision["skipped"].append({"type": "dishwasher",
-                "reason": f"Ready ({dw['reason']}) — no control switch configured"})
+                "reason": f"Ready ({dw['reason']}) — no control switch configured",
+                "explanation": dw_expl})
     elif dw["action"] is False:
-        decision["skipped"].append({"type": "dishwasher", "reason": dw["reason"]})
+        decision["skipped"].append({"type": "dishwasher", "reason": dw["reason"],
+            "explanation": dw_expl})
         log.info(f"  [DISHWASHER] Waiting — {dw['reason']}")
     else:
         log.info(f"  [DISHWASHER] {dw['reason']}")
@@ -1615,7 +1893,8 @@ def run_cycle() -> dict:
         state_word = "ON" if cl["want_on"] else "OFF"
         decision["actions"].append({"type": "custom_load", "switch": cl["switch"],
             "name": cl["name"], "action": state_word.lower(),
-            "schedule": cl["schedule"], "reason": cl["reason"], "ok": ok})
+            "schedule": cl["schedule"], "reason": cl["reason"], "ok": ok,
+            "explanation": cl.get("explanation")})
         log.info(f"  [CUSTOM LOAD/{cl['name']}] {state_word} — {cl['reason']}")
 
     # 5. Washer / Dryer — state monitoring + valley recommendation
@@ -1899,6 +2178,21 @@ table{width:100%;border-collapse:collapse;font-size:.78rem}
 td,th{padding:.4rem .5rem;border-bottom:1px solid var(--b);text-align:left}
 th{color:var(--m);font-weight:500}
 .ok-c{color:var(--g)}.skip{color:var(--m)}.err-c{color:var(--r)}
+/* Expandable decision explanation row (v4.0.0) */
+.exp-toggle{cursor:pointer;color:var(--g);margin-right:.35rem;font-size:.78rem;user-select:none;transition:transform .12s}
+.exp-toggle:hover{filter:brightness(1.4)}
+.exp-row td{background:rgba(74,222,128,.04);border-top:1px solid rgba(74,222,128,.12);padding:.55rem .8rem !important}
+.exp-body{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;line-height:1.45;color:var(--t)}
+.exp-body .exp-what{font-weight:600;color:var(--g)}
+.exp-body .exp-why{color:var(--t);opacity:.85;margin-bottom:.2rem}
+.exp-body .exp-section{margin-top:.3rem}
+.exp-body .exp-section b{color:var(--m);font-weight:600;font-size:.72rem;letter-spacing:.03em;text-transform:uppercase;display:block;margin-bottom:.15rem}
+.exp-body code{font-size:.72rem;background:rgba(0,0,0,.35);padding:.1rem .35rem;border-radius:.25rem;color:#a5b4fc;font-family:'Fira Code',monospace}
+.exp-body ul{margin:.1rem 0 .15rem 1rem;padding:0;list-style-type:'✗ '}
+.exp-body ul li{font-size:.74rem;margin:.15rem 0}
+.exp-body .kv-grid{display:grid;grid-template-columns:auto 1fr;gap:.1rem .7rem;font-size:.74rem}
+.exp-body .kv-grid .k{color:var(--m);font-weight:500}
+.exp-body .kv-grid .v{color:var(--t)}
 .tag{display:inline-block;padding:.1rem .4rem;border-radius:.25rem;font-size:.68rem;background:var(--b);color:var(--m)}
 .tag.bat{background:rgba(56,189,248,.12);color:var(--a)}
 .tag.hp{background:rgba(74,222,128,.12);color:var(--g)}
@@ -3444,6 +3738,17 @@ async function loadHistory(){
 const PC={peak:'peak',valley:'valley',mid:'mid'};
 const tagMap={battery:'bat',heat_pump:'hp',pool:'pool',dishwasher:'dw'};
 
+// Expand / collapse a decision's explanation panel. Used by the toggle that
+// appears in front of each `reason` when the decision carries an `explanation`
+// dict (v4.0.0+). Pure DOM, no framework.
+function toggleExp(rowId, btn){
+  const r = document.getElementById(rowId);
+  if (!r) return;
+  const open = r.style.display !== 'none';
+  r.style.display = open ? 'none' : 'table-row';
+  if (btn) btn.textContent = open ? '▶' : '▼';
+}
+
 async function load(){
   try {
     const [s,d,sv]=await Promise.all([
@@ -3504,11 +3809,48 @@ async function load(){
         <div style="font-size:.72rem;color:var(--m)">Since ${sv.since??'--'}</div>
       </div>`;
 
+    // v4.0.0 — each decision can carry a structured `explanation` dict. Render
+    // an expandable row beneath the summary that exposes the engine's reasoning
+    // (inputs, formula, calculation, alternatives_rejected). Backwards-compatible:
+    // entries without `explanation` render exactly like before.
+    let _expIdx = 0;
+    const renderExpRow = (id, exp, isSkipped) => {
+      const inputsHtml = (exp.inputs && exp.inputs.length)
+        ? `<div class="exp-section"><b>Inputs</b><div class="kv-grid">${
+            exp.inputs.map(i => `<div class="k">${i.label}</div><div class="v">${i.value}</div>`).join('')
+          }</div></div>` : '';
+      const formulaHtml = exp.formula
+        ? `<div class="exp-section"><b>Formula</b><code>${exp.formula}</code></div>` : '';
+      const calcHtml = exp.calculation
+        ? `<div class="exp-section"><b>Calculation</b><code>${exp.calculation}</code></div>` : '';
+      const altsHtml = (exp.alternatives_rejected && exp.alternatives_rejected.length)
+        ? `<div class="exp-section"><b>Alternatives rejected</b><ul>${
+            exp.alternatives_rejected.map(alt => `<li><b style="color:var(--t);text-transform:none;letter-spacing:0;display:inline">${alt.option}</b> — ${alt.why}</li>`).join('')
+          }</ul></div>` : '';
+      return `<tr id="${id}" class="exp-row" style="display:none"><td colspan="4">
+        <div class="exp-body">
+          <div class="exp-what">${exp.what||''}</div>
+          ${exp.why ? `<div class="exp-why">${exp.why}</div>` : ''}
+          ${inputsHtml}${formulaHtml}${calcHtml}${altsHtml}
+        </div></td></tr>`;
+    };
+
     const rows=d.slice().reverse().flatMap(dec=>{
       const ts=new Date(dec.timestamp).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'});
+      const buildRow = (a, isSkipped) => {
+        const hasExp = a.explanation && a.explanation.what;
+        const expId  = hasExp ? `exp-${_expIdx++}` : '';
+        const toggle = hasExp ? `<span class="exp-toggle" onclick="toggleExp('${expId}',this)">▶</span>` : '';
+        const okCell = isSkipped
+          ? `<td class="skip">–</td>`
+          : `<td class="${a.ok?'ok-c':'err-c'}">${a.ok?'✓':'✗'}</td>`;
+        const reasonCls = isSkipped ? 'skip' : 'ok-c';
+        const main = `<tr><td>${ts}</td><td><span class="tag ${tagMap[a.type]||''}">${a.type}</span></td><td class="${reasonCls}">${toggle}${a.reason}</td>${okCell}</tr>`;
+        return hasExp ? [main, renderExpRow(expId, a.explanation, isSkipped)] : [main];
+      };
       return [
-        ...(dec.actions||[]).map(a=>`<tr><td>${ts}</td><td><span class="tag ${tagMap[a.type]||''}">${a.type}</span></td><td class="ok-c">${a.reason}</td><td class="${a.ok?'ok-c':'err-c'}">${a.ok?'✓':'✗'}</td></tr>`),
-        ...(dec.skipped||[]).map(a=>`<tr><td>${ts}</td><td><span class="tag">${a.type}</span></td><td class="skip">${a.reason}</td><td class="skip">–</td></tr>`)
+        ...(dec.actions||[]).flatMap(a => buildRow(a, false)),
+        ...(dec.skipped||[]).flatMap(a => buildRow(a, true))
       ];
     }).join('');
     document.getElementById('log').innerHTML=rows||'<tr><td colspan="4" style="color:var(--m)">No decisions yet</td></tr>';

@@ -574,6 +574,16 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v4.0.1 — Full traceability of side effects
+
+Audit pass on top of v4.0.0 to close every "black box" — every switch toggle, every number write, every API call the add-on performs is now recorded in `decisions.json` and visible in the Activity tab. No silent actions.
+
+- **Pool cleaner auto-stop**: the 15-min APScheduler-deferred turn-off was firing outside the cycle and never reaching `decisions.json`. Now wrapped through a new `_record_event()` helper that persists deferred / out-of-cycle actions to the same history. Tagged `scheduler_event` in the UI.
+- **Pool cleaner start**: previously bundled implicitly with the pool pump's reason string. Now emitted as its own `pool_cleaner` entry with its own `explanation`.
+- **Heat pump dual call** (`number.set_value` + optional `climate.set_temperature`): previously only the number write was logged. The climate mirror call now gets its own `climate_setpoint` entry, tracked independently with its own ok/explanation.
+- **Manual API endpoints** (`/api/battery/charge`, `/api/battery/self-consumption`): when called from outside the engine (UI button, external automation, curl), the action is now recorded as a `manual_api` event with the requester IP, the target SOC, and the full reasoning. No more invisible overrides.
+- **Activity tab visual coverage**: extended the `tagMap` and CSS to include `custom_load`, `pool_cleaner`, `climate_setpoint`, `dishwasher`, `manual_api`, `scheduler_event`. Previously unknown types rendered as undifferentiated gray pills; now each event family has a distinct colour so external interventions are visually distinguishable from cycle decisions.
+
 ### v4.0.0 — Decision engine rewrite + transparency layer
 
 Major release. The internal decision engine has been rewritten to (a) respect every user-configurable setting that was previously silently overridden, and (b) explain what it did and why, in every cycle.

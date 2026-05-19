@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "4.0.0"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "4.0.1"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1616,19 +1616,72 @@ def decide_pool(sensors: dict, tariff: dict) -> dict:
 
     return {"action": False, "reason": f"Waiting — period={period}, solar={solar_now:.2f} kWh/h"}
 
-def _start_pool_with_cleaner(pool_sw: str, cleaner_sw: str):
-    """Turn on pool pump; start limpiafondos (~1.5 kWh) and auto-stop after 15 min."""
-    ha_switch(pool_sw, True)
+def _start_pool_with_cleaner(pool_sw: str, cleaner_sw: str) -> list[dict]:
+    """Turn on pool pump; start limpiafondos (~1.5 kWh) and auto-stop after 15 min.
+
+    Returns the list of actions performed so the caller can append them to
+    the cycle's `decision["actions"]` — previously the limpiafondos start
+    happened silently inside this function, and its 15-min auto-stop happened
+    in a deferred APScheduler job that never reached decisions.json (the
+    "black box" Sergio called out). Both are now traced.
+    """
+    actions = []
+    pump_ok = ha_switch(pool_sw, True)
+    # The pool pump itself is logged by the caller as part of the pool decision;
+    # we return only the cleaner-related actions to avoid double-logging.
     if cleaner_sw and _scheduler_ref:
-        ha_switch(cleaner_sw, True)
+        clean_ok = ha_switch(cleaner_sw, True)
         log.info("  [POOL] Limpiafondos ON — will auto-stop in 15 min")
+        actions.append({
+            "type":     "pool_cleaner",
+            "action":   "on",
+            "switch":   cleaner_sw,
+            "reason":   "Auto-started with pool pump (15-min run)",
+            "ok":       clean_ok,
+            "explanation": _explain(
+                what=f"Turn on pool cleaner {cleaner_sw}",
+                why="Pool pump just started — the cleaner runs for 15 min in parallel as configured by _start_pool_with_cleaner.",
+                inputs=[
+                    {"label": "Pool pump switch",      "value": pool_sw},
+                    {"label": "Cleaner switch",        "value": cleaner_sw},
+                    {"label": "Auto-stop after",       "value": "15 min"},
+                    {"label": "Pool pump start ok",    "value": str(pump_ok)},
+                ],
+                formula="if pool pump turned on AND cleaner configured → cleaner on, schedule off in 15 min",
+                calculation="pool ON → cleaner ON → scheduler.add_job(cleaner OFF at now+15min)",
+            ),
+        })
         shutoff_time = datetime.now() + timedelta(minutes=15)
+
+        def _cleaner_shutoff():
+            """Deferred task: turn off the cleaner 15 min after start, and
+            persist the off-action to decisions.json via _record_event so it
+            shows up in the Activity tab alongside cycle decisions."""
+            ok = ha_switch(cleaner_sw, False)
+            log.info("  [POOL] Limpiafondos OFF (15 min timer completed)")
+            _record_event({
+                "type":     "pool_cleaner",
+                "action":   "off",
+                "switch":   cleaner_sw,
+                "reason":   "Auto-stop after 15-min run",
+                "ok":       ok,
+                "explanation": _explain(
+                    what=f"Turn off pool cleaner {cleaner_sw}",
+                    why="The 15-min timer scheduled when the cleaner started has now elapsed.",
+                    inputs=[
+                        {"label": "Cleaner switch",   "value": cleaner_sw},
+                        {"label": "Trigger",          "value": "APScheduler timer (deferred)"},
+                    ],
+                    formula="scheduled 15 min ago when pool pump started → fire now",
+                ),
+            }, source="scheduler")
+
         _scheduler_ref.add_job(
-            lambda: (ha_switch(cleaner_sw, False),
-                     log.info("  [POOL] Limpiafondos OFF (15 min timer completed)")),
+            _cleaner_shutoff,
             "date", run_date=shutoff_time,
             id="cleaner_shutoff", replace_existing=True,
         )
+    return actions
 
 # ── Dishwasher logic ─────────────────────────────────────────────────────────
 def decide_dishwasher(sensors: dict, tariff: dict) -> dict:
@@ -1834,19 +1887,46 @@ def run_cycle() -> dict:
         log.info(f"  [BATTERY] No action — {bat['reason']}")
 
     # 2. Heat pump — multi-zone
+    # Each zone may produce TWO side effects: the number setpoint (always)
+    # and an optional climate.set_temperature (when a climate entity is also
+    # configured). Previously these were collapsed into one log entry with the
+    # `ok` of the number-write only — the climate call was a silent black box.
+    # Now they get separate entries (`heat_pump` and `climate_setpoint`) so the
+    # Activity tab traces both with their own ok/explanation.
     hp_zones = decide_heat_pump(sensors)
     for hp in hp_zones:
         ok = ha_set_number(hp["entity"], hp["target"]) if hp["entity"] else False
-        # If a climate entity is also configured, set temperature there too
-        if hp.get("climate"):
-            ha_service("climate", "set_temperature", {
-                "entity_id": hp["climate"], "temperature": hp["target"],
-            })
         zone_tag = f"/{hp['zone']}" if hp.get("zone", "default") != "default" else ""
         decision["actions"].append({"type": "heat_pump", "entity": hp["entity"],
             "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
             "value": hp["target"], "reason": hp["reason"], "ok": ok,
             "explanation": hp.get("explanation")})
+        # Second action: climate.set_temperature on the climate entity (if any)
+        if hp.get("climate"):
+            climate_ok = ha_service("climate", "set_temperature", {
+                "entity_id": hp["climate"], "temperature": hp["target"],
+            })
+            decision["actions"].append({
+                "type":   "climate_setpoint",
+                "entity": hp["climate"],
+                "zone":   hp.get("zone"),
+                "value":  hp["target"],
+                "reason": f"Mirror setpoint to climate entity {hp['climate']}",
+                "ok":     climate_ok,
+                "explanation": _explain(
+                    what=f"Set {hp['climate']} target temperature to {hp['target']}°C",
+                    why=(f"Zone {hp.get('zone')} has both a number entity ({hp['entity']}) and a climate "
+                         f"entity ({hp['climate']}) configured. The number drives the actual hardware; "
+                         f"the climate mirror keeps HA dashboards and other automations in sync."),
+                    inputs=[
+                        {"label": "Number entity (hardware)", "value": hp.get("entity", "—")},
+                        {"label": "Climate entity (mirror)",  "value": hp["climate"]},
+                        {"label": "Target temperature",       "value": f"{hp['target']}°C"},
+                        {"label": "Number-write ok",          "value": str(ok)},
+                    ],
+                    formula="if zone.climate configured → climate.set_temperature(climate, target)",
+                ),
+            })
         log.info(f"  [HEAT PUMP/{hp['season'].upper()}{zone_tag}] {hp['reason']} → {hp['target']}°C")
 
     # 3. Pool pump + cleaner
@@ -1855,10 +1935,14 @@ def run_cycle() -> dict:
     clean_sw = _wiz("pool_cleaner", "switch_pool_cleaner", "")
     pool_expl = pool.get("explanation")
     if pool["action"]:
-        _start_pool_with_cleaner(pool_sw, clean_sw)
+        # The helper turns on the pool pump and returns the side actions
+        # (limpiafondos on + scheduled auto-off in 15 min) for tracing.
+        cleaner_actions = _start_pool_with_cleaner(pool_sw, clean_sw)
         decision["actions"].append({"type": "pool", "action": True,
             "reason": pool["reason"] + " (+ limpiafondos 15 min)", "ok": True,
             "explanation": pool_expl})
+        # Each cleaner sub-action is its own row in Activity (own type, own ▶).
+        decision["actions"].extend(cleaner_actions)
         log.info(f"  [POOL] ON — {pool['reason']}")
     else:
         ha_switch(pool_sw, False)
@@ -1935,6 +2019,34 @@ def _save_decision(d: dict):
             history = []
     history.append(d)
     DECISIONS_FILE.write_text(json.dumps(history[-500:], indent=2, default=str))
+
+
+def _record_event(action: dict, source: str = "event"):
+    """Append a single side-effect action to decisions.json outside of the
+    normal 15-min cycle, so the Activity tab still traces it.
+
+    Used for:
+      - Deferred actions fired by the scheduler (e.g. limpiafondos auto-stop
+        15 min after the pool pump starts)
+      - Manual triggers from API endpoints or the UI (e.g. /api/battery/charge)
+      - Anything the engine does that wasn't decided as part of a `run_cycle()`
+
+    Stored as a minimal `decision` envelope so the existing UI rendering
+    works unchanged — `sensors`, `tariff`, `prediction` are intentionally
+    empty (the event is detached from a cycle context). The `source` field
+    distinguishes these from the regular cycle decisions in case the UI
+    wants to surface them differently later.
+    """
+    event = {
+        "timestamp":  datetime.now().isoformat(),
+        "source":     source,                  # "event" | "manual_api" | "scheduler"
+        "sensors":    {},
+        "tariff":     {},
+        "prediction": {},
+        "actions":    [action],
+        "skipped":    [],
+    }
+    _save_decision(event)
 
 # ── Daily summary notification ───────────────────────────────────────────────
 def send_daily_summary():
@@ -2197,6 +2309,12 @@ th{color:var(--m);font-weight:500}
 .tag.bat{background:rgba(56,189,248,.12);color:var(--a)}
 .tag.hp{background:rgba(74,222,128,.12);color:var(--g)}
 .tag.pool{background:rgba(251,191,36,.12);color:var(--y)}
+.tag.cl{background:rgba(168,85,247,.14);color:#c084fc}                     /* custom_load — purple */
+.tag.pc{background:rgba(251,191,36,.18);color:var(--y);font-style:italic}  /* pool_cleaner — yellow italic */
+.tag.dw{background:rgba(244,114,182,.12);color:#f472b6}                    /* dishwasher */
+.tag.cli{background:rgba(56,189,248,.18);color:var(--a);font-style:italic} /* climate_setpoint — same family as battery */
+.tag.man{background:rgba(239,68,68,.14);color:var(--r);font-weight:700}    /* manual / API trigger — red, prominent */
+.tag.evt{background:rgba(148,163,184,.18);color:#94a3b8;font-style:italic} /* scheduler/deferred event */
 .tag.dw{background:rgba(251,146,60,.12);color:var(--o)}
 /* Weather */
 .weather-card{background:var(--s);border-radius:.75rem;padding:.9rem;border:1px solid var(--b);margin-bottom:1rem}
@@ -3736,7 +3854,23 @@ async function loadHistory(){
 
 // ── Status & decisions ────────────────────────────────────────────────────────
 const PC={peak:'peak',valley:'valley',mid:'mid'};
-const tagMap={battery:'bat',heat_pump:'hp',pool:'pool',dishwasher:'dw'};
+// Visual badge mapping for each action `type` recorded in decisions.json.
+// Any type not listed here renders with the generic gray pill, so missing
+// entries don't break the UI — they just look undifferentiated. The full
+// set is kept in sync with what the cycle / event recorders emit:
+//   battery, heat_pump, climate_setpoint, pool, pool_cleaner,
+//   dishwasher, custom_load, manual_api, scheduler_event
+const tagMap = {
+  battery:          'bat',
+  heat_pump:        'hp',
+  climate_setpoint: 'cli',
+  pool:             'pool',
+  pool_cleaner:     'pc',
+  dishwasher:       'dw',
+  custom_load:      'cl',
+  manual_api:       'man',
+  scheduler_event:  'evt',
+};
 
 // Expand / collapse a decision's explanation panel. Used by the toggle that
 // appears in front of each `reason` when the decision carries an `explanation`
@@ -5828,14 +5962,54 @@ def api_retrain():
 
 @app.route("/api/battery/charge", methods=["POST"])
 def api_battery_charge():
+    """Manual override: force a battery charge to a given target. Records
+    the action in decisions.json as a `manual_api` event so it doesn't bypass
+    the Activity tab (no black box)."""
     data       = request.get_json() or {}
     target_soc = max(10, min(100, int(data.get("target_soc", 80))))
+    requester  = request.headers.get("X-Forwarded-For") or request.remote_addr or "unknown"
     ok         = set_battery_charge_target(target_soc)
+    _record_event({
+        "type":    "manual_api",
+        "action":  "battery_charge",
+        "target_soc": target_soc,
+        "reason":  f"Manual override via /api/battery/charge (requested by {requester})",
+        "ok":      ok,
+        "explanation": _explain(
+            what=f"Force battery charge to {target_soc}% (manual override)",
+            why="Triggered by an external POST to /api/battery/charge — bypasses the normal decision cycle.",
+            inputs=[
+                {"label": "Endpoint",      "value": "/api/battery/charge"},
+                {"label": "Target SOC",    "value": f"{target_soc}%"},
+                {"label": "Requester IP",  "value": requester},
+            ],
+            formula="external HTTP POST → set_battery_charge_target(target_soc)",
+        ),
+    }, source="manual_api")
     return jsonify({"ok": ok, "target_soc": target_soc})
 
 @app.route("/api/battery/self-consumption", methods=["POST"])
 def api_battery_self_consumption():
-    return jsonify({"ok": set_battery_self_consumption()})
+    """Manual override: switch the battery back to self-consumption mode.
+    Records the action in decisions.json as a `manual_api` event."""
+    requester = request.headers.get("X-Forwarded-For") or request.remote_addr or "unknown"
+    ok        = set_battery_self_consumption()
+    _record_event({
+        "type":   "manual_api",
+        "action": "battery_self_consumption",
+        "reason": f"Manual override via /api/battery/self-consumption (requested by {requester})",
+        "ok":     ok,
+        "explanation": _explain(
+            what="Switch battery to self-consumption (manual override)",
+            why="Triggered by an external POST to /api/battery/self-consumption — bypasses the normal decision cycle.",
+            inputs=[
+                {"label": "Endpoint",     "value": "/api/battery/self-consumption"},
+                {"label": "Requester IP", "value": requester},
+            ],
+            formula="external HTTP POST → set_battery_self_consumption()",
+        ),
+    }, source="manual_api")
+    return jsonify({"ok": ok})
 
 @app.route("/api/send-summary", methods=["POST"])
 def api_send_summary():

@@ -36,6 +36,11 @@ Smart energy management add-on for Home Assistant OS. Its primary goal is to **m
 13. [Persistent data](#persistent-data)
 14. [Changelog](#changelog)
 
+> **v5 deep dive:** the predictive engine introduced in v5.0.0 has its own
+> architecture write-up at [docs/architecture-v5.md](docs/architecture-v5.md)
+> and a wiring guide for activating the dormant `v5_engine_enabled` flag at
+> [docs/v5-wiring.md](docs/v5-wiring.md).
+
 ---
 
 ## Installation

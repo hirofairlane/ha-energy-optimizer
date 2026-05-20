@@ -574,6 +574,14 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v4.0.2 — Setup integrity checker + first modular package
+
+Hotfix release that lays the ground for the upcoming v5.0.0 rewrite while delivering one immediately useful fix.
+
+- **Setup integrity checker**: detects when the same `entity_id` is configured in multiple actuable roles in the wizard (e.g. the same `switch.*` used as `pool_switch` and as a `custom_loads[].switch`). This was the root cause of the "blitzwolf switching by itself" symptom reported in #4 — the pool branch issued `turn_on` and the custom-load branch issued `turn_off` in the very same decision cycle. On startup the add-on now logs every conflict, publishes `binary_sensor.energy_optimizer_setup_conflict` to Home Assistant (with the full conflict list as attributes), and fires a Telegram alert if any CRITICAL collision is found.
+- **First module of the new `eo` package**: `eo.checks.setup_integrity` is a pure, unit-tested module (18 pytest cases) introduced as the template for how v5.0.0 modules will be organised. The legacy monolithic `energy_optimizer.py` keeps running unchanged; new functionality grows alongside it (strangler-fig pattern).
+- **`pytest.ini` and `tests/` directory**: development tests now live in the repo and run with `python3 -m pytest tests/` (not shipped inside the Docker image).
+
 ### v4.0.1 — Full traceability of side effects
 
 Audit pass on top of v4.0.0 to close every "black box" — every switch toggle, every number write, every API call the add-on performs is now recorded in `decisions.json` and visible in the Activity tab. No silent actions.

@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "4.0.1"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "4.0.2"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1583,6 +1583,52 @@ def send_telegram_alert(message: str):
         "data": {"parse_mode": "markdown"},
     })
     log.info(f"  Telegram instant alert: {'OK' if ok else 'ERROR'}")
+
+# ── Setup integrity check (v4.0.2) ────────────────────────────────────────────
+def run_setup_integrity_check() -> None:
+    """Run the wizard-config integrity check and publish results to HA.
+
+    Detects entity_ids assigned to multiple actuable roles (e.g. the same
+    switch as `pool_switch` and as a `custom_loads[].switch`), which causes
+    the engine to issue contradictory on/off commands in the same cycle.
+
+    Side effects:
+      • Logs warnings/criticals.
+      • Publishes `binary_sensor.energy_optimizer_setup_conflict` to HA.
+      • Sends a Telegram alert if there are CRITICAL conflicts.
+    """
+    from eo.checks.setup_integrity import check as _check_integrity
+
+    report = _check_integrity(_WIZARD)
+
+    if report.ok and not report.conflicts:
+        log.info("  Setup integrity: OK")
+    else:
+        for line in report.to_summary().splitlines():
+            (log.error if not report.ok else log.warning)(line)
+
+    state = "off" if report.ok else "on"  # binary_sensor: on = problem detected
+    ha_post("/api/states/binary_sensor.energy_optimizer_setup_conflict", {
+        "state": state,
+        "attributes": {
+            "friendly_name":   "Energy Optimizer Setup Conflict",
+            "device_class":    "problem",
+            "icon":            "mdi:alert-circle" if not report.ok else "mdi:check-circle",
+            "critical_count":  len(report.critical_conflicts),
+            "warning_count":   len(report.warnings),
+            "conflicts":       [c.to_dict() for c in report.conflicts],
+            "summary":         report.to_summary(),
+        },
+    })
+
+    if report.critical_conflicts:
+        msg_lines = ["🚨 *Energy Optimizer — Setup conflict detected*", ""]
+        for c in report.critical_conflicts:
+            roles = ", ".join(f"`{o.role}`" for o in c.occurrences)
+            msg_lines.append(f"• `{c.entity_id}` is assigned to {len(c.occurrences)} roles: {roles}")
+        msg_lines.append("")
+        msg_lines.append("This causes contradictory on/off commands in the same cycle. Fix in the Wizard before relying on automation.")
+        send_telegram_alert("\n".join(msg_lines))
 
 # ── Pool pump + cleaner logic ────────────────────────────────────────────────
 _scheduler_ref = None  # set in main()
@@ -6388,6 +6434,11 @@ def main():
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")
     log.info(f"  Telegram daily:          {cfg('notify_telegram_daily_enabled', True)}")
     log.info(f"  Telegram instant alerts: {cfg('notify_telegram_alerts_enabled', True)}")
+
+    try:
+        run_setup_integrity_check()
+    except Exception as e:
+        log.error(f"Setup integrity check failed to run: {e}")
 
     if not MODEL_FILE.exists():
         log.info("No saved model — starting initial training...")

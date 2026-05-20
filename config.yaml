@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "4.0.2"
+version: "5.0.0"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -24,6 +24,13 @@ options:
   decision_interval_minutes: 15
   retrain_cron: "0 3 * * *"
   log_level: "info"
+
+  # ── v5 decision engine (forecasting + planner + policy) ────────────────────────────────────────────
+  # When false (default), the addon runs the legacy v4 reactive engine. Flip
+  # to true ONLY after the v5 forecasters have been trained on your data
+  # (see docs for the wiring checklist). The legacy engine stays available
+  # as the fallback for the v5 cycle whenever sensors / forecasts are missing.
+  v5_engine_enabled: false
 
   # ── Seasons ────────────────────────────────────────────────────────────────────────────────────────
   summer_start_month: 6
@@ -100,6 +107,7 @@ schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
   log_level: "list(debug|info|warning|error)"
+  v5_engine_enabled: bool
   summer_start_month: int(1,12)
   summer_end_month: int(1,12)
   solar_tomorrow_irrisoria_kwh: float

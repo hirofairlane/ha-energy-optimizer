@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "4.0.2"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.0"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -6434,6 +6434,14 @@ def main():
     log.info(f"  Email enabled:           {cfg('notify_email_enabled', True)}")
     log.info(f"  Telegram daily:          {cfg('notify_telegram_daily_enabled', True)}")
     log.info(f"  Telegram instant alerts: {cfg('notify_telegram_alerts_enabled', True)}")
+
+    v5_enabled = bool(cfg("v5_engine_enabled", False))
+    log.info(f"  v5 engine:               {'ENABLED' if v5_enabled else 'disabled (legacy v4 cycle active)'}")
+    if v5_enabled:
+        log.warning(
+            "  v5 engine is enabled but the integration adapter is not wired yet "
+            "in this release. Falling back to legacy v4 cycle. See docs/v5-wiring.md."
+        )
 
     try:
         run_setup_integrity_check()

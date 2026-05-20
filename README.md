@@ -574,6 +574,26 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.0 — Predictive engine rewrite
+
+Major release. The decision engine moves from reactive heuristics to a **predictive planner** with explicit forecasting, deterministic SOC simulation, an iterative planner with convergence guarantees, a four-layer policy pipeline, and full per-cell traceability. The new engine is delivered behind a feature flag (`v5_engine_enabled: false` by default) so existing v4 installations keep running unchanged until the flag is flipped.
+
+**Why a major bump.** Although `wizard_config.json` v3.5+ remains backward-compatible, the cycle's observable behaviour changes radically when the v5 engine is active: forecasts come from quantile heads, decisions are computed from a horizon-aware planner, and every override (capacity budget, peak prohibition, antiflap, degraded mode) is recorded in a structured trace. Calling that anything less than a major bump would be dishonest.
+
+**Architecture (under `rootfs/usr/bin/eo/`).** Built strangler-fig style alongside the existing monolithic `energy_optimizer.py`. The v4 engine is untouched.
+
+- `eo/forecasters/` — `ClearSkyModel` (deterministic PV baseline, no `pvlib`), `AtmosphericFactorModel` (ML residual with P10/P50/P90 quantile heads), `SolarForecaster` (composition), `HouseForecaster` (standalone quantile model, **not chained** to avoid the v3.x autoregressive inflated R²), `ForecastQualityTracker` (rolling MAE / bias / calibration error per series), `training` helpers.
+- `eo/simulator/` — pure, side-effect-free 15-min-timestep SOC simulator with an injectable `PhysicsModel` (today `SingleBatteryPhysicsModel`; future EV / multi-battery without touching the simulator). Hard invariants for SOC bounds, charge/discharge mutex, inverter capacity, energy conservation, min-runtime, contradictory actions, debt monotonicity. Soft mode in production, strict mode in tests.
+- `eo/planner/` — debt-state classifier with the two bug fixes from review (window-mutation truncation + telemetry-coverage scaling), 11-row decision matrix from the spec, utility-score function, iterative convergence loop with plan-hash + 2-cycle detection + `MAX_PLANNER_ITERATIONS=5` guardrail. Implements the `forced_states` injection insight from the audit round so the simulated trajectory never diverges from execution.
+- `eo/policy/` — four-layer pipeline (`capacity_budget` → `peak_prohibition` → `antiflap` → `degraded_mode`). Each layer is a pure transform; the triple `raw_plan / policy_adjusted_plan / execution_plan` is preserved end-to-end. Three-level degraded mode (forecast MAE high → drop `min_runtime_only` decisions; AEMET stale → drop everything except `rule_id=3`; sensors stale > 30 min → all deferred loads OFF).
+- `eo/scenario/` — `ScenarioBuilder` collapses quantiles into a single coherent Scenario whose risk tolerance is derived from the worst debt state across declared loads.
+- `eo/state/` — aggregated `SystemState` dataclass (battery + forecast quality + planner history + load debt + antiflap + execution world state) with atomic JSON persistence (`tmp + fsync + os.replace`).
+- `eo/execution/` — pure execution engine and cycle orchestrator. Optimistic-hybrid dispatch (no synchronous ACK wait); telemetry-driven reconciliation after restart (telemetry beats persisted state if they diverge).
+
+**Tests.** 355 pytest cases across the package. Includes the three high-pressure scenarios from the spec review: "Monstruo del Bucle" (oscillating load hits `max_iter` cap), "Sábado de Gloria" (concurrent loads on weekend valley serialised by capacity budget), "Cap del Fin del Mundo" (unreachable quota produces `irreachable` debt state and Telegram alert).
+
+**Defaults.** `v5_engine_enabled: false`. The flag turns the engine on once the addon-specific wiring is complete (forecasters trained on the user's historical data, data-source bindings for hours-on-per-day rebuilds, entity registry for `is_on` / `send_command`). Wiring guide ships in a future point release.
+
 ### v4.0.2 — Setup integrity checker + first modular package
 
 Hotfix release that lays the ground for the upcoming v5.0.0 rewrite while delivering one immediately useful fix.

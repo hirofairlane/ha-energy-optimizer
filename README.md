@@ -579,6 +579,15 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.1 — Retrain fix for InfluxDB-backed installs
+
+Hotfix. The nightly retrain (`retrain_cron`, default `0 3 * * *`) was silently failing on every cycle for any installation with `data_source: influxdb` in the wizard, leaving the model frozen at the SOC predictions it had at install time. Traceback was buried in the addon log — the engine kept producing decisions from a stale model and never surfaced the problem.
+
+- **Root cause.** `_influx_query` requests `epoch=ms` so InfluxDB returns `time` as an integer (Unix milliseconds), but `_rows_to_15min_series` assumed HA-REST style ISO strings and called `.replace("Z", …)` on the value. The `except` clause caught `KeyError / ValueError / TypeError` but not `AttributeError`, so the first row aborted the whole training set.
+- **Fix.** `_rows_to_15min_series` now detects the type of `last_changed` (`str` / `int` / `float`) and converts integer timestamps via magnitude thresholds (seconds / milliseconds / nanoseconds). `AttributeError` is also added to the `except` so a single malformed row no longer kills the batch.
+- **Impact.** Confirmed on a real install: the post-fix retrain produced 8637 samples × 22 features (R² 0.997), versus the previous 14-feature model trained 18 days earlier. The eight extra features are the wizard's `grid_submeters` (per-appliance power readings) that had been silently dropped because they were added after the last successful training.
+- Affects: HAOS installs with `data_source: influxdb` (the default for users who configure the InfluxDB step in the wizard). HA-REST-only installs were not affected because their `last_changed` is already a string.
+
 ### v5.0.0 — Predictive engine rewrite
 
 Major release. The decision engine moves from reactive heuristics to a **predictive planner** with explicit forecasting, deterministic SOC simulation, an iterative planner with convergence guarantees, a four-layer policy pipeline, and full per-cell traceability. The new engine is delivered behind a feature flag (`v5_engine_enabled: false` by default) so existing v4 installations keep running unchanged until the flag is flipped.

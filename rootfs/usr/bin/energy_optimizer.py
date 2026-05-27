@@ -15,7 +15,7 @@ import re
 import json
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import joblib
@@ -1014,10 +1014,25 @@ def _rows_to_15min_series(rows: list, col: str) -> "pd.Series":
     records = []
     for row in rows:
         try:
-            ts  = datetime.fromisoformat(row["last_changed"].replace("Z", "+00:00"))
+            lc = row["last_changed"]
+            if isinstance(lc, str):
+                ts = datetime.fromisoformat(lc.replace("Z", "+00:00"))
+            elif isinstance(lc, (int, float)):
+                # InfluxDB path returns Unix timestamp. _influx_query asks for
+                # epoch=ms, but we accept seconds and nanoseconds too so this
+                # function stays correct if the upstream epoch ever changes.
+                if lc > 1e15:     # nanoseconds (~year 33658 in s)
+                    ts_val = lc / 1e9
+                elif lc > 1e11:   # milliseconds (~year 5138 in s)
+                    ts_val = lc / 1e3
+                else:             # seconds
+                    ts_val = lc
+                ts = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+            else:
+                continue
             val = float(row["state"])
             records.append({"ts": ts.replace(tzinfo=None), "value": val})
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, AttributeError):
             continue
     if not records:
         return pd.Series(dtype=float, name=col)

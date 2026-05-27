@@ -15,7 +15,7 @@ import re
 import json
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import joblib
@@ -823,6 +823,10 @@ def _influx_wizard_history(entity: str, days: int, influx_cfg: dict) -> list:
                 ts, val = point[ti], point[vi]
                 if val is None:
                     continue
+                # _influx_query passes epoch=ms → timestamps are integers.
+                # Convert to ISO 8601 for _rows_to_15min_series compatibility.
+                if isinstance(ts, (int, float)):
+                    ts = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
                 rows.append({"last_changed": ts, "state": str(val)})
         return rows
     except Exception as e:
@@ -5712,7 +5716,10 @@ def api_wizard_data_quality():
                 if resp_f:
                     try:
                         data = resp_f.json()
-                        first_ts = data["results"][0]["series"][0]["values"][0][0][:10]
+                        raw_ts = data["results"][0]["series"][0]["values"][0][0]
+                        if isinstance(raw_ts, (int, float)):
+                            raw_ts = datetime.fromtimestamp(raw_ts / 1000, tz=timezone.utc).isoformat()
+                        first_ts = raw_ts[:10]
                     except (KeyError, IndexError, TypeError, ValueError):
                         pass
         except Exception as e:

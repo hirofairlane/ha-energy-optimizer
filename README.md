@@ -579,6 +579,15 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.2 — GoodWe support: opt-in mode select + `battery_backup_soc` reset
+
+Fixes two bugs in the battery control layer that prevented Energy Optimizer from working on GoodWe inverters and could leave any installation with an inflated minimum discharge SOC after a valley charge. Reported and diagnosed by [@andredp](https://github.com/andredp) on a GoodWe GW3648-EM with the [mletenay HACS integration](https://github.com/mletenay/home-assistant-goodwe-inverter) (issue #7).
+
+- **Bug A — mandatory mode select.** `set_battery_charge_target` and `set_battery_self_consumption` unconditionally called `select.select_option` against the configured `battery_mode_select` entity. The hardcoded fallback was a Huawei Luna2000-specific id (`select.battery_working_mode`), so a GoodWe install with the wizard field left blank still fired the call against a non-existent entity, got a 400 back, and tainted the whole battery operation as `ok=False`. GoodWe doesn't need a mode select at all — `goodwe_fast_charging_switch` + `goodwe_fast_charging_soc` are standalone registers that operate independently of the inverter's operation mode.
+- **Bug B — `battery_backup_soc` never reset.** `set_battery_charge_target` raised `battery_backup_soc` to the valley charge target (e.g. 60 %) but `set_battery_self_consumption` never lowered it back when the engine flipped to self-consumption at peak start. On Huawei this entity is the minimum charging SOC and the silent inflation was tolerable; on GoodWe it maps to `goodwe_battery_soc_protection` and pinned the battery above the valley target all day, defeating the entire optimisation.
+- **Fix.** The mode select is now opt-in: the hardcoded Huawei default is removed, and the call is guarded with `if mode_entity:` so it only fires when the user explicitly populates `select_battery_mode` in the wizard or `setup.json`. `set_battery_self_consumption` now also resets `battery_backup_soc` to `min_soc`, mirroring how `battery_cutoff_soc` is already reset.
+- **Migration note for Huawei users.** If you were relying on the implicit `select.battery_working_mode` default and never set the entity in the wizard, you must add it explicitly under Setup Wizard → Battery → "Mode select entity" after upgrading. If you already configured it (the recommended path documented in the wizard since v3.x), nothing changes.
+
 ### v5.0.1 — Retrain fix for InfluxDB-backed installs
 
 Hotfix. The nightly retrain (`retrain_cron`, default `0 3 * * *`) was silently failing on every cycle for any installation with `data_source: influxdb` in the wizard, leaving the model frozen at the SOC predictions it had at install time. Traceback was buried in the addon log — the engine kept producing decisions from a stale model and never surfaced the problem.

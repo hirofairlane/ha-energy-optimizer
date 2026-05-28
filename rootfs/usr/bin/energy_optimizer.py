@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.1"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.2"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -628,8 +628,13 @@ def set_battery_charge_target(target_soc: int, charge_power_w: int = 3000) -> bo
     ops = [
         ha_set_number(_batt("battery_cutoff_soc",   "number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), target_soc),
         ha_set_number(_batt("battery_backup_soc",   "number_battery_backup_soc",   ""),       target_soc),
-        ha_set_select(_batt("battery_mode_select",  "select_battery_mode",         "select.battery_working_mode"), "time_of_use_luna2000"),
     ]
+    # Mode select — opt-in. GoodWe handles charging through standalone fast-charge
+    # registers and has no mode entity for this; firing select.select_option against
+    # a missing/foreign entity returns 400 and taints the whole op as ok=False (#7).
+    mode_entity = _batt("battery_mode_select", "select_battery_mode", "")
+    if mode_entity:
+        ops.append(ha_set_select(mode_entity, "time_of_use_luna2000"))
     # Charge power — only if entity is available
     pwr_entity = _batt("battery_charge_power", "number_battery_charge_power", "")
     if pwr_entity:
@@ -643,10 +648,18 @@ def set_battery_charge_target(target_soc: int, charge_power_w: int = 3000) -> bo
     return ok
 
 def set_battery_self_consumption(min_soc: int = 20) -> bool:
-    ok = all([
+    # Reset both floors that set_battery_charge_target raised during valley.
+    # battery_backup_soc was previously left at the valley target, which on GoodWe
+    # maps to goodwe_battery_soc_protection and locked the battery above min_soc
+    # all peak (#7).
+    ops = [
         ha_set_number(_batt("battery_cutoff_soc",  "number_battery_charge_cutoff", "number.battery_grid_charge_cutoff_soc"), min_soc),
-        ha_set_select(_batt("battery_mode_select", "select_battery_mode",          "select.battery_working_mode"), "maximise_self_consumption"),
-    ])
+        ha_set_number(_batt("battery_backup_soc",  "number_battery_backup_soc",   ""), min_soc),
+    ]
+    mode_entity = _batt("battery_mode_select", "select_battery_mode", "")
+    if mode_entity:
+        ops.append(ha_set_select(mode_entity, "maximise_self_consumption"))
+    ok = all(ops)
     # Disengage force charge if entity is set
     force_entity = _batt("battery_force_charge", "switch_battery_force_charge", "")
     if force_entity:

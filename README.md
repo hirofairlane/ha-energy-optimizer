@@ -579,6 +579,14 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.4 — `set_battery_self_consumption` honours Battery Health Mode
+
+Follow-up to v5.0.2 reported by [@andredp](https://github.com/andredp) on issue #7. The 5.0.2 fix correctly reset `battery_backup_soc` at peak start, but did so against the hardcoded default of 20 %, silently shadowing the user's selection on the **Tweak page → Battery Health Mode** card. Effect: even after upgrading, a `bill_reducer` install kept the floor at 20 instead of 10 (loses ~10 % of usable capacity every peak window), and a `battery_guard` install dropped to 20 instead of staying at 25 (more aggressive than the user asked for).
+
+- **Root cause.** The two call sites — the autonomous cycle when `decide_battery` returns `self_consumption`, and the manual `POST /api/battery/self-consumption` endpoint — both invoked `set_battery_self_consumption()` with no argument, taking the function's hardcoded default of `min_soc=20`. The same `battery_health_mode` setting that already drives the charging floors via `_health_mode_limits()` (`bill_reducer→(10,95) / optimized→(20,90) / battery_guard→(25,85)`) was not consulted on the release side.
+- **Fix.** `set_battery_self_consumption(min_soc=None)`: when no explicit floor is passed, derive it from `_health_mode_limits()[0]`. Both call sites continue to call it with no argument, so the user's Tweak selection now flows end-to-end without any additional wiring.
+- **Migration.** Anyone who selected a non-default mode and noticed their battery being more conservative than expected at peak will see the floor change after upgrading: `bill_reducer` 20 → 10, `battery_guard` 20 → 25. `optimized` users are unaffected (mode floor is already 20). Explicit external API callers passing a custom `min_soc` keep their behaviour.
+
 ### v5.0.3 — Radiant cooling regime + manual season selector
 
 Adds a conservative summer regime for installs whose cooling side is a high-inertia radiant floor (or any system where overnight cooling is wasteful) and lets users flip seasons manually from a Home Assistant helper instead of relying on the calendar.

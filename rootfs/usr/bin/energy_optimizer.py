@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.3"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.4"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -647,7 +647,13 @@ def set_battery_charge_target(target_soc: int, charge_power_w: int = 3000) -> bo
     log.info(f"  Battery → charge to {target_soc}% @ {charge_power_w}W — {'OK' if ok else 'ERROR'}")
     return ok
 
-def set_battery_self_consumption(min_soc: int = 20) -> bool:
+def set_battery_self_consumption(min_soc: int | None = None) -> bool:
+    # When no explicit floor is passed, honour the user's Battery Health Mode.
+    # Previous default of hardcoded 20 silently shadowed bill_reducer (→ 10)
+    # and battery_guard (→ 25), so the post-peak release was always at 20
+    # regardless of what the user picked on the Tweak page (#7, andredp).
+    if min_soc is None:
+        min_soc = _health_mode_limits()[0]
     # Reset both floors that set_battery_charge_target raised during valley.
     # battery_backup_soc was previously left at the valley target, which on GoodWe
     # maps to goodwe_battery_soc_protection and locked the battery above min_soc

@@ -579,6 +579,15 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.3 — Radiant cooling regime + manual season selector
+
+Adds a conservative summer regime for installs whose cooling side is a high-inertia radiant floor (or any system where overnight cooling is wasteful) and lets users flip seasons manually from a Home Assistant helper instead of relying on the calendar.
+
+- **New `season_select` wizard role.** Resolves to a Home Assistant `input_select` (typically `input_select.season` with options `summer` / `winter`, Spanish `verano` / `invierno` also accepted). When configured, the addon trusts that selector end-to-end — `_season()` returns its state and `_is_summer()` derives from it. When not configured, the legacy month-based heuristic (`summer_start_month` / `summer_end_month`) keeps working. The selector is also honoured by `decide_pool`, so pool hours-per-day vs hours-per-week switch with the same flip as the HVAC regime.
+- **Conservative summer HVAC regime.** `_hp_zone_decision` and `_hp_legacy_decision` now refuse to actuate the cooling setpoint unless one of two conditions holds: (a) a clear solar surplus (SOC ≥ 99 % with the battery exporting, *or* the zone schedule cell is `surplus`), or (b) indoor temperature crosses the new `hvac_summer_override_c` threshold (default 29 °C). Outside those windows the decision is reported as `skip: True`, the activity feed records the inaction, and no `number.set_value` or `climate.set_temperature` is sent — critical for radiant floors, which would otherwise be primed cold overnight at valley prices and stay cold through the morning when there's nothing to dump into.
+- **No behaviour change for winter.** The heating branch keeps the existing `surplus` / `comfort` / `minimum` ladder; only the summer branch was inverted.
+- **Migration.** Nothing required for installs that don't add the new selector — the month-based default keeps the previous behaviour modulo the summer inactivity rule. Installs that *do* want the radiant regime should: (1) create `input_select.season` in HA, (2) point the wizard's new "Season selector entity" field at it, (3) optionally tune `hvac_summer_override_c` in `setup.json`. A companion design for the HA side (templates that swap thermostats with the same selector) ships under [docs/season-switch.md](docs/season-switch.md).
+
 ### v5.0.2 — GoodWe support: opt-in mode select + `battery_backup_soc` reset
 
 Fixes two bugs in the battery control layer that prevented Energy Optimizer from working on GoodWe inverters and could leave any installation with an inflated minimum discharge SOC after a valley charge. Reported and diagnosed by [@andredp](https://github.com/andredp) on a GoodWe GW3648-EM with the [mletenay HACS integration](https://github.com/mletenay/home-assistant-goodwe-inverter) (issue #7).

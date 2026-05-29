@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.2"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.3"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1253,9 +1253,24 @@ def predict_soc(sensors: dict) -> dict:
     return {"predicted_soc": pred, "method": "rules_fallback"}
 
 # ── Heat pump logic ──────────────────────────────────────────────────────────
-def _is_summer() -> bool:
+def _season() -> str:
+    """Return 'summer' or 'winter'. Priority: wizard season_select entity →
+    month-based fallback. Lets the user flip the seasonal regime from a HA
+    helper (input_select.season) when the calendar disagrees with reality —
+    notably for radiant cooling installs where the summer regime is opt-in.
+    """
+    season_entity = _wiz("season_select", "input_select_season", "")
+    if season_entity:
+        s = ha_str(season_entity, "").strip().lower()
+        if s in ("summer", "verano"):
+            return "summer"
+        if s in ("winter", "invierno"):
+            return "winter"
     m = datetime.now().month
-    return cfg("summer_start_month", 6) <= m <= cfg("summer_end_month", 9)
+    return "summer" if cfg("summer_start_month", 6) <= m <= cfg("summer_end_month", 9) else "winter"
+
+def _is_summer() -> bool:
+    return _season() == "summer"
 
 def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
     soc        = sensors["battery_soc"]
@@ -1270,17 +1285,27 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
     t_surplus  = float(zone.get("temp_surplus", 23.0))
     t_min      = float(zone.get("temp_min",     18.0))
     zone_name  = zone.get("name", f"Zone {zone_idx + 1}")
+    skip       = False
+    target     = None
+    reason     = ""
 
     if summer:
         entity = (zone.get("temp_cool") or
                   _wiz("hvac_temp_cool", "number_hvac_cool", ""))
-        if free_power or sched_mode == "surplus":
-            target, reason = max(16.0, t_comfort - 3), f"Surplus cooling [{zone_name}]"
-        elif sched_mode == "comfort":
-            target, reason = t_comfort - 1,            f"Comfort cooling ({temp_in:.1f}°C) [{zone_name}]"
+        # Radiant-cooling regime: the floor stores cold poorly compared to a
+        # split AC, so running it overnight/valley wastes energy. Default is
+        # NOT to act unless (a) we have a clear solar surplus, or (b) the
+        # house has crossed the configurable thermal override threshold.
+        override_c = float(cfg("hvac_summer_override_c", 29.0))
+        if temp_in > override_c:
+            target = max(16.0, t_comfort - 2)
+            reason = f"Thermal override ({temp_in:.1f}°C > {override_c:.1f}°C) [{zone_name}]"
+        elif free_power or sched_mode == "surplus":
+            target = max(16.0, t_comfort - 3)
+            reason = f"Surplus cooling [{zone_name}]"
         else:
-            target = t_surplus if temp_in > t_surplus + 2 else t_surplus + 3
-            reason = f"Minimum economy [{zone_name}]"
+            skip = True
+            reason = f"Inactive (no surplus, {temp_in:.1f}°C ≤ {override_c:.1f}°C) [{zone_name}]"
     else:
         entity = (zone.get("temp_heat") or
                   _wiz("hvac_temp_heat", "number_hvac_heat", ""))
@@ -1292,7 +1317,9 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
             target, reason = t_min, f"Minimum heating [{zone_name}]"
 
     return {"entity": entity, "climate": zone.get("climate") or None,
-            "target": round(target, 1), "reason": reason, "zone": zone_name,
+            "target": None if skip else round(target, 1),
+            "skip": skip,
+            "reason": reason, "zone": zone_name,
             "sched_mode": sched_mode, "temp_indoor": round(temp_in, 1),
             "season": "summer" if summer else "winter"}
 
@@ -1303,14 +1330,20 @@ def _hp_legacy_decision(sensors: dict) -> dict:
     sun        = get_sun_status()
     daytime    = sun["is_day"]
     free_power = (soc >= 99 and batt_power > 0)
-    if _is_summer():
+    skip       = False
+    target     = None
+    reason     = ""
+    summer     = _is_summer()
+    if summer:
         entity = _wiz("hvac_temp_cool", "number_hvac_cool", "")
-        if free_power:
+        override_c = float(cfg("hvac_summer_override_c", 29.0))
+        if temp_in > override_c:
+            target, reason = 20.0, f"Thermal override ({temp_in:.1f}°C > {override_c:.1f}°C)"
+        elif free_power:
             target, reason = 16.0, "Free solar power (SOC≥99%)"
-        elif temp_in > 26 and daytime:
-            target, reason = 20.0, f"Indoor too hot ({temp_in:.1f}°C)"
         else:
-            target, reason = 25.0, "Summer base setpoint"
+            skip = True
+            reason = f"Inactive (no surplus, {temp_in:.1f}°C ≤ {override_c:.1f}°C)"
     else:
         entity = _wiz("hvac_temp_heat", "number_hvac_heat", "")
         if free_power:
@@ -1319,8 +1352,11 @@ def _hp_legacy_decision(sensors: dict) -> dict:
             target, reason = 17.0, f"Indoor too cold ({temp_in:.1f}°C)"
         else:
             target, reason = 16.0, "Winter base setpoint"
-    return {"entity": entity, "climate": None, "target": target, "reason": reason,
-            "zone": "default", "season": "summer" if _is_summer() else "winter"}
+    return {"entity": entity, "climate": None,
+            "target": None if skip else target,
+            "skip": skip,
+            "reason": reason,
+            "zone": "default", "season": "summer" if summer else "winter"}
 
 def decide_heat_pump(sensors: dict) -> list:
     zones = _WIZARD.get("hvac_zones", [])
@@ -1662,8 +1698,7 @@ def run_setup_integrity_check() -> None:
 _scheduler_ref = None  # set in main()
 
 def decide_pool(sensors: dict, tariff: dict) -> dict:
-    month   = datetime.now().month
-    summer  = cfg("summer_start_month", 6) <= month <= cfg("summer_end_month", 9)
+    summer  = _is_summer()
     hrs_day = sensors.get("pool_hours_day", 0)
     hrs_wk  = sensors.get("pool_hours_week", 0)
     prices  = tariff["prices"]
@@ -1969,8 +2004,19 @@ def run_cycle() -> dict:
     # Activity tab traces both with their own ok/explanation.
     hp_zones = decide_heat_pump(sensors)
     for hp in hp_zones:
-        ok = ha_set_number(hp["entity"], hp["target"]) if hp["entity"] else False
         zone_tag = f"/{hp['zone']}" if hp.get("zone", "default") != "default" else ""
+        # Conservative summer regime can decide to NOT touch the setpoint at all
+        # (e.g. radiant cooling: don't engage overnight without solar surplus).
+        # The action is recorded as a no-op with ok=True so the Activity tab
+        # makes the inaction visible instead of silent.
+        if hp.get("skip"):
+            decision["actions"].append({"type": "heat_pump", "entity": hp.get("entity"),
+                "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
+                "value": None, "reason": hp["reason"], "ok": True,
+                "explanation": hp.get("explanation")})
+            log.info(f"  [HP{zone_tag}] skip — {hp['reason']}")
+            continue
+        ok = ha_set_number(hp["entity"], hp["target"]) if hp["entity"] else False
         decision["actions"].append({"type": "heat_pump", "entity": hp["entity"],
             "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
             "value": hp["target"], "reason": hp["reason"], "ok": ok,

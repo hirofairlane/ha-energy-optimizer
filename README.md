@@ -579,6 +579,15 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.5 — Surplus detection with hysteresis (radiant cooling never engaged on real installs)
+
+Direct follow-up to a 48 h audit on Sergio's install. After v5.0.3 enabled radiant cooling under "solar surplus", the engine never once actuated the cooling path across two days in a heatwave (SoC stayed in the 80–95 % band, the cooling setpoint was `skip`-ed every cycle, the aerotermia never started the compressor). Root cause: `free_power = (soc >= 99 and batt_power > 0)` is a knife-edge condition. SoC sits at 99–100 % only a handful of minutes per day around the peak, and with a 15-minute cycle the engine almost always misses the window.
+
+- **New surplus detector with hysteresis.** Added `_has_surplus_power()` that crosses on at `SoC ≥ 95 %` with the battery not charging (`batt_power ≥ 0`) and only drops off when `SoC < 90 %` OR the battery starts charging hard (`batt_power < −500 W`). All three thresholds are tunable via `setup.json` (`surplus_enter_soc`, `surplus_exit_soc`, `surplus_exit_charge_w`). The active flag is persisted to `/data/surplus_state.json` so addon restarts don't lose context.
+- **Avoids start/stop chatter.** The 5 % SoC and 500 W power gates between entry and exit are wide enough to absorb cycle-to-cycle noise (cloud shading, occasional inverter ramps, opportunistic loads) without bouncing the engine in/out of surplus mode.
+- **Both decision paths updated.** `_hp_zone_decision` and `_hp_legacy_decision` now use the hysteresis detector wherever they previously called the raw `(soc>=99 and batt_power>0)` check. Reason strings updated from "Free solar power (SOC≥99%)" to "Solar surplus (hysteresis)" so logs match the actual mechanic.
+- **No tuning changes shipped by default.** The defaults match the values audited on Sergio's install (95 / 90 / −500), and `hvac_summer_override_c` stays at 29. Installs that want different bands set them in `setup.json` and the addon picks them up on the next cycle.
+
 ### v5.0.4 — `set_battery_self_consumption` honours Battery Health Mode
 
 Follow-up to v5.0.2 reported by [@andredp](https://github.com/andredp) on issue #7. The 5.0.2 fix correctly reset `battery_backup_soc` at peak start, but did so against the hardcoded default of 20 %, silently shadowing the user's selection on the **Tweak page → Battery Health Mode** card. Effect: even after upgrading, a `bill_reducer` install kept the floor at 20 instead of 10 (loses ~10 % of usable capacity every peak window), and a `battery_guard` install dropped to 20 instead of staying at 25 (more aggressive than the user asked for).

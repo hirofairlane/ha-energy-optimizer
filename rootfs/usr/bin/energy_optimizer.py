@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.4"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.5"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -43,6 +43,7 @@ SAVINGS_FILE   = DATA_DIR / "savings.json"
 TARIFF_FILE    = DATA_DIR / "tariff.json"
 SETUP_FILE     = DATA_DIR / "setup.json"
 WIZARD_FILE    = DATA_DIR / "wizard_config.json"
+SURPLUS_STATE_FILE = DATA_DIR / "surplus_state.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -1278,11 +1279,78 @@ def _season() -> str:
 def _is_summer() -> bool:
     return _season() == "summer"
 
+# ── Solar surplus detector with hysteresis ──────────────────────────────────
+# Previous version used `soc >= 99 and batt_power > 0` evaluated cycle-by-cycle.
+# In practice the SOC sits at 99–100 % for only a few minutes per day around the
+# peak — the engine almost never sampled the right cycle window, so radiant
+# cooling never engaged via the surplus path. Now we cross at SOC ≥ 95 % with
+# the battery no longer charging, hold the state across cycles, and only drop
+# out when SOC falls below 90 % OR the battery starts charging hard again.
+# State persists across addon restarts to avoid losing context on rebuild.
+_surplus_state: dict = {"active": False, "since": None, "last_soc": None, "last_pwr": None}
+
+def _load_surplus_state():
+    global _surplus_state
+    if SURPLUS_STATE_FILE.exists():
+        try:
+            _surplus_state = json.loads(SURPLUS_STATE_FILE.read_text())
+        except Exception:
+            pass
+
+def _save_surplus_state():
+    try:
+        SURPLUS_STATE_FILE.write_text(json.dumps(_surplus_state))
+    except Exception as e:
+        log.warning(f"  Could not persist surplus_state.json: {e}")
+
+def _has_surplus_power(soc: float, batt_power_w: float) -> bool:
+    """Return True if there's enough solar surplus to spend on opportunistic
+    loads (radiant cooling, heat pump pre-heating, etc.) with hysteresis.
+
+    Tunables (cfg() keys):
+        surplus_enter_soc      – default 95 %, SOC needed to enter surplus
+        surplus_exit_soc       – default 90 %, SOC drop that ends surplus
+        surplus_exit_charge_w  – default -500 W, hard-charging threshold that
+                                  also ends surplus (battery soaking up solar
+                                  again means there isn't really surplus).
+    """
+    global _surplus_state
+    enter_soc = float(cfg("surplus_enter_soc", 95.0))
+    exit_soc  = float(cfg("surplus_exit_soc",  90.0))
+    exit_pwr  = float(cfg("surplus_exit_charge_w", -500.0))
+
+    active = bool(_surplus_state.get("active", False))
+    now_iso = datetime.now().isoformat()
+
+    if active:
+        # Stay active while SOC isn't depleted AND we're not charging hard.
+        stay = (soc >= exit_soc) and (batt_power_w >= exit_pwr)
+        if not stay:
+            _surplus_state = {"active": False, "since": now_iso,
+                              "last_soc": soc, "last_pwr": batt_power_w}
+            _save_surplus_state()
+            log.info(f"  Surplus → OFF (SOC={soc:.0f}% pwr={batt_power_w:.0f}W "
+                     f"thresholds: <{exit_soc:.0f}% or <{exit_pwr:.0f}W)")
+            return False
+        _surplus_state.update({"last_soc": soc, "last_pwr": batt_power_w})
+        return True
+
+    # Inactive — require crossing the entry bar
+    enter = (soc >= enter_soc) and (batt_power_w >= 0)
+    if enter:
+        _surplus_state = {"active": True, "since": now_iso,
+                          "last_soc": soc, "last_pwr": batt_power_w}
+        _save_surplus_state()
+        log.info(f"  Surplus → ON (SOC={soc:.0f}% pwr={batt_power_w:.0f}W "
+                 f"thresholds: ≥{enter_soc:.0f}% and ≥0W)")
+        return True
+    return False
+
 def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
     soc        = sensors["battery_soc"]
     batt_power = sensors["battery_power"]
     summer     = _is_summer()
-    free_power = (soc >= 99 and batt_power > 0)
+    free_power = _has_surplus_power(soc, batt_power)
     temp_in    = sensors.get(f"temp_zone_{zone_idx}", sensors.get("temp_indoor", 20.0))
     hour       = datetime.now().hour
     sched      = zone.get("sched") or {}
@@ -1335,7 +1403,7 @@ def _hp_legacy_decision(sensors: dict) -> dict:
     temp_in    = sensors.get("temp_indoor", 20.0)
     sun        = get_sun_status()
     daytime    = sun["is_day"]
-    free_power = (soc >= 99 and batt_power > 0)
+    free_power = _has_surplus_power(soc, batt_power)
     skip       = False
     target     = None
     reason     = ""
@@ -1346,14 +1414,14 @@ def _hp_legacy_decision(sensors: dict) -> dict:
         if temp_in > override_c:
             target, reason = 20.0, f"Thermal override ({temp_in:.1f}°C > {override_c:.1f}°C)"
         elif free_power:
-            target, reason = 16.0, "Free solar power (SOC≥99%)"
+            target, reason = 16.0, "Solar surplus (hysteresis)"
         else:
             skip = True
             reason = f"Inactive (no surplus, {temp_in:.1f}°C ≤ {override_c:.1f}°C)"
     else:
         entity = _wiz("hvac_temp_heat", "number_hvac_heat", "")
         if free_power:
-            target, reason = 18.5, "Free solar power (SOC≥99%)"
+            target, reason = 18.5, "Solar surplus (hysteresis)"
         elif temp_in < 16 and daytime:
             target, reason = 17.0, f"Indoor too cold ({temp_in:.1f}°C)"
         else:
@@ -6505,6 +6573,7 @@ def main():
     global _scheduler_ref
     _load_setup_cache()
     _load_wizard_cache()
+    _load_surplus_state()
 
     _check_version_sync()
     log.info("═══════════════════════════════════════")

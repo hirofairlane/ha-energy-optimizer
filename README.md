@@ -579,6 +579,18 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.7 — Heat-pump hydraulic loop as ground-truth signal
+
+After a 24 h audit on Sergio's install we learned that the obvious "did the heat pump run?" signals — `aerotermia_consumo_electrico`, `status01_pumpstate` — are silently broken on his ebusd integration (the first stays `unavailable`, the second sticks at `off` even when the unit is clearly running). The only sensors that always tell the truth are the **two water-loop temperatures**: ida (water leaving the unit) and vuelta (water coming back). When they're equal the unit is idle. When ida is colder than vuelta the unit is cooling. When ida is hotter than vuelta it's heating. No ambiguity, no desync.
+
+- **New wizard roles** `hp_flow_in_temp` and `hp_flow_out_temp` resolve to two existing sensors. Sergio's install maps them to `sensor.aerotermia_exterior_status01_temp1` and `sensor.aerotermia_exterior_status01_temp1_2` respectively.
+- **Per-cycle hydraulic log line.** When both roles are configured, every `run_cycle()` emits:
+  ```
+  [HYDRAULIC] flow_in=13.5°C  flow_out=16.5°C  ΔT=-3.0°C → COOLING
+  ```
+  The verdict is `HEATING` for ΔT > +1 °C, `COOLING` for ΔT < −1 °C, `idle` otherwise. The sign convention (ΔT = ida − vuelta) matches Sergio's existing template sensor `aerotermia_delta_t_calefaccion` so the two read the same direction.
+- **Three new fields in `sensors` and `decisions.json`** (`hp_flow_in_c`, `hp_flow_out_c`, `hp_delta_t_c`) so the Activity tab and any downstream analysis have the ground truth recorded per cycle. Installs without the roles configured fall through silently — no log line, no extra fields.
+
 ### v5.0.6 — Smart-target floor + night-consumption baseline (issue #8)
 
 Two related bugs in the valley-charge planner reported by [@andredp](https://github.com/andredp) on issue #8, both compounding to under-fill the battery for tomorrow's peak on self-consumption installs.

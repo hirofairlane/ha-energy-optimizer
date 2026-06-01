@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.6"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.7"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -617,6 +617,28 @@ def read_sensors() -> dict:
         ts_entity = zone.get("temp_sensor")
         if ts_entity:
             s[f"temp_zone_{i}"] = ha_float(ts_entity)
+
+    # ── Heat-pump hydraulic loop temps. These are the single most reliable
+    #    ground-truth that the unit is actually doing physical work — way more
+    #    trustworthy than the power-consumption sensor or the pump-state flag,
+    #    both of which silently desync on many ebusd integrations.
+    #
+    #    `hp_flow_in_c`  = water leaving the heat pump (ida, towards the
+    #                      hydraulic loop / underfloor circuit).
+    #    `hp_flow_out_c` = water returning to the heat pump (vuelta).
+    #    `hp_delta_t_c`  = ida − vuelta (matches the user's template
+    #                      `sensor.aerotermia_delta_t_calefaccion` convention):
+    #         heating: ΔT > 0  (water leaves hot, returns cooler)
+    #         cooling: ΔT < 0  (water leaves cold, returns warmer)
+    #         idle:    ΔT ≈ 0  (no circulation, both legs converge)
+    hp_in  = _wiz("hp_flow_in_temp",  "sensor_hp_flow_in_temp",  "")
+    hp_out = _wiz("hp_flow_out_temp", "sensor_hp_flow_out_temp", "")
+    if hp_in:
+        s["hp_flow_in_c"]  = ha_float(hp_in)
+    if hp_out:
+        s["hp_flow_out_c"] = ha_float(hp_out)
+    if hp_in and hp_out and s.get("hp_flow_in_c") and s.get("hp_flow_out_c"):
+        s["hp_delta_t_c"] = round(s["hp_flow_in_c"] - s["hp_flow_out_c"], 2)
 
     return s
 
@@ -2098,6 +2120,20 @@ def run_cycle() -> dict:
     sensors    = read_sensors()
     tariff     = current_tariff()
     prediction = predict_soc(sensors)
+
+    # Hydraulic ground truth: log the heat-pump flow temps + ΔT every cycle.
+    # ΔT = ida − vuelta (the user's convention). Heating gives ΔT > 0 (water
+    # leaves hot, returns cooler — gave heat to the loop). Cooling gives
+    # ΔT < 0 (water leaves cold, returns warmer — absorbed heat from the
+    # house). Idle collapses both legs to ~0.
+    if "hp_delta_t_c" in sensors:
+        d = sensors["hp_delta_t_c"]
+        verdict = ("HEATING" if d > 1.0 else
+                   "COOLING" if d < -1.0 else
+                   "idle")
+        log.info(f"  [HYDRAULIC] flow_in={sensors['hp_flow_in_c']:.1f}°C  "
+                 f"flow_out={sensors['hp_flow_out_c']:.1f}°C  "
+                 f"ΔT={d:+.1f}°C → {verdict}")
 
     decision = {"timestamp": datetime.now().isoformat(), "sensors": sensors,
                 "tariff": tariff, "prediction": prediction, "actions": [], "skipped": []}

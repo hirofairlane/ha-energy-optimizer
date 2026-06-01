@@ -579,6 +579,26 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.8 — Summer free-cooling gates + "open the windows" alert
+
+In mountain climates with cool nights (Guadarrama is the reference install), running the heat pump for radiant cooling makes no sense once the outdoor air is colder than indoors. Ventilation does the same job for free. v5.0.7 was still happy to fire the thermal override at 23:00 with 16 °C outside.
+
+Two gates added to `_hp_zone_decision()` / `_hp_legacy_decision()`, both inert if `sensor_temp_outdoor` isn't wired (behaviour matches v5.0.7 in that case):
+
+- **Override gate.** If `t_indoor > hvac_summer_override_c` *but* `t_outdoor ≤ t_indoor − free_cooling_delta_c` (default 2 °C), the heat pump is **not** started. Instead, the addon emits a `[COOLING-GATE]` log line and sends a Telegram alert telling you to open the windows. The alert is rate-limited to one every `notify_open_windows_cooldown_h` hours (default 4).
+- **Surplus gate.** If there's solar surplus *and* `t_outdoor ≤ cooling_outdoor_max_c` (default 22 °C), cooling is also skipped — better to keep the surplus charging the battery than to spend it cooling air that's already cold outside.
+
+New options (all live under `cfg()` with safe defaults):
+
+| key | default | meaning |
+|---|---|---|
+| `cooling_outdoor_max_c` | `22.0` | Skip surplus cooling when outdoor is at or below this temperature |
+| `free_cooling_delta_c`  | `2.0`  | How much colder outdoor must be vs indoor to skip the thermal override |
+| `notify_open_windows_enabled` | `true` | Toggle the Telegram alert |
+| `notify_open_windows_cooldown_h` | `4.0` | Minimum hours between repeat alerts |
+
+State for the alert deduplication persists at `/data/cooling_gate_state.json` so addon rebuilds don't reset the cooldown timer.
+
 ### v5.0.7 — Heat-pump hydraulic loop as ground-truth signal
 
 After a 24 h audit on Sergio's install we learned that the obvious "did the heat pump run?" signals — `aerotermia_consumo_electrico`, `status01_pumpstate` — are silently broken on his ebusd integration (the first stays `unavailable`, the second sticks at `off` even when the unit is clearly running). The only sensors that always tell the truth are the **two water-loop temperatures**: ida (water leaving the unit) and vuelta (water coming back). When they're equal the unit is idle. When ida is colder than vuelta the unit is cooling. When ida is hotter than vuelta it's heating. No ambiguity, no desync.

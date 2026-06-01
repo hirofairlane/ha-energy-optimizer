@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.7"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.8"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -44,6 +44,7 @@ TARIFF_FILE    = DATA_DIR / "tariff.json"
 SETUP_FILE     = DATA_DIR / "setup.json"
 WIZARD_FILE    = DATA_DIR / "wizard_config.json"
 SURPLUS_STATE_FILE = DATA_DIR / "surplus_state.json"
+COOLING_GATE_STATE_FILE = DATA_DIR / "cooling_gate_state.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -1420,12 +1421,55 @@ def _has_surplus_power(soc: float, batt_power_w: float) -> bool:
         return True
     return False
 
+# ── Free-cooling gate state (v5.0.8) ────────────────────────────────────────
+# Holds the last "open the windows" notify timestamp so we don't spam Telegram
+# every 15-min cycle while the conditions persist.
+_cooling_gate_state: dict = {"last_open_windows_notify": None}
+
+def _load_cooling_gate_state():
+    global _cooling_gate_state
+    if COOLING_GATE_STATE_FILE.exists():
+        try:
+            _cooling_gate_state = json.loads(COOLING_GATE_STATE_FILE.read_text())
+        except Exception:
+            pass
+
+def _save_cooling_gate_state():
+    try:
+        COOLING_GATE_STATE_FILE.write_text(json.dumps(_cooling_gate_state))
+    except Exception as e:
+        log.warning(f"  Could not persist cooling_gate_state.json: {e}")
+
+def _maybe_notify_open_windows(temp_in: float, temp_out: float, zone_name: str) -> None:
+    """Send a 'open the windows' Telegram alert, rate-limited to one per
+    `notify_open_windows_cooldown_h` hours (default 4h)."""
+    if not cfg("notify_open_windows_enabled", True):
+        return
+    cooldown_h = float(cfg("notify_open_windows_cooldown_h", 4.0))
+    now = datetime.now()
+    last_iso = _cooling_gate_state.get("last_open_windows_notify")
+    if last_iso:
+        try:
+            last = datetime.fromisoformat(last_iso)
+            if (now - last).total_seconds() < cooldown_h * 3600:
+                return
+        except Exception:
+            pass
+    msg = (f"🌬️ *Free-cooling disponible* — {zone_name}\n"
+           f"Casa a {temp_in:.1f}°C, fuera {temp_out:.1f}°C.\n"
+           f"Abre ventanas — la aerotermia no se enciende.")
+    send_telegram_alert(msg)
+    _cooling_gate_state["last_open_windows_notify"] = now.isoformat()
+    _save_cooling_gate_state()
+
 def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
     soc        = sensors["battery_soc"]
     batt_power = sensors["battery_power"]
     summer     = _is_summer()
     free_power = _has_surplus_power(soc, batt_power)
     temp_in    = sensors.get(f"temp_zone_{zone_idx}", sensors.get("temp_indoor", 20.0))
+    temp_out_raw = sensors.get("temp_outdoor")
+    temp_out   = float(temp_out_raw) if temp_out_raw is not None else None
     hour       = datetime.now().hour
     sched      = zone.get("sched") or {}
     sched_mode = sched.get(str(hour), sched.get(hour, "comfort"))
@@ -1445,9 +1489,32 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
         # NOT to act unless (a) we have a clear solar surplus, or (b) the
         # house has crossed the configurable thermal override threshold.
         override_c = float(cfg("hvac_summer_override_c", 29.0))
-        if temp_in > override_c:
+        # Free-cooling gates (v5.0.8). When the outdoor air is already cold
+        # enough, opening windows beats spending energy on the heat pump.
+        # If `sensor_temp_outdoor` isn't wired, temp_out is None and these
+        # gates are inert — behaviour matches v5.0.7.
+        cooling_outdoor_max_c = float(cfg("cooling_outdoor_max_c", 22.0))
+        free_cooling_delta_c  = float(cfg("free_cooling_delta_c",  2.0))
+        outdoor_known       = temp_out is not None
+        outdoor_cool_enough = outdoor_known and temp_out <= cooling_outdoor_max_c
+        outdoor_cooler_than_indoor = (
+            outdoor_known and temp_out <= (temp_in - free_cooling_delta_c)
+        )
+        if temp_in > override_c and outdoor_cooler_than_indoor:
+            skip = True
+            reason = (f"Free-cooling override: house {temp_in:.1f}°C, "
+                      f"outdoor {temp_out:.1f}°C → open windows [{zone_name}]")
+            log.info(f"  [COOLING-GATE] {reason}")
+            _maybe_notify_open_windows(temp_in, temp_out, zone_name)
+        elif temp_in > override_c:
             target = max(16.0, t_comfort - 2)
             reason = f"Thermal override ({temp_in:.1f}°C > {override_c:.1f}°C) [{zone_name}]"
+        elif (free_power or sched_mode == "surplus") and outdoor_cool_enough:
+            skip = True
+            reason = (f"Free-cooling surplus: outdoor {temp_out:.1f}°C ≤ "
+                      f"{cooling_outdoor_max_c:.1f}°C, save surplus for battery "
+                      f"[{zone_name}]")
+            log.info(f"  [COOLING-GATE] {reason}")
         elif free_power or sched_mode == "surplus":
             target = max(16.0, t_comfort - 3)
             reason = f"Surplus cooling [{zone_name}]"
@@ -1475,6 +1542,8 @@ def _hp_legacy_decision(sensors: dict) -> dict:
     soc        = sensors["battery_soc"]
     batt_power = sensors["battery_power"]
     temp_in    = sensors.get("temp_indoor", 20.0)
+    temp_out_raw = sensors.get("temp_outdoor")
+    temp_out   = float(temp_out_raw) if temp_out_raw is not None else None
     sun        = get_sun_status()
     daytime    = sun["is_day"]
     free_power = _has_surplus_power(soc, batt_power)
@@ -1485,8 +1554,26 @@ def _hp_legacy_decision(sensors: dict) -> dict:
     if summer:
         entity = _wiz("hvac_temp_cool", "number_hvac_cool", "")
         override_c = float(cfg("hvac_summer_override_c", 29.0))
-        if temp_in > override_c:
+        cooling_outdoor_max_c = float(cfg("cooling_outdoor_max_c", 22.0))
+        free_cooling_delta_c  = float(cfg("free_cooling_delta_c",  2.0))
+        outdoor_known       = temp_out is not None
+        outdoor_cool_enough = outdoor_known and temp_out <= cooling_outdoor_max_c
+        outdoor_cooler_than_indoor = (
+            outdoor_known and temp_out <= (temp_in - free_cooling_delta_c)
+        )
+        if temp_in > override_c and outdoor_cooler_than_indoor:
+            skip = True
+            reason = (f"Free-cooling override: house {temp_in:.1f}°C, "
+                      f"outdoor {temp_out:.1f}°C → open windows")
+            log.info(f"  [COOLING-GATE] {reason}")
+            _maybe_notify_open_windows(temp_in, temp_out, "default")
+        elif temp_in > override_c:
             target, reason = 20.0, f"Thermal override ({temp_in:.1f}°C > {override_c:.1f}°C)"
+        elif free_power and outdoor_cool_enough:
+            skip = True
+            reason = (f"Free-cooling surplus: outdoor {temp_out:.1f}°C ≤ "
+                      f"{cooling_outdoor_max_c:.1f}°C, save surplus for battery")
+            log.info(f"  [COOLING-GATE] {reason}")
         elif free_power:
             target, reason = 16.0, "Solar surplus (hysteresis)"
         else:
@@ -6664,6 +6751,7 @@ def main():
     _load_setup_cache()
     _load_wizard_cache()
     _load_surplus_state()
+    _load_cooling_gate_state()
 
     _check_version_sync()
     log.info("═══════════════════════════════════════")

@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "5.0.7"
+version: "5.0.8"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -103,6 +103,15 @@ options:
   notify_telegram_daily_enabled: true
   notify_telegram_alerts_enabled: true
 
+  # ── Summer free-cooling (v5.0.8) ──────────────────────────────────────────────────────────────────
+  # Skip heat-pump cooling when the outdoor air is already cool enough that
+  # opening windows beats spending energy. All gates are no-ops if
+  # `sensor_temp_outdoor` isn't wired (temp_outdoor unknown → behave like v5.0.7).
+  cooling_outdoor_max_c: 22.0
+  free_cooling_delta_c: 2.0
+  notify_open_windows_enabled: true
+  notify_open_windows_cooldown_h: 4.0
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -151,3 +160,7 @@ schema:
   notify_email_enabled: bool
   notify_telegram_daily_enabled: bool
   notify_telegram_alerts_enabled: bool
+  cooling_outdoor_max_c: float
+  free_cooling_delta_c: float
+  notify_open_windows_enabled: bool
+  notify_open_windows_cooldown_h: float

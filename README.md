@@ -579,6 +579,17 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.6 — Smart-target floor + night-consumption baseline (issue #8)
+
+Two related bugs in the valley-charge planner reported by [@andredp](https://github.com/andredp) on issue #8, both compounding to under-fill the battery for tomorrow's peak on self-consumption installs.
+
+- **Bug A — `max(30, _hmin)` shadows `battery_health_mode`.** The smart-target final clamp, the emergency target and the recovery target all forced a hardcoded `30 %` floor on top of the user's configured health-mode minimum, silently overriding `bill_reducer` (10) and `battery_guard` (25→30, paradoxically *lower* than guard's actual floor on some edges). Three call sites: `calculate_optimal_soc` ([:822](rootfs/usr/bin/energy_optimizer.py)), `decide_battery` emergency floor and `decide_battery` low-target. All three now read directly from `_health_mode_limits()[0]` so the Tweak page selection flows end-to-end. `bill_reducer` users get smart_target down to 10 % when solar is plentiful tomorrow; `battery_guard` users get 25 %.
+- **Bug B — Night consumption baseline ignores battery discharge.** `_refresh_consumption_cache` computed `abs(grid_power)` averaged over 22:00–08:00. On self-consumption installs the battery covers the load and the grid value is near zero — Sergio's cache had been showing `1.1 kW avg night` only because of occasional pre-2026-05-30 nights when the battery had not yet been topped up. Fix: pull `solar_power`, `battery_power` and `grid_power` together, align them on a 15-min grid, and compute `house = solar + batt − grid` (with the addon's `positive=exporting` convention for grid and `positive=discharging` for battery). Falls back to the legacy `abs(grid)` calculation for installs whose wizard does not have solar/battery wired (grid-only setups). The new log line is explicit:
+  ```
+  Consumption cache (house = solar + batt − grid): 0.512 kW avg night (892 samples)
+  ```
+- **Migration.** No setup changes needed for installs that already have solar/battery wired in the wizard. Pure-grid setups keep the old code path with no behavioural change. Users on `bill_reducer` who were quietly being floor-clamped at 30 % will see their smart target dip toward 10 % on sunny-forecast days — that is the requested behaviour.
+
 ### v5.0.5 — Surplus detection with hysteresis (radiant cooling never engaged on real installs)
 
 Direct follow-up to a 48 h audit on Sergio's install. After v5.0.3 enabled radiant cooling under "solar surplus", the engine never once actuated the cooling path across two days in a heatwave (SoC stayed in the 80–95 % band, the cooling setpoint was `skip`-ed every cycle, the aerotermia never started the compressor). Root cause: `free_power = (soc >= 99 and batt_power > 0)` is a knife-edge condition. SoC sits at 99–100 % only a handful of minutes per day around the peak, and with a 15-minute cycle the engine almost always misses the window.

@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.5"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.6"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -678,30 +678,80 @@ def set_battery_self_consumption(min_soc: int | None = None) -> bool:
 _consumption_cache: dict = {"kw": 0.5, "updated": None}
 
 def _refresh_consumption_cache():
+    """Refresh the average-night-house-consumption baseline.
+
+    Pre-#8 this used `abs(grid_power)` only, which is silently wrong for
+    self-consumption installs: when the battery covers the night load the
+    grid measurement collapses to ~0 W and the baseline goes near zero,
+    falsely shrinking the smart-target valley-charge plan. Reported by
+    @andredp.
+
+    The correct quantity is total house consumption:
+
+        house = solar + battery_discharge − grid_export
+              = solar_w + batt_w  (positive = discharging)
+                                  − grid_w (positive = exporting)
+
+    All three series get resampled to a 15-min grid, aligned, filtered to
+    the night window [22:00, 08:00) and averaged over their positive
+    values. Falls back to the legacy `abs(grid)` calculation if solar or
+    battery_power is not wired (grid-only setups).
+    """
     global _consumption_cache
-    entity = cfg("sensor_grid_power", "")
 
-    # Prefer InfluxDB (years of data); fall back to HA recorder
-    rows = []
-    influx_u = cfg("influxdb_url", "").strip()
-    if influx_u:
-        rows, _ = ha_history_influx(entity, days=14)
-    if not rows:
-        rows = ha_history(entity, days=14)
+    grid_entity = _wiz("grid_power",     "sensor_grid_power",    "")
+    solar_entity = _wiz("solar_power",   "sensor_solar_power",   "")
+    batt_entity  = _wiz("battery_power", "sensor_battery_power", "")
 
-    night_watts = []
-    for row in rows:
+    if not grid_entity:
+        log.warning("  Consumption cache: no grid_power entity wired — skip")
+        return
+
+    grid_rows = _load_history_best_effort(grid_entity, 14)
+
+    house_kw = None
+    if solar_entity and batt_entity and grid_rows:
         try:
-            ts  = datetime.fromisoformat(row["last_changed"].replace("Z", "+00:00"))
-            ts_local = ts.astimezone().replace(tzinfo=None)
-            val = float(row["state"])
-            if ts_local.hour >= 22 or ts_local.hour < 8:
-                night_watts.append(abs(val))
-        except (KeyError, ValueError, TypeError):
-            continue
-    kw = (sum(night_watts) / len(night_watts) / 1000) if len(night_watts) >= 20 else 0.5
-    _consumption_cache = {"kw": round(kw, 3), "updated": datetime.now()}
-    log.info(f"  Consumption cache refreshed: {kw:.3f} kW avg night ({len(night_watts)} night samples)")
+            solar_rows = _load_history_best_effort(solar_entity, 14)
+            batt_rows  = _load_history_best_effort(batt_entity,  14)
+            if solar_rows and batt_rows:
+                g = _rows_to_15min_series(grid_rows,  "grid")
+                s = _rows_to_15min_series(solar_rows, "solar")
+                b = _rows_to_15min_series(batt_rows,  "batt")
+                if bool(_WIZARD.get("grid_flip")):
+                    g = -g
+                df = pd.concat([g, s, b], axis=1).dropna()
+                # In UTC; align to local hours via index offset isn't worth the
+                # complexity here — the 22-08 window is a daily band that picks
+                # up the same physical hours regardless of tz drift up to 1 h.
+                df["house"] = df["solar"] + df["batt"] - df["grid"]
+                df["hour"]  = df.index.hour
+                night = df[((df["hour"] >= 22) | (df["hour"] < 8)) & (df["house"] > 0)]
+                if len(night) >= 20:
+                    house_kw = float(night["house"].mean()) / 1000.0
+                    log.info(f"  Consumption cache (house = solar + batt − grid): "
+                             f"{house_kw:.3f} kW avg night ({len(night)} samples)")
+        except Exception as e:
+            log.warning(f"  House-balance baseline failed ({e}); falling back to |grid|")
+
+    if house_kw is None:
+        # Legacy fallback for installs whose wizard does not have solar/battery
+        # wired (pure-grid setups). Preserves prior behaviour exactly.
+        night_watts = []
+        for row in grid_rows:
+            try:
+                ts = datetime.fromisoformat(row["last_changed"].replace("Z", "+00:00"))
+                ts_local = ts.astimezone().replace(tzinfo=None)
+                val = float(row["state"])
+                if ts_local.hour >= 22 or ts_local.hour < 8:
+                    night_watts.append(abs(val))
+            except (KeyError, ValueError, TypeError):
+                continue
+        house_kw = (sum(night_watts) / len(night_watts) / 1000) if len(night_watts) >= 20 else 0.5
+        log.info(f"  Consumption cache (|grid| fallback): {house_kw:.3f} kW avg "
+                 f"night ({len(night_watts)} grid-only samples)")
+
+    _consumption_cache = {"kw": round(house_kw, 3), "updated": datetime.now()}
 
 def _get_avg_night_consumption_kw() -> float:
     now = datetime.now()
@@ -815,11 +865,13 @@ def calculate_optimal_soc(sensors: dict, tariff: dict | None = None) -> dict:
     soc_needed = (battery_needed / battery_kwh) * 100
 
     # +5 % safety buffer, then clamp to the user's health-mode SOC limits.
-    # The floor is whichever is higher between 30 % "safe operation" and the
-    # configured health-mode minimum (e.g. Battery Guard mode raises the floor
-    # to 25 % so this `max(30, ...)` is effectively the safe operation floor).
+    # The floor is the configured health-mode minimum — that is the value the
+    # user explicitly chose on the Tweak page and represents their own risk
+    # boundary. The pre-#8 code added a hardcoded 30 % paternalistic floor on
+    # top, which silently overrode bill_reducer (→10) for any user who wanted
+    # to use the full battery capacity. Reported by @andredp.
     _hmin, _hmax = _health_mode_limits()
-    target = max(max(30, _hmin), min(_hmax, round(soc_needed + 5)))
+    target = max(_hmin, min(_hmax, round(soc_needed + 5)))
 
     return {
         "target_soc":         target,
@@ -1468,11 +1520,13 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
     thr_low   = cfg("battery_low_threshold",       30)
     storm_thr = cfg("battery_storm_threshold",     80)
     hmin, hmax = _health_mode_limits()
-    # Emergency / recovery targets respect the health-mode minimum: a
-    # Battery Guard user (25-85 %) gets charged to at least 25 % on emergency,
-    # not to a hardcoded 30 % that may be below their floor on edge configs.
-    emerg_target = max(30, hmin)
-    low_target   = max(40, hmin + 10)
+    # Emergency / recovery targets are anchored to the health-mode minimum
+    # itself. Up until #8 these were `max(30, hmin)` and `max(40, hmin + 10)`
+    # which silently overrode bill_reducer (hmin=10): the emergency floor was
+    # effectively 30 even though the user explicitly chose 10. Now we honour
+    # the user's pick — bill_reducer emergency target = 10, recovery low = 20.
+    emerg_target = hmin
+    low_target   = hmin + 10
     # Battery "full" threshold for self-consumption hand-off is the user's
     # health-mode ceiling, not a hardcoded 95 %. For Battery Guard (max 85 %)
     # we consider the battery full at 85 % and stop trying to charge further.
@@ -1528,9 +1582,9 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
                     what=f"Emergency grid charge to {emerg_target}% during PEAK tariff",
                     why=f"SOC dropped below emergency threshold ({soc:.0f}% < {thr_emerg}%) — paying peak-tariff grid to prevent reaching 0% is the lesser evil.",
                     inputs=base_inputs + [
-                        {"label": "Emergency target", "value": f"{emerg_target}% (max of 30% or health-mode floor)"},
+                        {"label": "Emergency target", "value": f"{emerg_target}% (health-mode floor)"},
                     ],
-                    formula="if peak and SOC < emergency_threshold → charge to max(30, health_mode_min)",
+                    formula="if peak and SOC < emergency_threshold → charge to health_mode_min",
                     calculation=f"period=peak AND SOC {soc:.0f}% < {thr_emerg}% → charge to {emerg_target}%",
                     alternatives_rejected=[
                         {"option": "no action", "why": "battery would hit 0% and we'd import full peak load from grid"},
@@ -1594,7 +1648,7 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
                         {"label": "Outdoor temp",           "value": f"{optimal['temp_outdoor']:.1f}°C"},
                         {"label": "Battery capacity",       "value": f"{cfg('battery_capacity_kwh', 10.0)} kWh"},
                     ],
-                    formula="target_soc = clamp(max(30, health_min), health_max, ((peak_consumption − solar_during_peak) / capacity × 100) + 5% buffer)",
+                    formula="target_soc = clamp(health_min, health_max, ((peak_consumption − solar_during_peak) / capacity × 100) + 5% buffer)",
                     calculation=f"((({optimal['peak_total_kwh']:.1f} − {optimal['solar_during_peak']:.1f}) / {cfg('battery_capacity_kwh', 10.0)}) × 100) + 5 buffer → clamped to [{hmin},{hmax}] = {target}%",
                     alternatives_rejected=[
                         {"option": f"charge to {hmax}%", "why": "wastes valley grid energy on capacity tomorrow's solar can fill for free"},
@@ -1632,7 +1686,7 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
                     what=f"Emergency grid charge to {emerg_target}% during MID tariff",
                     why=f"SOC critical ({soc:.0f}% < {thr_emerg}%). Even at mid tariff, recovery is worth the cost to avoid hitting 0%.",
                     inputs=base_inputs,
-                    formula="if mid and SOC < emergency_threshold → charge to max(30, health_mode_min)",
+                    formula="if mid and SOC < emergency_threshold → charge to health_mode_min",
                     calculation=f"period=mid AND SOC {soc:.0f}% < {thr_emerg}% → charge to {emerg_target}%",
                     alternatives_rejected=[
                         {"option": "wait for valley", "why": "could take hours; SOC would hit 0% before then"},

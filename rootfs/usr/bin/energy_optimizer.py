@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.8"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.9"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -45,6 +45,7 @@ SETUP_FILE     = DATA_DIR / "setup.json"
 WIZARD_FILE    = DATA_DIR / "wizard_config.json"
 SURPLUS_STATE_FILE = DATA_DIR / "surplus_state.json"
 COOLING_GATE_STATE_FILE = DATA_DIR / "cooling_gate_state.json"
+POOL_MANUAL_STATE_FILE = DATA_DIR / "pool_manual_state.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -1934,6 +1935,90 @@ def run_setup_integrity_check() -> None:
 # ── Pool pump + cleaner logic ────────────────────────────────────────────────
 _scheduler_ref = None  # set in main()
 
+# ── Pool manual-override state (v5.0.9) ──────────────────────────────────────
+# When Sergio flips the pool switch by hand (Lovelace, mobile app, physical
+# button…), the addon used to apagar la depuradora en el siguiente cycle if
+# its automatic decision was OFF. To honour the manual gesture, we lock the
+# pump in ON for `pool_manual_min_runtime_min` minutes (default 50). State
+# persists across rebuilds at /data/pool_manual_state.json.
+_pool_manual_state: dict = {"addon_last_action": None, "manual_on_since": None}
+
+def _load_pool_manual_state():
+    global _pool_manual_state
+    if POOL_MANUAL_STATE_FILE.exists():
+        try:
+            _pool_manual_state = json.loads(POOL_MANUAL_STATE_FILE.read_text())
+        except Exception:
+            pass
+
+def _save_pool_manual_state():
+    try:
+        POOL_MANUAL_STATE_FILE.write_text(json.dumps(_pool_manual_state))
+    except Exception as e:
+        log.warning(f"  Could not persist pool_manual_state.json: {e}")
+
+def _check_pool_manual_override(pool_sw: str) -> dict | None:
+    """If the pool switch was turned on outside the addon, return a manual
+    override decision that keeps it on for `pool_manual_min_runtime_min` from
+    the first cycle where we observed the unexpected ON. Returns None when no
+    override applies (so the caller falls through to `decide_pool`)."""
+    if not pool_sw:
+        return None
+    runtime_min = float(cfg("pool_manual_min_runtime_min", 50.0))
+    actual_on = (ha_str(pool_sw, "").lower() == "on")
+    addon_last = _pool_manual_state.get("addon_last_action")
+    manual_since_iso = _pool_manual_state.get("manual_on_since")
+    now = datetime.now()
+
+    # Fresh manual ON: switch is on but the addon did not turn it on
+    if actual_on and addon_last != "on" and not manual_since_iso:
+        _pool_manual_state["manual_on_since"] = now.isoformat()
+        _save_pool_manual_state()
+        manual_since_iso = _pool_manual_state["manual_on_since"]
+        log.info(f"  [POOL] Manual ON detected → locking pump ON for "
+                 f"{runtime_min:.0f} min")
+
+    # Switch is off (manually or by us) → clear any pending manual lock
+    if not actual_on and manual_since_iso:
+        _pool_manual_state["manual_on_since"] = None
+        _save_pool_manual_state()
+        log.info("  [POOL] Manual lock cleared (switch is off)")
+        return None
+
+    # Inside the manual window → force ON
+    if manual_since_iso:
+        try:
+            manual_since = datetime.fromisoformat(manual_since_iso)
+            elapsed_min = (now - manual_since).total_seconds() / 60.0
+            if elapsed_min < runtime_min:
+                remaining = runtime_min - elapsed_min
+                return {
+                    "action": True,
+                    "reason": (f"Manual override — "
+                               f"{elapsed_min:.0f}/{runtime_min:.0f} min "
+                               f"({remaining:.0f} min remaining)"),
+                    "manual_override": True,
+                }
+            # Window elapsed — release the lock and let decide_pool run
+            _pool_manual_state["manual_on_since"] = None
+            _save_pool_manual_state()
+            log.info(f"  [POOL] Manual lock window elapsed "
+                     f"({runtime_min:.0f} min) — automatic logic resumes")
+        except Exception as e:
+            log.warning(f"  [POOL] Invalid manual_on_since, clearing: {e}")
+            _pool_manual_state["manual_on_since"] = None
+            _save_pool_manual_state()
+    return None
+
+def _record_pool_addon_action(action: str) -> None:
+    """Persist the last on/off action the addon issued for the pool pump so
+    `_check_pool_manual_override` can tell apart its own turn-ons from the
+    user's. Call right after every ha_switch(pool_sw, ...)."""
+    if action not in ("on", "off"):
+        return
+    _pool_manual_state["addon_last_action"] = action
+    _save_pool_manual_state()
+
 def decide_pool(sensors: dict, tariff: dict) -> dict:
     summer  = _is_summer()
     hrs_day = sensors.get("pool_hours_day", 0)
@@ -2301,22 +2386,38 @@ def run_cycle() -> dict:
         log.info(f"  [HEAT PUMP/{hp['season'].upper()}{zone_tag}] {hp['reason']} → {hp['target']}°C")
 
     # 3. Pool pump + cleaner
-    pool     = decide_pool(sensors, tariff)
     pool_sw  = _wiz("pool_switch",  "switch_pool",         "")
     clean_sw = _wiz("pool_cleaner", "switch_pool_cleaner", "")
+    # Manual-override gate: if the user flipped the switch ON outside the
+    # addon, lock it ON for the configured runtime (default 50 min) before
+    # letting decide_pool weigh in again.
+    manual_override = _check_pool_manual_override(pool_sw)
+    pool = manual_override if manual_override else decide_pool(sensors, tariff)
     pool_expl = pool.get("explanation")
     if pool["action"]:
-        # The helper turns on the pool pump and returns the side actions
-        # (limpiafondos on + scheduled auto-off in 15 min) for tracing.
-        cleaner_actions = _start_pool_with_cleaner(pool_sw, clean_sw)
-        decision["actions"].append({"type": "pool", "action": True,
-            "reason": pool["reason"] + " (+ limpiafondos 15 min)", "ok": True,
-            "explanation": pool_expl})
-        # Each cleaner sub-action is its own row in Activity (own type, own ▶).
-        decision["actions"].extend(cleaner_actions)
-        log.info(f"  [POOL] ON — {pool['reason']}")
+        if pool.get("manual_override"):
+            # Don't re-trigger the limpiafondos on a manual ON — the user is
+            # in charge of side-loads when they flipped the pump by hand.
+            ha_switch(pool_sw, True)
+            _record_pool_addon_action("on")
+            decision["actions"].append({"type": "pool", "action": True,
+                "reason": pool["reason"], "ok": True,
+                "explanation": pool_expl})
+            log.info(f"  [POOL] ON (manual) — {pool['reason']}")
+        else:
+            # The helper turns on the pool pump and returns the side actions
+            # (limpiafondos on + scheduled auto-off in 15 min) for tracing.
+            cleaner_actions = _start_pool_with_cleaner(pool_sw, clean_sw)
+            _record_pool_addon_action("on")
+            decision["actions"].append({"type": "pool", "action": True,
+                "reason": pool["reason"] + " (+ limpiafondos 15 min)", "ok": True,
+                "explanation": pool_expl})
+            # Each cleaner sub-action is its own row in Activity (own type, own ▶).
+            decision["actions"].extend(cleaner_actions)
+            log.info(f"  [POOL] ON — {pool['reason']}")
     else:
         ha_switch(pool_sw, False)
+        _record_pool_addon_action("off")
         decision["skipped"].append({"type": "pool", "reason": pool["reason"],
             "explanation": pool_expl})
         log.info(f"  [POOL] OFF — {pool['reason']}")
@@ -6752,6 +6853,7 @@ def main():
     _load_wizard_cache()
     _load_surplus_state()
     _load_cooling_gate_state()
+    _load_pool_manual_state()
 
     _check_version_sync()
     log.info("═══════════════════════════════════════")

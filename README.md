@@ -579,6 +579,19 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.9 — Honour the user's manual pool switch ON (50-min minimum runtime)
+
+Until v5.0.8 the pool-pump decision was strictly automatic: every 15-min cycle ran `decide_pool()` and either kept the pump running or switched it off. If Sergio flipped the pool switch ON by hand (Lovelace, app, physical button), the next cycle would happily switch it off again — there was no notion of "the user did this, leave it alone for a bit".
+
+New behaviour:
+
+- Each cycle compares the actual state of `switch_pool` with the last on/off action the addon issued. If the pump is `on` but the addon's last action wasn't `on`, that's a **manual ON**: the addon stamps `manual_on_since=now` in `/data/pool_manual_state.json` and emits a `[POOL] Manual ON detected` log line.
+- For the next `pool_manual_min_runtime_min` minutes (default 50) the automatic decision is overridden: `decide_pool()` is bypassed and the pump is kept on. The Activity tab logs the override as `Manual override — X/50 min (Y min remaining)`.
+- The user can still cut it short by flipping the switch off — any cycle that observes `switch_pool == off` clears the lock and the automatic logic resumes immediately.
+- The 50-min limpiafondos auto-start is **not** retriggered on manual ON (when the user flips the pump by hand they're presumed to be in charge of side-loads too).
+
+New option: `pool_manual_min_runtime_min` (default `50.0`).
+
 ### v5.0.8 — Summer free-cooling gates + "open the windows" alert
 
 In mountain climates with cool nights (Guadarrama is the reference install), running the heat pump for radiant cooling makes no sense once the outdoor air is colder than indoors. Ventilation does the same job for free. v5.0.7 was still happy to fire the thermal override at 23:00 with 16 °C outside.

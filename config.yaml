@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "5.0.8"
+version: "5.0.9"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -112,6 +112,11 @@ options:
   notify_open_windows_enabled: true
   notify_open_windows_cooldown_h: 4.0
 
+  # ── Pool manual-override (v5.0.9) ─────────────────────────────────────────────────────────────────
+  # When the user flips the pool switch ON by hand, keep it on for at least
+  # this many minutes before letting the automatic logic switch it off again.
+  pool_manual_min_runtime_min: 50.0
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -164,3 +169,4 @@ schema:
   free_cooling_delta_c: float
   notify_open_windows_enabled: bool
   notify_open_windows_cooldown_h: float
+  pool_manual_min_runtime_min: float

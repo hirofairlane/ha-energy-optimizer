@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.9"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.10"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -1935,13 +1935,19 @@ def run_setup_integrity_check() -> None:
 # ── Pool pump + cleaner logic ────────────────────────────────────────────────
 _scheduler_ref = None  # set in main()
 
-# ── Pool manual-override state (v5.0.9) ──────────────────────────────────────
+# ── Pool manual-override state (v5.0.9 / v5.0.10) ───────────────────────────
 # When Sergio flips the pool switch by hand (Lovelace, mobile app, physical
-# button…), the addon used to apagar la depuradora en el siguiente cycle if
-# its automatic decision was OFF. To honour the manual gesture, we lock the
-# pump in ON for `pool_manual_min_runtime_min` minutes (default 50). State
-# persists across rebuilds at /data/pool_manual_state.json.
-_pool_manual_state: dict = {"addon_last_action": None, "manual_on_since": None}
+# button…), the addon runs the pump for exactly `pool_manual_min_runtime_min`
+# minutes (default 50) and then turns it off via a deferred APScheduler job —
+# regardless of what the automatic decision would say in between. State
+# persists across rebuilds at /data/pool_manual_state.json; the job is
+# re-scheduled on startup if the off-time is still in the future.
+_pool_manual_state: dict = {
+    "addon_last_action": None,
+    "manual_on_since":   None,
+    "manual_off_at":     None,
+}
+_POOL_MANUAL_OFF_JOB_ID = "pool_manual_off"
 
 def _load_pool_manual_state():
     global _pool_manual_state
@@ -1950,6 +1956,8 @@ def _load_pool_manual_state():
             _pool_manual_state = json.loads(POOL_MANUAL_STATE_FILE.read_text())
         except Exception:
             pass
+    # Backfill key for installs that ran v5.0.9 and saved a 2-key state.
+    _pool_manual_state.setdefault("manual_off_at", None)
 
 def _save_pool_manual_state():
     try:
@@ -1957,57 +1965,149 @@ def _save_pool_manual_state():
     except Exception as e:
         log.warning(f"  Could not persist pool_manual_state.json: {e}")
 
+def _pool_manual_timer_off() -> None:
+    """Deferred APScheduler task — turn the pool pump off at the end of the
+    manual-ON window. Logs to decisions.json so the Activity tab shows it."""
+    pool_sw = _wiz("pool_switch", "switch_pool", "")
+    if not pool_sw:
+        return
+    log.info("  [POOL] Manual timer reached → switching pump OFF")
+    ok = ha_switch(pool_sw, False)
+    _pool_manual_state["addon_last_action"] = "off"
+    _pool_manual_state["manual_on_since"]   = None
+    _pool_manual_state["manual_off_at"]     = None
+    _save_pool_manual_state()
+    _record_event({
+        "type":   "pool",
+        "action": "off",
+        "switch": pool_sw,
+        "reason": "Manual ON timer elapsed — pump auto-off",
+        "ok":     ok,
+        "explanation": _explain(
+            what=f"Turn off pool pump {pool_sw}",
+            why=("The user flipped the pool switch on by hand; the addon ran "
+                 "the pump for the configured manual runtime and now turns "
+                 "it off as promised."),
+            inputs=[
+                {"label": "Pool switch", "value": pool_sw},
+                {"label": "Trigger",     "value": "APScheduler manual-OFF timer"},
+            ],
+            formula="manual ON detected at T → schedule OFF at T + pool_manual_min_runtime_min",
+        ),
+    }, source="scheduler")
+
+def _schedule_pool_manual_off(when: datetime) -> None:
+    """(Re)schedule the deferred OFF job. Idempotent — replaces any existing
+    job with the same id, so re-flipping the switch resets the timer cleanly."""
+    if not _scheduler_ref:
+        log.warning("  [POOL] Scheduler not ready — cannot schedule manual OFF")
+        return
+    _scheduler_ref.add_job(
+        _pool_manual_timer_off,
+        "date", run_date=when,
+        id=_POOL_MANUAL_OFF_JOB_ID, replace_existing=True,
+        misfire_grace_time=120,
+    )
+
+def _cancel_pool_manual_off() -> None:
+    if not _scheduler_ref:
+        return
+    try:
+        _scheduler_ref.remove_job(_POOL_MANUAL_OFF_JOB_ID)
+    except Exception:
+        pass  # job already fired or never existed — fine
+
+def _reschedule_pool_manual_off_after_restart() -> None:
+    """Called from main() after the scheduler is alive. If a manual-OFF was
+    pending when the addon stopped, restore it. If the deadline has passed
+    while we were down, fire the OFF immediately."""
+    off_at_iso = _pool_manual_state.get("manual_off_at")
+    if not off_at_iso:
+        return
+    try:
+        off_at = datetime.fromisoformat(off_at_iso)
+    except Exception:
+        log.warning(f"  [POOL] Bad manual_off_at on disk ({off_at_iso}) — clearing")
+        _pool_manual_state["manual_off_at"] = None
+        _pool_manual_state["manual_on_since"] = None
+        _save_pool_manual_state()
+        return
+    now = datetime.now()
+    if off_at > now:
+        log.info(f"  [POOL] Restoring manual OFF timer "
+                 f"(fires at {off_at.strftime('%H:%M:%S')})")
+        _schedule_pool_manual_off(off_at)
+    else:
+        log.info(f"  [POOL] Manual OFF was due at {off_at.strftime('%H:%M:%S')} "
+                 f"while addon was down → firing now")
+        _pool_manual_timer_off()
+
 def _check_pool_manual_override(pool_sw: str) -> dict | None:
-    """If the pool switch was turned on outside the addon, return a manual
-    override decision that keeps it on for `pool_manual_min_runtime_min` from
-    the first cycle where we observed the unexpected ON. Returns None when no
-    override applies (so the caller falls through to `decide_pool`)."""
+    """Return a manual-override decision if a manual ON is in progress,
+    otherwise None so `decide_pool` runs as usual. Side effects: on a fresh
+    manual ON, persist `manual_off_at` and schedule the deferred OFF job."""
     if not pool_sw:
         return None
     runtime_min = float(cfg("pool_manual_min_runtime_min", 50.0))
-    actual_on = (ha_str(pool_sw, "").lower() == "on")
-    addon_last = _pool_manual_state.get("addon_last_action")
+    actual_on   = (ha_str(pool_sw, "").lower() == "on")
+    addon_last  = _pool_manual_state.get("addon_last_action")
     manual_since_iso = _pool_manual_state.get("manual_on_since")
     now = datetime.now()
 
-    # Fresh manual ON: switch is on but the addon did not turn it on
+    # 1. Fresh manual ON detected
     if actual_on and addon_last != "on" and not manual_since_iso:
+        off_at = now + timedelta(minutes=runtime_min)
         _pool_manual_state["manual_on_since"] = now.isoformat()
+        _pool_manual_state["manual_off_at"]   = off_at.isoformat()
         _save_pool_manual_state()
+        _schedule_pool_manual_off(off_at)
+        log.info(f"  [POOL] Manual ON detected → auto-OFF at "
+                 f"{off_at.strftime('%H:%M')} ({runtime_min:.0f} min)")
         manual_since_iso = _pool_manual_state["manual_on_since"]
-        log.info(f"  [POOL] Manual ON detected → locking pump ON for "
-                 f"{runtime_min:.0f} min")
 
-    # Switch is off (manually or by us) → clear any pending manual lock
+    # 2. Switch went off (user or addon) → cancel timer + clear lock
     if not actual_on and manual_since_iso:
+        _cancel_pool_manual_off()
         _pool_manual_state["manual_on_since"] = None
+        _pool_manual_state["manual_off_at"]   = None
         _save_pool_manual_state()
-        log.info("  [POOL] Manual lock cleared (switch is off)")
+        log.info("  [POOL] Manual lock cleared (switch off, timer cancelled)")
         return None
 
-    # Inside the manual window → force ON
+    # 3. Inside the manual window → force ON. The deferred APScheduler job
+    #    will turn it off at the exact minute; the cycle just holds the line.
     if manual_since_iso:
+        off_at_iso = _pool_manual_state.get("manual_off_at")
         try:
-            manual_since = datetime.fromisoformat(manual_since_iso)
-            elapsed_min = (now - manual_since).total_seconds() / 60.0
-            if elapsed_min < runtime_min:
-                remaining = runtime_min - elapsed_min
-                return {
-                    "action": True,
-                    "reason": (f"Manual override — "
-                               f"{elapsed_min:.0f}/{runtime_min:.0f} min "
-                               f"({remaining:.0f} min remaining)"),
-                    "manual_override": True,
-                }
-            # Window elapsed — release the lock and let decide_pool run
-            _pool_manual_state["manual_on_since"] = None
-            _save_pool_manual_state()
-            log.info(f"  [POOL] Manual lock window elapsed "
-                     f"({runtime_min:.0f} min) — automatic logic resumes")
-        except Exception as e:
-            log.warning(f"  [POOL] Invalid manual_on_since, clearing: {e}")
-            _pool_manual_state["manual_on_since"] = None
-            _save_pool_manual_state()
+            off_at = datetime.fromisoformat(off_at_iso) if off_at_iso else None
+        except Exception:
+            off_at = None
+        if off_at and now < off_at:
+            try:
+                since = datetime.fromisoformat(manual_since_iso)
+                elapsed = (now - since).total_seconds() / 60.0
+            except Exception:
+                elapsed = 0.0
+            remaining = (off_at - now).total_seconds() / 60.0
+            return {
+                "action": True,
+                "reason": (f"Manual ON — {elapsed:.0f}/{runtime_min:.0f} min "
+                           f"({remaining:.0f} min remaining)"),
+                "manual_override": True,
+            }
+        # Window elapsed but the job didn't run (clock skew, scheduler issue) →
+        # apagar y limpiar aquí mismo para no quedarse atascado en ON.
+        if actual_on:
+            log.warning("  [POOL] Manual window elapsed without timer firing "
+                        "→ forcing OFF now")
+            ha_switch(pool_sw, False)
+            _pool_manual_state["addon_last_action"] = "off"
+        _cancel_pool_manual_off()
+        _pool_manual_state["manual_on_since"] = None
+        _pool_manual_state["manual_off_at"]   = None
+        _save_pool_manual_state()
+        return None
+
     return None
 
 def _record_pool_addon_action(action: str) -> None:
@@ -6885,6 +6985,9 @@ def main():
 
     scheduler = BackgroundScheduler(timezone="Europe/Madrid")
     _scheduler_ref = scheduler
+
+    # If a manual pool OFF was pending when the addon stopped, restore it.
+    _reschedule_pool_manual_off_after_restart()
 
     interval = cfg("decision_interval_minutes", 15)
     scheduler.add_job(run_cycle, "interval", minutes=interval, id="cycle",

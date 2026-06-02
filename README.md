@@ -579,18 +579,18 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
-### v5.0.9 — Honour the user's manual pool switch ON (50-min minimum runtime)
+### v5.0.10 — Manual pool ON: exact 50-min run, then auto-off (fix v5.0.9)
 
-Until v5.0.8 the pool-pump decision was strictly automatic: every 15-min cycle ran `decide_pool()` and either kept the pump running or switched it off. If Sergio flipped the pool switch ON by hand (Lovelace, app, physical button), the next cycle would happily switch it off again — there was no notion of "the user did this, leave it alone for a bit".
+v5.0.9 honored a manual ON for at least 50 min but then handed control back to `decide_pool()`. If there happened to be solar surplus at minute 50, the pump kept running. Sergio's actual intent: **flip on → run for 50 min → turn off, full stop**.
 
-New behaviour:
+- On manual ON detection the addon now schedules a deferred APScheduler job (same pattern as the limpiafondos auto-off) that flips the switch off at the exact second `T + pool_manual_min_runtime_min`. The Activity tab logs it as `Manual ON timer elapsed — pump auto-off`.
+- Persistent state at `/data/pool_manual_state.json` now stores the absolute `manual_off_at` timestamp. On addon restart the job is restored if the deadline is still in the future, or fired immediately if it elapsed while the addon was down.
+- Cycle override during the window still applies (no surprise OFFs from `decide_pool()` while the timer runs), but the cycle no longer owns the cutoff — the APScheduler job does.
+- Flipping the switch off by hand cancels the pending timer cleanly.
 
-- Each cycle compares the actual state of `switch_pool` with the last on/off action the addon issued. If the pump is `on` but the addon's last action wasn't `on`, that's a **manual ON**: the addon stamps `manual_on_since=now` in `/data/pool_manual_state.json` and emits a `[POOL] Manual ON detected` log line.
-- For the next `pool_manual_min_runtime_min` minutes (default 50) the automatic decision is overridden: `decide_pool()` is bypassed and the pump is kept on. The Activity tab logs the override as `Manual override — X/50 min (Y min remaining)`.
-- The user can still cut it short by flipping the switch off — any cycle that observes `switch_pool == off` clears the lock and the automatic logic resumes immediately.
-- The 50-min limpiafondos auto-start is **not** retriggered on manual ON (when the user flips the pump by hand they're presumed to be in charge of side-loads too).
+### v5.0.9 — Honour the user's manual pool switch ON (superseded by v5.0.10)
 
-New option: `pool_manual_min_runtime_min` (default `50.0`).
+Initial implementation that respected a manual ON as a *minimum* runtime. Behaviour subtly wrong when solar surplus or valley tariff coincided with minute 50; replaced by v5.0.10's exact-duration timer.
 
 ### v5.0.8 — Summer free-cooling gates + "open the windows" alert
 

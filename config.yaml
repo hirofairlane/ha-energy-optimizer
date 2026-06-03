@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "5.0.10"
+version: "5.0.11"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -117,6 +117,12 @@ options:
   # this many minutes before letting the automatic logic switch it off again.
   pool_manual_min_runtime_min: 50.0
 
+  # ── HVAC off-reset (v5.0.11) ──────────────────────────────────────────────────────────────────────
+  # When the addon stops asking for cooling, write this value to the cooling
+  # setpoint so the slider doesn't stay at the aggressive value (16 °C) for
+  # hours after surplus ends. 25 °C matches Sergio's Z1CoolingTemp baseline.
+  cooling_off_setpoint_c: 25.0
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -170,3 +176,4 @@ schema:
   notify_open_windows_enabled: bool
   notify_open_windows_cooldown_h: float
   pool_manual_min_runtime_min: float
+  cooling_off_setpoint_c: float

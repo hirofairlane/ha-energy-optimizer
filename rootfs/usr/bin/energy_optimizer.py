@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.10"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.11"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -46,6 +46,7 @@ WIZARD_FILE    = DATA_DIR / "wizard_config.json"
 SURPLUS_STATE_FILE = DATA_DIR / "surplus_state.json"
 COOLING_GATE_STATE_FILE = DATA_DIR / "cooling_gate_state.json"
 POOL_MANUAL_STATE_FILE = DATA_DIR / "pool_manual_state.json"
+HVAC_DECISION_STATE_FILE = DATA_DIR / "hvac_decision_state.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -2110,6 +2111,29 @@ def _check_pool_manual_override(pool_sw: str) -> dict | None:
 
     return None
 
+# ── HVAC per-zone decision state (v5.0.11) ──────────────────────────────────
+# Tracks whether the addon's last decision for each zone was "active" or
+# "skip", so we can detect the edge `active → skip` and reset the cooling
+# setpoint back to a safe off-value. Without this, the slider sits at the
+# aggressive value the addon wrote during the last surplus cycle (e.g. 16 °C
+# for Z1CoolingTemp) for hours/days, and any out-of-band trigger (manual
+# flip, ebusd internal loop) would run the heat pump way too hard.
+_hvac_decision_state: dict = {}
+
+def _load_hvac_decision_state():
+    global _hvac_decision_state
+    if HVAC_DECISION_STATE_FILE.exists():
+        try:
+            _hvac_decision_state = json.loads(HVAC_DECISION_STATE_FILE.read_text())
+        except Exception:
+            pass
+
+def _save_hvac_decision_state():
+    try:
+        HVAC_DECISION_STATE_FILE.write_text(json.dumps(_hvac_decision_state))
+    except Exception as e:
+        log.warning(f"  Could not persist hvac_decision_state.json: {e}")
+
 def _record_pool_addon_action(action: str) -> None:
     """Persist the last on/off action the addon issued for the pool pump so
     `_check_pool_manual_override` can tell apart its own turn-ons from the
@@ -2439,20 +2463,97 @@ def run_cycle() -> dict:
     # Now they get separate entries (`heat_pump` and `climate_setpoint`) so the
     # Activity tab traces both with their own ok/explanation.
     hp_zones = decide_heat_pump(sensors)
+    # Dedup: when several zones fall back to the same global slider (because
+    # they don't have their own `temp_cool` entity), we only want one write
+    # per actual entity per cycle. Skipping the duplicates avoids spamming
+    # the bus and triple-logging the same reset.
+    hvac_written_entities: set[str] = set()
     for hp in hp_zones:
         zone_tag = f"/{hp['zone']}" if hp.get("zone", "default") != "default" else ""
         # Conservative summer regime can decide to NOT touch the setpoint at all
         # (e.g. radiant cooling: don't engage overnight without solar surplus).
         # The action is recorded as a no-op with ok=True so the Activity tab
         # makes the inaction visible instead of silent.
+        zone_key = hp.get("zone") or "default"
         if hp.get("skip"):
-            decision["actions"].append({"type": "heat_pump", "entity": hp.get("entity"),
-                "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
-                "value": None, "reason": hp["reason"], "ok": True,
-                "explanation": hp.get("explanation")})
-            log.info(f"  [HP{zone_tag}] skip — {hp['reason']}")
+            # Edge-triggered cooling-OFF write (v5.0.11): when the decision
+            # transitions from active → skip in summer AND the zone writes to
+            # a number entity (not just a climate mirror), bump the slider
+            # back up to a safe "off" value so it doesn't sit at e.g. 16 °C
+            # for hours after the surplus window ends.
+            prev = _hvac_decision_state.get(zone_key, {}).get("last")
+            off_setpoint = float(cfg("cooling_off_setpoint_c", 25.0))
+            reset_reason = None
+            if hp.get("season") == "summer" and hp.get("entity"):
+                if prev == "active":
+                    reset_reason = "active→skip transition"
+                else:
+                    # Defensive bootstrap / recovery: if the slider is still
+                    # parked at an aggressive cooling value (lower than the
+                    # off-setpoint by more than 1 °C), bring it up. Covers
+                    # first cycle after a fresh deploy when the state file is
+                    # empty but a previous version left a low setpoint.
+                    current = ha_float(hp["entity"])
+                    if current and current < off_setpoint - 1:
+                        reset_reason = (f"slider parked at {current:.1f}°C "
+                                        f"during skip — bootstrap reset")
+            if reset_reason and hp["entity"] in hvac_written_entities:
+                # Another zone in this cycle already reset this slider; skip
+                # the duplicate write (the value is the same anyway).
+                reset_reason = None
+            if reset_reason:
+                ok_reset = ha_set_number(hp["entity"], off_setpoint)
+                hvac_written_entities.add(hp["entity"])
+                log.info(f"  [HP{zone_tag}] {reset_reason} → reset "
+                         f"{hp['entity']} to {off_setpoint:.1f}°C")
+                decision["actions"].append({
+                    "type": "heat_pump_off_reset", "entity": hp["entity"],
+                    "zone": hp.get("zone"), "value": off_setpoint,
+                    "reason": (f"{reset_reason} — setpoint reset to "
+                               f"{off_setpoint:.1f}°C"),
+                    "ok": ok_reset,
+                    "explanation": _explain(
+                        what=f"Reset cooling setpoint on {hp['entity']} to {off_setpoint}°C",
+                        why=("Without this reset the slider would stay at the "
+                             "aggressive value (e.g. 16 °C) the addon wrote "
+                             "during the last surplus cycle. The addon is no "
+                             "longer asking for cooling, so the slider must "
+                             "match — otherwise any out-of-band trigger "
+                             "(manual flip, ebusd internal loop) would run "
+                             "the heat pump too hard."),
+                        inputs=[
+                            {"label": "Entity",       "value": hp["entity"]},
+                            {"label": "Off setpoint", "value": f"{off_setpoint:.1f}°C"},
+                            {"label": "Prev state",   "value": prev or "unknown"},
+                        ],
+                        formula=("if prev decision was active AND now skip "
+                                 "AND summer → write cooling_off_setpoint_c"),
+                    ),
+                })
+            else:
+                decision["actions"].append({
+                    "type": "heat_pump", "entity": hp.get("entity"),
+                    "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
+                    "value": None, "reason": hp["reason"], "ok": True,
+                    "explanation": hp.get("explanation")})
+                log.info(f"  [HP{zone_tag}] skip — {hp['reason']}")
+            _hvac_decision_state[zone_key] = {
+                "last": "skip", "ts": datetime.now().isoformat()}
+            _save_hvac_decision_state()
             continue
-        ok = ha_set_number(hp["entity"], hp["target"]) if hp["entity"] else False
+        # Active branch — record state and proceed with the existing write.
+        _hvac_decision_state[zone_key] = {
+            "last": "active", "ts": datetime.now().isoformat()}
+        _save_hvac_decision_state()
+        if hp["entity"] and hp["entity"] in hvac_written_entities:
+            # Same slider already written by another zone this cycle (last
+            # value wins). Skip the redundant write — historically the addon
+            # repeated the write 3× when zones shared a global fallback.
+            ok = True
+        else:
+            ok = ha_set_number(hp["entity"], hp["target"]) if hp["entity"] else False
+            if hp["entity"] and ok:
+                hvac_written_entities.add(hp["entity"])
         decision["actions"].append({"type": "heat_pump", "entity": hp["entity"],
             "zone": hp.get("zone"), "sched_mode": hp.get("sched_mode"),
             "value": hp["target"], "reason": hp["reason"], "ok": ok,
@@ -6954,6 +7055,7 @@ def main():
     _load_surplus_state()
     _load_cooling_gate_state()
     _load_pool_manual_state()
+    _load_hvac_decision_state()
 
     _check_version_sync()
     log.info("═══════════════════════════════════════")

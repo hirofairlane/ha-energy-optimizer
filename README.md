@@ -579,6 +579,22 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.11 — Reset cooling setpoint when surplus ends
+
+When the addon decided "Surplus cooling" during the solar peak it wrote an aggressive value to the heat-pump cooling setpoint (e.g. `Z1CoolingTemp = 16 °C` on Sergio's install — the floor of the slider's range). When the surplus window closed, the decision flipped to `Inactive (no surplus)` and the slider was left untouched. It stayed at 16 °C for hours and overnight, even though the addon was no longer asking for cooling. A manual flip of the heat pump or any ebusd internal loop would then ramp the unit hard against an inappropriate target.
+
+Now the addon detects the edge `active → skip` (per zone) and writes the configured `cooling_off_setpoint_c` (default `25.0` — matches the Z1CoolingTemp value from Sergio's 2026-05-07 baseline) to the slider. The transition is logged as:
+
+```
+[HP/aerotermia_principal] active→skip transition → reset number.ebusd_ctls2_z1coolingtemp_tempv to 25.0°C
+```
+
+Steady-state cycles do NOT keep writing — manual edits made by the user on the slider while the addon is in `skip` are respected until the next surplus arrives.
+
+State persists at `/data/hvac_decision_state.json` so the addon doesn't lose the "did I just stop cooling?" knowledge through restarts.
+
+New option: `cooling_off_setpoint_c` (default `25.0`).
+
 ### v5.0.10 — Manual pool ON: exact 50-min run, then auto-off (fix v5.0.9)
 
 v5.0.9 honored a manual ON for at least 50 min but then handed control back to `decide_pool()`. If there happened to be solar surplus at minute 50, the pump kept running. Sergio's actual intent: **flip on → run for 50 min → turn off, full stop**.

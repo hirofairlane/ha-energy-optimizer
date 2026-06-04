@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.11"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.12"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -47,6 +47,7 @@ SURPLUS_STATE_FILE = DATA_DIR / "surplus_state.json"
 COOLING_GATE_STATE_FILE = DATA_DIR / "cooling_gate_state.json"
 POOL_MANUAL_STATE_FILE = DATA_DIR / "pool_manual_state.json"
 HVAC_DECISION_STATE_FILE = DATA_DIR / "hvac_decision_state.json"
+LOG_SUMMARY_STATE_FILE = DATA_DIR / "log_summary_state.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -2134,6 +2135,106 @@ def _save_hvac_decision_state():
     except Exception as e:
         log.warning(f"  Could not persist hvac_decision_state.json: {e}")
 
+# ── Quiet log mode (v5.0.12) ─────────────────────────────────────────────────
+# When `log_quiet_mode` is on, suppress the routine per-category INFO lines
+# inside run_cycle and replace them with a structured end-of-cycle summary:
+#  - `[Δ <cat>] ...` only for categories whose verdict changed vs last cycle.
+#  - `[HB] BAT=... HP=... POOL=... DW=...` once per hour as heartbeat.
+# WARNING/ERROR always pass through. State persists in /data/log_summary_state.json.
+_log_summary_state: dict = {"last_summary": {}, "last_heartbeat": None}
+
+def _load_log_summary_state():
+    global _log_summary_state
+    if LOG_SUMMARY_STATE_FILE.exists():
+        try:
+            _log_summary_state = json.loads(LOG_SUMMARY_STATE_FILE.read_text())
+        except Exception:
+            pass
+
+def _save_log_summary_state():
+    try:
+        LOG_SUMMARY_STATE_FILE.write_text(json.dumps(_log_summary_state))
+    except Exception as e:
+        log.warning(f"  Could not persist log_summary_state.json: {e}")
+
+class _QuietCycleFilter(logging.Filter):
+    """Suppress noisy INFO lines emitted during run_cycle when quiet mode is
+    enabled. Whitelist:
+       - any record at WARNING or above
+       - the cycle banner
+       - explicit summary lines emitted by _emit_cycle_summary (prefix `[Δ`
+         or `[HB`)
+    """
+    def __init__(self):
+        super().__init__()
+        self.enabled = False
+
+    def filter(self, record):
+        if not self.enabled:
+            return True
+        if record.levelno >= logging.WARNING:
+            return True
+        msg = record.getMessage()
+        if "Decision cycle" in msg:
+            return True
+        stripped = msg.lstrip()
+        if stripped.startswith("[Δ") or stripped.startswith("[HB"):
+            return True
+        return False
+
+_QUIET_FILTER = _QuietCycleFilter()
+
+def _verdict_for(item: dict) -> str:
+    """Reduce an action/skip dict to a stable verdict for diffing — keep the
+    first few words of the reason, dropping the trailing numbers/temps that
+    flicker cycle-to-cycle."""
+    reason = (item.get("reason") or "").strip()
+    # Trim at the first opening parenthesis (where the numbers usually live).
+    cut = reason.find(" (")
+    bucket = reason[:cut] if cut > 0 else reason
+    # Cap aggressively
+    return bucket[:60]
+
+def _emit_cycle_summary(decision: dict) -> None:
+    """End of run_cycle in quiet mode: log only what changed vs last cycle,
+    plus an hourly heartbeat with the current verdicts. No-op in verbose mode."""
+    if not cfg("log_quiet_mode", False):
+        return
+    # Compute current summary keyed by 'type:zone'
+    summary: dict = {}
+    item_lookup: dict = {}
+    for items in decision.get("actions", []) + decision.get("skipped", []):
+        t = items.get("type", "") or ""
+        zone = items.get("zone") or ""
+        key = f"{t}:{zone}" if zone else t
+        summary[key] = _verdict_for(items)
+        item_lookup[key] = (items.get("reason") or "")[:140]
+    # Compare with last
+    last = _log_summary_state.get("last_summary", {}) or {}
+    changes = [(k, last.get(k), v) for k, v in summary.items() if last.get(k) != v]
+    for k, was, now_v in changes:
+        # Use the rich reason on the new state, mark the transition
+        was_short = (was or "(new)")[:40]
+        log.info(f"  [Δ {k}] {was_short} → {item_lookup.get(k, now_v)}")
+    # Heartbeat
+    now = datetime.now()
+    last_hb_iso = _log_summary_state.get("last_heartbeat")
+    need_hb = True
+    if last_hb_iso:
+        try:
+            last_hb = datetime.fromisoformat(last_hb_iso)
+            need_hb = (now - last_hb).total_seconds() >= 3600
+        except Exception:
+            pass
+    if need_hb or (changes and not last_hb_iso):
+        compact = " | ".join(
+            f"{k}={summary[k]}" for k in sorted(summary.keys())
+        )
+        log.info(f"  [HB] {compact[:240]}")
+        _log_summary_state["last_heartbeat"] = now.isoformat()
+    _log_summary_state["last_summary"] = summary
+    _save_log_summary_state()
+
 def _record_pool_addon_action(action: str) -> None:
     """Persist the last on/off action the addon issued for the pool pump so
     `_check_pool_manual_override` can tell apart its own turn-ons from the
@@ -2412,6 +2513,16 @@ def _update_savings(sensors: dict, tariff: dict):
 
 # ── Decision cycle ───────────────────────────────────────────────────────────
 def run_cycle() -> dict:
+    quiet = cfg("log_quiet_mode", False)
+    if quiet:
+        _QUIET_FILTER.enabled = True
+    try:
+        return _run_cycle_inner()
+    finally:
+        if quiet:
+            _QUIET_FILTER.enabled = False
+
+def _run_cycle_inner() -> dict:
     log.info("━━━ Decision cycle ━━━━━━━━━━━━━━━━━━━━━━")
     sensors    = read_sensors()
     tariff     = current_tariff()
@@ -2681,6 +2792,9 @@ def run_cycle() -> dict:
 
     _update_savings(sensors, tariff)
     _save_decision(decision)
+    # Quiet-mode summary: a couple of compact INFO lines at the very end,
+    # AFTER all the per-category logs have been suppressed by _QUIET_FILTER.
+    _emit_cycle_summary(decision)
     return decision
 
 def _save_decision(d: dict):
@@ -7056,6 +7170,13 @@ def main():
     _load_cooling_gate_state()
     _load_pool_manual_state()
     _load_hvac_decision_state()
+    _load_log_summary_state()
+    # Attach the quiet-mode filter to the energy-optimizer logger AND to the
+    # root logger so it intercepts any nested logger that propagates up
+    # (Flask, APScheduler, libraries). The filter is a no-op until run_cycle
+    # turns `enabled` on for the duration of the cycle.
+    log.addFilter(_QUIET_FILTER)
+    logging.getLogger().addFilter(_QUIET_FILTER)
 
     _check_version_sync()
     log.info("═══════════════════════════════════════")

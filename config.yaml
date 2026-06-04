@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "5.0.11"
+version: "5.0.12"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -123,6 +123,13 @@ options:
   # hours after surplus ends. 25 °C matches Sergio's Z1CoolingTemp baseline.
   cooling_off_setpoint_c: 25.0
 
+  # ── Quiet log mode (v5.0.12) ──────────────────────────────────────────────────────────────────────
+  # When true, suppress the routine per-category INFO lines inside each cycle
+  # and replace them with: (a) `[Δ <cat>]` only when a verdict changed vs the
+  # previous cycle, (b) `[HB]` once an hour as a heartbeat. WARNING/ERROR
+  # always pass through. Activity tab JSON is NOT filtered — only the log.
+  log_quiet_mode: false
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -177,3 +184,4 @@ schema:
   notify_open_windows_cooldown_h: float
   pool_manual_min_runtime_min: float
   cooling_off_setpoint_c: float
+  log_quiet_mode: bool

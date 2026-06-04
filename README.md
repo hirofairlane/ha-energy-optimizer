@@ -579,6 +579,21 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.12 — Quiet log mode: changes-only + hourly heartbeat
+
+Each 15-min cycle was emitting ~15-20 INFO lines, almost all of them identical to the previous cycle. Useful when debugging a regression, useless to keep an eye on day-to-day operation. New `log_quiet_mode` option (default `false`):
+
+- When enabled, a `_QuietCycleFilter` Python logging filter intercepts every INFO record that fires inside `run_cycle()` and drops it unless it's the cycle banner or the new structured summary lines.
+- At the end of the cycle, `_emit_cycle_summary()` compares the current verdict per category against the one persisted in `/data/log_summary_state.json` and emits one INFO line per category that changed:
+  ```
+  [Δ battery] Mid — opportunistic top-up to smart target → Valley, at optimal level
+  [Δ heat_pump:aerotermia_principal] Surplus cooling → Inactive (no surplus)
+  ```
+- Once per hour an `[HB]` heartbeat compacts all current verdicts into a single line — confirms the addon is alive even when nothing has changed.
+- WARNING/ERROR records bypass the filter unconditionally. The Activity tab JSON (`decisions.json`) is **not** filtered — full history is preserved for analysis.
+
+To opt in: set `log_quiet_mode: true` in addon options.
+
 ### v5.0.11 — Reset cooling setpoint when surplus ends
 
 When the addon decided "Surplus cooling" during the solar peak it wrote an aggressive value to the heat-pump cooling setpoint (e.g. `Z1CoolingTemp = 16 °C` on Sergio's install — the floor of the slider's range). When the surplus window closed, the decision flipped to `Inactive (no surplus)` and the slider was left untouched. It stayed at 16 °C for hours and overnight, even though the addon was no longer asking for cooling. A manual flip of the heat pump or any ebusd internal loop would then ramp the unit hard against an inappropriate target.

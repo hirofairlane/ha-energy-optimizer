@@ -579,6 +579,17 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.13 — Forecast-nocturno cooling gate
+
+If AEMET predicts a cool night ahead (default ≤ 18 °C), don't burn solar surplus on running the heat pump for cooling — the house will free-cool overnight via open windows + radiant-floor inertia. The surplus stays in the battery.
+
+- New wizard role `aemet_night_low` (legacy key `sensor_aemet_night_low`). Maps to a numeric AEMET forecast sensor, typically `sensor.aemet_daily_forecast_temperature_low`.
+- New cycle gate in `_hp_zone_decision()` and `_hp_legacy_decision()`: when surplus is detected and `aemet_night_low ≤ cooling_skip_if_night_low_c` (default 18.0), the cooling action is skipped with reason `Cool night forecast (X.X°C ≤ Y.Y°C): skip cooling, the house will free-cool tonight`. Logged as `[COOLING-GATE]`.
+- No-op when the role isn't mapped (sensor value None / 0 / placeholder).
+- Hierarchy: thermal override > free-cooling-outdoor gate > **night-forecast gate (new)** > surplus cooling > inactive.
+
+New option (with schema): `cooling_skip_if_night_low_c: 18.0`.
+
 ### v5.0.12 — Quiet log mode: changes-only + hourly heartbeat
 
 Each 15-min cycle was emitting ~15-20 INFO lines, almost all of them identical to the previous cycle. Useful when debugging a regression, useless to keep an eye on day-to-day operation. New `log_quiet_mode` option (default `false`):

@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "5.0.12"
+version: "5.0.13"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -130,6 +130,17 @@ options:
   # always pass through. Activity tab JSON is NOT filtered — only the log.
   log_quiet_mode: false
 
+  # ── Forecast-nocturno cooling gate (v5.0.13) ──────────────────────────────────────────────────────
+  # If AEMET's forecasted overnight minimum is at or below this value,
+  # skip surplus-driven cooling — the house will free-cool overnight via
+  # open windows + radiant-floor inertia. Requires `aemet_night_low` role
+  # in the wizard pointing at e.g. `sensor.aemet_daily_forecast_temperature_low`.
+  # No-op if the role isn't mapped (sensor reads as None/0).
+  cooling_skip_if_night_low_c: 18.0
+
+  # Sensor: AEMET daily forecast — overnight minimum temperature
+  sensor_aemet_night_low: ""
+
 schema:
   decision_interval_minutes: int(5,60)
   retrain_cron: str
@@ -185,3 +196,5 @@ schema:
   pool_manual_min_runtime_min: float
   cooling_off_setpoint_c: float
   log_quiet_mode: bool
+  cooling_skip_if_night_low_c: float
+  sensor_aemet_night_low: str

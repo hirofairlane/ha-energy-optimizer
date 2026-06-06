@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.12"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.13"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -595,6 +595,7 @@ def read_sensors() -> dict:
         "solar_today":        ha_float(_wiz("solar_fc_today",     "sensor_solar_today",        "sensor.energy_production_today")),
         "solar_tomorrow":     ha_float(_wiz("solar_fc_tomorrow",  "sensor_solar_tomorrow",     "sensor.energy_production_tomorrow")),
         "temp_outdoor":       ha_float(_wiz("temp_outdoor",       "sensor_temp_outdoor",       "")),
+        "aemet_night_low":    ha_float(_wiz("aemet_night_low",    "sensor_aemet_night_low",    "")),
         "temp_indoor":        ha_float(_wiz("temp_indoor",        "sensor_temp_salon",         "")),
         "pool_hours_day":     ha_float(cfg("sensor_pool_hours_day",  "sensor.depuradora_encendida_24h")),
         "pool_hours_week":    ha_float(cfg("sensor_pool_hours_week", "sensor.depuradora_encendida_semana")),
@@ -1503,6 +1504,15 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
         outdoor_cooler_than_indoor = (
             outdoor_known and temp_out <= (temp_in - free_cooling_delta_c)
         )
+        # Forecast-nocturno gate (v5.0.13). If AEMET predicts a cool night
+        # (default ≤ 18 °C, Guadarrama typical), don't burn surplus on
+        # cooling — the house will free-cool overnight via open windows +
+        # radiant-floor inertia. Inert when sensor not mapped (value None
+        # or 0 / placeholder values dismissed).
+        night_low_raw = sensors.get("aemet_night_low")
+        night_low = float(night_low_raw) if night_low_raw not in (None, 0, 0.0) else None
+        night_low_threshold = float(cfg("cooling_skip_if_night_low_c", 18.0))
+        night_will_be_cool  = night_low is not None and night_low <= night_low_threshold
         if temp_in > override_c and outdoor_cooler_than_indoor:
             skip = True
             reason = (f"Free-cooling override: house {temp_in:.1f}°C, "
@@ -1517,6 +1527,12 @@ def _hp_zone_decision(sensors: dict, zone: dict, zone_idx: int) -> dict:
             reason = (f"Free-cooling surplus: outdoor {temp_out:.1f}°C ≤ "
                       f"{cooling_outdoor_max_c:.1f}°C, save surplus for battery "
                       f"[{zone_name}]")
+            log.info(f"  [COOLING-GATE] {reason}")
+        elif (free_power or sched_mode == "surplus") and night_will_be_cool:
+            skip = True
+            reason = (f"Cool night forecast ({night_low:.1f}°C ≤ "
+                      f"{night_low_threshold:.1f}°C): skip cooling, the house "
+                      f"will free-cool tonight [{zone_name}]")
             log.info(f"  [COOLING-GATE] {reason}")
         elif free_power or sched_mode == "surplus":
             target = max(16.0, t_comfort - 3)
@@ -1564,6 +1580,10 @@ def _hp_legacy_decision(sensors: dict) -> dict:
         outdoor_cooler_than_indoor = (
             outdoor_known and temp_out <= (temp_in - free_cooling_delta_c)
         )
+        night_low_raw = sensors.get("aemet_night_low")
+        night_low = float(night_low_raw) if night_low_raw not in (None, 0, 0.0) else None
+        night_low_threshold = float(cfg("cooling_skip_if_night_low_c", 18.0))
+        night_will_be_cool  = night_low is not None and night_low <= night_low_threshold
         if temp_in > override_c and outdoor_cooler_than_indoor:
             skip = True
             reason = (f"Free-cooling override: house {temp_in:.1f}°C, "
@@ -1576,6 +1596,12 @@ def _hp_legacy_decision(sensors: dict) -> dict:
             skip = True
             reason = (f"Free-cooling surplus: outdoor {temp_out:.1f}°C ≤ "
                       f"{cooling_outdoor_max_c:.1f}°C, save surplus for battery")
+            log.info(f"  [COOLING-GATE] {reason}")
+        elif free_power and night_will_be_cool:
+            skip = True
+            reason = (f"Cool night forecast ({night_low:.1f}°C ≤ "
+                      f"{night_low_threshold:.1f}°C): skip cooling, the house "
+                      f"will free-cool tonight")
             log.info(f"  [COOLING-GATE] {reason}")
         elif free_power:
             target, reason = 16.0, "Solar surplus (hysteresis)"

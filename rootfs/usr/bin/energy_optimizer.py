@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.13"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.14"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -48,6 +48,7 @@ COOLING_GATE_STATE_FILE = DATA_DIR / "cooling_gate_state.json"
 POOL_MANUAL_STATE_FILE = DATA_DIR / "pool_manual_state.json"
 HVAC_DECISION_STATE_FILE = DATA_DIR / "hvac_decision_state.json"
 LOG_SUMMARY_STATE_FILE = DATA_DIR / "log_summary_state.json"
+COMFORT_FEEDBACK_FILE = DATA_DIR / "comfort_feedback.jsonl"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -6761,6 +6762,66 @@ def api_chart_data():
         "averages":      _live_averages_7d(),
         "date":          date_param,
     })
+
+@app.route("/api/comfort_feedback", methods=["POST"])
+def api_comfort_feedback():
+    """Log a subjective comfort feedback entry with full sensor snapshot.
+
+    Body: {"feedback": "frio"|"perfecto"|"calor", "note": "optional"}
+    Appends one JSON line to /data/comfort_feedback.jsonl capturing the
+    current sensor state — basis for later comfort-aware setpoint tuning.
+    """
+    data = request.get_json(silent=True) or {}
+    fb = (data.get("feedback") or "").strip().lower()
+    if fb not in ("frio", "perfecto", "calor"):
+        return jsonify({"ok": False, "error": "feedback must be one of: frio, perfecto, calor"}), 400
+    note = (data.get("note") or "").strip()[:200]
+    try:
+        sensors = read_sensors()
+    except Exception as e:
+        log.warning(f"  comfort_feedback: sensor snapshot failed: {e}")
+        sensors = {}
+    now = datetime.now()
+    entry = {
+        "ts": now.isoformat(),
+        "feedback": fb,
+        "note": note,
+        "t_indoor":  sensors.get("temp_indoor"),
+        "t_outdoor": sensors.get("temp_outdoor"),
+        "t_zone_0":  sensors.get("temp_zone_0"),
+        "t_zone_1":  sensors.get("temp_zone_1"),
+        "t_zone_2":  sensors.get("temp_zone_2"),
+        "hp_delta_t_c":   sensors.get("hp_delta_t_c"),
+        "battery_soc":    sensors.get("battery_soc"),
+        "solar_power":    sensors.get("solar_power"),
+        "hour":           now.hour,
+        "weekday":        now.weekday(),
+    }
+    try:
+        with open(COMFORT_FEEDBACK_FILE, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning(f"  comfort_feedback: write failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    log.info(f"  [COMFORT] {fb} @ t_in={entry.get('t_indoor')} "
+             f"t_out={entry.get('t_outdoor')}"
+             + (f" — {note}" if note else ""))
+    return jsonify({"ok": True, "entry": entry})
+
+@app.route("/api/comfort_feedback", methods=["GET"])
+def api_comfort_feedback_history():
+    """Return the last N comfort feedbacks (default 50)."""
+    n = int(request.args.get("limit", "50"))
+    if not COMFORT_FEEDBACK_FILE.exists():
+        return jsonify({"count": 0, "entries": []})
+    lines = COMFORT_FEEDBACK_FILE.read_text(encoding="utf-8").splitlines()
+    entries = []
+    for line in lines[-n:]:
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            pass
+    return jsonify({"count": len(entries), "entries": entries})
 
 @app.route("/api/run", methods=["POST"])
 def api_run():

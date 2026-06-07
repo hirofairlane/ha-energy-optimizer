@@ -579,6 +579,15 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.14 — Comfort feedback endpoint
+
+Two new endpoints to start collecting subjective comfort data ("¿estoy bien, frío o caliente?") with full sensor snapshot:
+
+- **`POST /api/comfort_feedback`** body `{feedback: "frio"|"perfecto"|"calor", note: "..."}` → appends a JSON line to `/data/comfort_feedback.jsonl` capturing current sensors (t_indoor/t_outdoor/zones, ΔT_hp, SoC, solar, hour, weekday). Logs as `[COMFORT] perfecto @ t_in=21.2 t_out=18.7`.
+- **`GET /api/comfort_feedback?limit=N`** returns the last N entries for review / future calibration.
+
+Designed to be called from a Home Assistant automation tied to an `input_select.confort_subjetivo`, so logging a feedback is one tap on a Lovelace card. With ~30 samples it becomes feasible to calibrate per-hour `temp_comfort` to Sergio's actual perception rather than a global default.
+
 ### v5.0.13 — Forecast-nocturno cooling gate
 
 If AEMET predicts a cool night ahead (default ≤ 18 °C), don't burn solar surplus on running the heat pump for cooling — the house will free-cool overnight via open windows + radiant-floor inertia. The surplus stays in the battery.

@@ -579,6 +579,28 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.15 — Narrative daily summary + Δ verdict numeric collapse
+
+The daily summary (sent at `notify_daily_time` to email + Telegram) used to dump every action of the day as a flat table — 200-500 rows, mostly noise. Useless as a "what did the engine do today" briefing. Rewritten as a concise causal narrative.
+
+New `_summarize_day_narrative(decisions, sensors)` builds one line per relevant decision category, each phrased as **WHAT happened and WHY**:
+
+```
+⚡ Grid charge → 95% from 02:30 to 07:45: Valley — smart target 95%.
+❄️ Cooling active 60 min today (~4 cycles).
+🌬️ Cooling skipped 60 cycles — main reason: Cool night forecast (60×).
+🏊 Pool: 1.4 h runtime today (13:15–15:00) — Solar surplus.
+🌙 Night-forecast gate active: AEMET min 14.0°C (≤ threshold) — surplus saved for the battery.
+```
+
+Both Telegram and email use the same narrative. Email keeps the four KPI tiles (SOC / Solar / Cycles / Savings) on top; the long actions-table is gone.
+
+Drive-by fix on the quiet log mode (v5.0.12): the verdict fingerprint that decides whether to emit `[Δ ...]` lines used to truncate to 60 chars and could split a number in half, so a 0.1 °C drift in `t_outdoor` would dirty-flag the verdict every cycle. Replaced with a regex that collapses every number to `*` before comparing. Symptoms: spurious Δ-spam right after a rebuild stops on this release.
+
+Both changes are pure logging / UX — zero impact on the decision logic itself.
+
+**Drive-by 3**: `ha_set_number`, `ha_set_select` and `ha_switch` now treat an empty `entity_id` as a silent no-op (return `True`) instead of forwarding the call to HA. Previously, when an optional integration entity wasn't present in the wizard (e.g. `battery_backup_soc` on inverters that don't expose a writable backup-SoC register), the service call went to HA with `entity_id=""` and came back as a `400/500` once per cycle — 96 spurious WARNINGs per day. Silently skipping is the right semantics: "no entity → nothing to do, success".
+
 ### v5.0.14 — Comfort feedback endpoint
 
 Two new endpoints to start collecting subjective comfort data ("¿estoy bien, frío o caliente?") with full sensor snapshot:

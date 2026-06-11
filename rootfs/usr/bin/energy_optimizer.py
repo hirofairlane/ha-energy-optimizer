@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.14"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.15"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -206,12 +206,22 @@ def ha_service(domain: str, service: str, data: dict = None) -> bool:
     return ha_post(f"/api/services/{domain}/{service}", data or {})
 
 def ha_set_number(entity_id: str, value: float) -> bool:
+    # Silent no-op when the role isn't configured (empty entity_id). Avoids
+    # 400/500 noise in the log every cycle when an optional integration
+    # entity isn't present (e.g. battery_backup_soc on inverters that don't
+    # expose a writable backup-SoC register).
+    if not entity_id:
+        return True
     return ha_service("number", "set_value", {"entity_id": entity_id, "value": value})
 
 def ha_set_select(entity_id: str, option: str) -> bool:
+    if not entity_id:
+        return True
     return ha_service("select", "select_option", {"entity_id": entity_id, "option": option})
 
 def ha_switch(entity_id: str, turn_on: bool) -> bool:
+    if not entity_id:
+        return True
     return ha_service("switch", "turn_on" if turn_on else "turn_off", {"entity_id": entity_id})
 
 def ha_history(entity_id: str, days: int = 14) -> list:
@@ -2212,15 +2222,16 @@ class _QuietCycleFilter(logging.Filter):
 _QUIET_FILTER = _QuietCycleFilter()
 
 def _verdict_for(item: dict) -> str:
-    """Reduce an action/skip dict to a stable verdict for diffing — keep the
-    first few words of the reason, dropping the trailing numbers/temps that
-    flicker cycle-to-cycle."""
+    """Reduce an action/skip dict to a stable verdict for diffing. v5.0.15:
+    collapse every number (integer or decimal) into `*` so 0.1 °C jitter in
+    outdoor / indoor temps doesn't fire spurious Δ lines. The full reason
+    still appears unmodified in the emitted `[Δ ...]` log so context isn't
+    lost — only the diff fingerprint is normalized."""
+    import re as _re
     reason = (item.get("reason") or "").strip()
-    # Trim at the first opening parenthesis (where the numbers usually live).
-    cut = reason.find(" (")
-    bucket = reason[:cut] if cut > 0 else reason
-    # Cap aggressively
-    return bucket[:60]
+    # Replace numbers (including signed and decimal) with a placeholder.
+    bucket = _re.sub(r"-?\d+(?:\.\d+)?", "*", reason)
+    return bucket[:120]
 
 def _emit_cycle_summary(decision: dict) -> None:
     """End of run_cycle in quiet mode: log only what changed vs last cycle,
@@ -2863,6 +2874,134 @@ def _record_event(action: dict, source: str = "event"):
     _save_decision(event)
 
 # ── Daily summary notification ───────────────────────────────────────────────
+def _summarize_day_narrative(decisions: list, sensors_now: dict) -> list[str]:
+    """Return a concise, causal English summary of the day's relevant decisions.
+
+    One line per category, each saying WHAT happened and WHY. Examples:
+      - "Grid charge → 95% in valley 02:30-08:00 (peak gap 11.7 kWh > solar forecast 5.7 kWh)."
+      - "No grid charge: peak gap (4.1 kWh) covered by solar forecast (12.4 kWh)."
+      - "Cooling skipped all day: cool night forecast 14°C (≤18°C) — free-cooling handles it."
+      - "Pool: 1.2 h runtime (target 1.0 h) — solar surplus 13:15-15:00."
+    """
+    lines: list[str] = []
+    if not decisions:
+        return ["No decisions logged today."]
+
+    # ── Battery: detect charge windows + reason ─────────────────────────────
+    charge_actions = []
+    no_charge_skips = []
+    for d in decisions:
+        ts = d.get("timestamp", "")[:16].replace("T", " ")
+        for a in d.get("actions", []):
+            if a.get("type") == "battery" and a.get("action") == "charge":
+                charge_actions.append((ts, a.get("target_soc"), a.get("reason", "")))
+        for s in d.get("skipped", []):
+            if s.get("type") == "battery":
+                no_charge_skips.append((ts, s.get("reason", "")))
+    if charge_actions:
+        # Compress consecutive same-target charges into one window
+        windows: list[tuple] = []
+        cur_start, cur_target, cur_reason = charge_actions[0]
+        cur_end = cur_start
+        for ts, tgt, reason in charge_actions[1:]:
+            if tgt == cur_target:
+                cur_end = ts
+            else:
+                windows.append((cur_start, cur_end, cur_target, cur_reason))
+                cur_start, cur_target, cur_reason = ts, tgt, reason
+                cur_end = ts
+        windows.append((cur_start, cur_end, cur_target, cur_reason))
+        for start, end, target, reason in windows:
+            t_from = start[-5:]
+            t_to = end[-5:] if end != start else "+"
+            # Strip the "(gap X kWh)" detail if present in reason
+            short = reason.split(" (gap ")[0].split(" — ")[0]
+            lines.append(f"⚡ Grid charge → {target}% from {t_from} to {t_to}: {short}.")
+    elif no_charge_skips:
+        # Use the most recent skip reason (most representative)
+        last_reason = no_charge_skips[-1][1]
+        # Sample optimal stats from last decision for context
+        last_opt = decisions[-1].get("optimal", {})
+        peak_gap = last_opt.get("peak_total_kwh", 0) - last_opt.get("solar_during_peak", 0)
+        if last_opt.get("solar_during_peak"):
+            lines.append(
+                f"✓ No grid charge: peak gap {peak_gap:.1f} kWh covered by "
+                f"solar forecast {last_opt['solar_during_peak']:.1f} kWh.")
+        else:
+            lines.append(f"✓ No grid charge today: {last_reason[:80]}.")
+
+    # ── HVAC cooling: active vs skipped + dominant reason ───────────────────
+    cool_active = 0
+    cool_skip_buckets: dict = {}
+    for d in decisions:
+        for a in d.get("actions", []):
+            if a.get("type") == "heat_pump":
+                r = a.get("reason", "") or ""
+                if "Surplus cooling" in r or "Manual override" in r or "Thermal override" in r:
+                    cool_active += 1
+                elif a.get("zone") == "aerotermia_principal":
+                    # Bucket the skip reason (one entry per cycle, not per zone)
+                    key = (r.split("[")[0].split(":")[0].strip() or "skip")[:50]
+                    cool_skip_buckets[key] = cool_skip_buckets.get(key, 0) + 1
+    if cool_active or cool_skip_buckets:
+        if cool_active:
+            cool_min = cool_active * 15  # cycles × 15 min
+            lines.append(f"❄️ Cooling active {cool_min} min today (~{cool_active} cycles).")
+        if cool_skip_buckets:
+            # Top skip reason
+            top_reason, top_count = max(cool_skip_buckets.items(), key=lambda kv: kv[1])
+            total_skips = sum(cool_skip_buckets.values())
+            lines.append(
+                f"🌬️ Cooling skipped {total_skips} cycles — main reason: {top_reason} ({top_count}×).")
+
+    # ── Pool: runtime today + reason if any ─────────────────────────────────
+    pool_on_count = 0
+    pool_first_on = None
+    pool_last_on = None
+    pool_reason = ""
+    for d in decisions:
+        ts = d.get("timestamp", "")[:16].replace("T", " ")
+        for a in d.get("actions", []):
+            if a.get("type") == "pool" and a.get("action") is True:
+                pool_on_count += 1
+                pool_first_on = pool_first_on or ts
+                pool_last_on = ts
+                pool_reason = a.get("reason", "") or pool_reason
+    pool_hours_now = sensors_now.get("pool_hours_day", 0) or 0
+    if pool_on_count:
+        first_t = pool_first_on[-5:] if pool_first_on else "?"
+        last_t = pool_last_on[-5:] if pool_last_on else "?"
+        short = pool_reason.split(" (")[0]
+        lines.append(
+            f"🏊 Pool: {pool_hours_now:.1f} h runtime today ({first_t}–{last_t}) — {short}.")
+    elif pool_hours_now > 0.05:
+        lines.append(f"🏊 Pool: {pool_hours_now:.1f} h runtime today (no addon action — manual).")
+
+    # ── Dishwasher: recommendation events ───────────────────────────────────
+    dw_recommend = 0
+    for d in decisions:
+        for s in d.get("skipped", []):
+            if s.get("type") == "dishwasher" and "recommend" in s.get("reason", "").lower():
+                dw_recommend += 1
+    if dw_recommend:
+        lines.append(f"🍽️ Dishwasher: {dw_recommend} valley-window recommendations today.")
+
+    # ── Cooling gate triggers (free-cooling / night-forecast) ───────────────
+    # These already counted under cool_skip_buckets; surface the night-forecast
+    # one explicitly if it dominated, because Sergio likes that signal.
+    night_skips = sum(c for k, c in cool_skip_buckets.items() if "night" in k.lower())
+    if night_skips >= 6:  # at least 1.5 h of skips with that reason
+        # Optional extra colour: AEMET min from latest cycle
+        last_sensors = decisions[-1].get("sensors", {}) if decisions else {}
+        nl = last_sensors.get("aemet_night_low")
+        if nl:
+            lines.append(
+                f"🌙 Night-forecast gate active: AEMET min {nl:.1f}°C "
+                f"(≤ threshold) — surplus saved for the battery.")
+
+    return lines
+
+
 def send_daily_summary():
     """Build daily HTML email + Telegram summary. Both channels independently togglable."""
     today = datetime.now().date().isoformat()
@@ -2879,66 +3018,35 @@ def send_daily_summary():
     savings     = _load_savings()
     sensors_now = read_sensors()
 
-    action_counts: dict = {}
-    action_details: list = []
-    for dec in today_decisions:
-        ts            = dec.get("timestamp", "")[:16].replace("T", " ")
-        tariff_period = dec.get("tariff", {}).get("period", "?")
-        soc           = dec.get("sensors", {}).get("battery_soc", 0)
-        for a in dec.get("actions", []):
-            key = a["type"]
-            action_counts[key] = action_counts.get(key, 0) + 1
-            action_details.append({"time": ts, "type": key, "reason": a.get("reason", ""),
-                                    "ok": a.get("ok", True), "period": tariff_period, "soc": soc})
-
     n_cycles   = len(today_decisions)
     solar_peak = max((d.get("sensors", {}).get("solar_today", 0) for d in today_decisions), default=0)
     eur_saved  = savings.get("total_eur_saved", 0)
     kwh_peak   = savings.get("total_kwh_avoided_peak", 0)
     since      = savings.get("since", today)
 
+    # Narrative summary — concise, causal English lines.
+    narrative = _summarize_day_narrative(today_decisions, sensors_now)
+
     tg_lines = [
         "⚡ *Energy Optimizer — Daily Report*",
         f"📅 {today}", "",
-        f"🔋 Battery SOC now: *{sensors_now['battery_soc']:.0f}%*",
-        f"☀️ Solar production today: *{solar_peak:.1f} kWh*",
-        f"🔄 Decision cycles: *{n_cycles}*", "",
-        "*Actions today:*",
+        f"🔋 SOC: *{sensors_now.get('battery_soc', 0):.0f}%*  ·  "
+        f"☀️ Solar: *{solar_peak:.1f} kWh*  ·  🔄 *{n_cycles}* cycles",
+        "",
+        "*What happened today:*",
     ]
-    if action_details:
-        for atype, count in action_counts.items():
-            tg_lines.append(f"  • {atype}: {count}x")
-        tg_lines.append("")
-        tg_lines.append("*Last 5 actions:*")
-        for a in action_details[-5:]:
-            icon = "✅" if a["ok"] else "❌"
-            tg_lines.append(f"  {icon} `{a['time'][-5:]}` [{a['type']}] {a['reason'][:60]}")
-    else:
-        tg_lines.append("  — No actions taken today")
-    tg_lines += ["", f"💰 Savings (since {since}): *€{eur_saved:.2f}* ({kwh_peak:.1f} kWh at peak avoided)"]
+    for line in narrative:
+        tg_lines.append(f"  {line}")
+    tg_lines += ["", f"💰 Savings since {since}: *€{eur_saved:.2f}* ({kwh_peak:.1f} kWh peak avoided)"]
     telegram_msg = "\n".join(tg_lines)
 
-    rows_html = ""
-    for a in action_details:
-        color   = "#4ade80" if a["ok"] else "#f87171"
-        p_badge = {"peak": "#f87171", "valley": "#4ade80", "mid": "#fbbf24"}.get(a["period"], "#94a3b8")
-        rows_html += (
-            f"<tr>"
-            f"<td style='padding:6px 8px;border-bottom:1px solid #334155;color:#94a3b8'>{a['time'][-8:]}</td>"
-            f"<td style='padding:6px 8px;border-bottom:1px solid #334155'>"
-            f"<span style='background:rgba(56,189,248,.15);color:#38bdf8;padding:2px 7px;"
-            f"border-radius:4px;font-size:12px'>{a['type']}</span></td>"
-            f"<td style='padding:6px 8px;border-bottom:1px solid #334155'>"
-            f"<span style='background:{p_badge}33;color:{p_badge};padding:1px 5px;"
-            f"border-radius:3px;font-size:11px'>{a['period']}</span></td>"
-            f"<td style='padding:6px 8px;border-bottom:1px solid #334155;font-size:12px;"
-            f"color:#e2e8f0'>{a['reason']}</td>"
-            f"<td style='padding:6px 8px;border-bottom:1px solid #334155;"
-            f"color:{color};font-weight:700'>{'✓' if a['ok'] else '✗'}</td>"
-            f"</tr>"
+    # Narrative as bullet list — one causal line per relevant decision category.
+    items_html = ""
+    for line in (narrative or ["No decisions logged today."]):
+        items_html += (
+            f"<li style='padding:8px 0;border-bottom:1px solid #1e293b;"
+            f"color:#e2e8f0;font-size:14px;line-height:1.5'>{line}</li>"
         )
-    if not rows_html:
-        rows_html = "<tr><td colspan='5' style='padding:12px;color:#94a3b8;text-align:center'>No actions today</td></tr>"
 
     ks = "display:inline-block;background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px 20px;margin:6px;text-align:center;min-width:120px"
     html_body = f"""<!DOCTYPE html>
@@ -2956,17 +3064,8 @@ def send_daily_summary():
     <span style="{ks}"><div style="font-size:28px;font-weight:700;color:#4ade80">€{eur_saved:.2f}</div>
       <div style="font-size:11px;color:#94a3b8">Total savings</div></span>
   </div>
-  <h2 style="color:#94a3b8;font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Actions taken today</h2>
-  <table style="width:100%;border-collapse:collapse;font-size:13px">
-    <thead><tr style="background:#1e293b">
-      <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Time</th>
-      <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Type</th>
-      <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Period</th>
-      <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">Reason</th>
-      <th style="padding:8px;text-align:left;color:#94a3b8;font-weight:500">OK</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-  </table>
+  <h2 style="color:#94a3b8;font-size:13px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">What happened today</h2>
+  <ul style="list-style:none;padding:0;margin:0">{items_html}</ul>
   <p style="margin-top:20px;font-size:12px;color:#475569">
     Savings tracked since {since}: {kwh_peak:.1f} kWh covered at peak tariff → €{eur_saved:.2f} saved
   </p>

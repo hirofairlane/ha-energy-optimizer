@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.15"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.16"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -2887,36 +2887,54 @@ def _summarize_day_narrative(decisions: list, sensors_now: dict) -> list[str]:
     if not decisions:
         return ["No decisions logged today."]
 
-    # ── Battery: detect charge windows + reason ─────────────────────────────
-    charge_actions = []
+    # ── Battery: distinguish real charges from floor adjustments ─────────────
+    # The motor's action="charge" gets dispatched for BOTH:
+    #   (a) real grid-charge windows (target_soc > current SoC) — buying kWh
+    #   (b) floor adjustments (target_soc <= current SoC) — just raising the
+    #       cutoff/protection level so the battery stops discharging further.
+    # Lumping them together in the daily summary misleads ("Grid charge → 20%"
+    # when SoC was already 28%). Split into two narratives.
+    charge_events = []  # list of (ts, target, soc_at_time, reason, kind)
     no_charge_skips = []
     for d in decisions:
         ts = d.get("timestamp", "")[:16].replace("T", " ")
+        soc_now = d.get("sensors", {}).get("battery_soc", 0) or 0
         for a in d.get("actions", []):
             if a.get("type") == "battery" and a.get("action") == "charge":
-                charge_actions.append((ts, a.get("target_soc"), a.get("reason", "")))
+                tgt = a.get("target_soc")
+                reason = a.get("reason", "") or ""
+                # +2% slack: target=soc+1 is still effectively "hold", not charge.
+                kind = "charge" if (tgt is not None and tgt > soc_now + 2) else "floor"
+                charge_events.append((ts, tgt, soc_now, reason, kind))
         for s in d.get("skipped", []):
             if s.get("type") == "battery":
                 no_charge_skips.append((ts, s.get("reason", "")))
-    if charge_actions:
-        # Compress consecutive same-target charges into one window
+
+    if charge_events:
+        # Compress consecutive same-(kind, target) events into one window
         windows: list[tuple] = []
-        cur_start, cur_target, cur_reason = charge_actions[0]
+        first = charge_events[0]
+        cur_start, cur_target, _, cur_reason, cur_kind = first
         cur_end = cur_start
-        for ts, tgt, reason in charge_actions[1:]:
-            if tgt == cur_target:
+        for ts, tgt, _soc, reason, kind in charge_events[1:]:
+            if tgt == cur_target and kind == cur_kind:
                 cur_end = ts
             else:
-                windows.append((cur_start, cur_end, cur_target, cur_reason))
-                cur_start, cur_target, cur_reason = ts, tgt, reason
+                windows.append((cur_start, cur_end, cur_target, cur_reason, cur_kind))
+                cur_start, cur_target, cur_reason, cur_kind = ts, tgt, reason, kind
                 cur_end = ts
-        windows.append((cur_start, cur_end, cur_target, cur_reason))
-        for start, end, target, reason in windows:
+        windows.append((cur_start, cur_end, cur_target, cur_reason, cur_kind))
+        for start, end, target, reason, kind in windows:
             t_from = start[-5:]
             t_to = end[-5:] if end != start else "+"
-            # Strip the "(gap X kWh)" detail if present in reason
             short = reason.split(" (gap ")[0].split(" — ")[0]
-            lines.append(f"⚡ Grid charge → {target}% from {t_from} to {t_to}: {short}.")
+            if kind == "charge":
+                lines.append(f"⚡ Grid charge → {target}% from {t_from} to {t_to}: {short}.")
+            else:
+                # Floor adjustment: target ≤ SoC at time. The motor lowered the
+                # cutoff so the battery can discharge down to `target`. No
+                # energy was bought from the grid.
+                lines.append(f"🔓 Battery floor lowered to {target}% at {t_from}: {short}.")
     elif no_charge_skips:
         # Use the most recent skip reason (most representative)
         last_reason = no_charge_skips[-1][1]

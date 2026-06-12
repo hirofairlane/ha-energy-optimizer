@@ -579,6 +579,25 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.16 — Distinguish real charges from floor adjustments in the daily summary
+
+The v5.0.15 narrative tagged every `battery.action == "charge"` event as a "Grid charge → X%", but the motor reuses the same code path for two semantically opposite operations:
+
+- **Real charge**: target_soc > current SoC → battery actually buys kWh from the grid.
+- **Floor adjustment**: target_soc ≤ current SoC → motor is just *lowering* the cutoff/protection level so the battery is allowed to discharge further. No energy is bought.
+
+The 2026-06-11 daily report on Sergio's install showed `⚡ Grid charge → 20% at 08:14` when SoC was already 28 % — confusing, because it implied a grid purchase that never happened.
+
+Now the narrative splits them:
+
+```
+⚡ Grid charge → 95% from 00:14 to 00:44: Valley — smart target 95%.
+🔓 Battery floor lowered to 20% at 08:14: Mid + low SOC (28% < 30%).
+⚡ Grid charge → 50% at 23:59: Mid — opportunistic top-up to smart target 50%.
+```
+
+Threshold is `target_soc > soc_at_time + 2` (the +2 slack avoids treating "target = SoC + 1" as a real charge — that's effectively a hold). Pure summary change; zero impact on what the motor actually does to the battery.
+
 ### v5.0.15 — Narrative daily summary + Δ verdict numeric collapse
 
 The daily summary (sent at `notify_daily_time` to email + Telegram) used to dump every action of the day as a flat table — 200-500 rows, mostly noise. Useless as a "what did the engine do today" briefing. Rewritten as a concise causal narrative.

@@ -579,6 +579,35 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 
 ## Changelog
 
+### v5.0.17 — Solar floor: historical baseline + daylight cross-check
+
+The Sungrow `solar_tomorrow` forecast persistently under-estimates at 03:00. Confirmed on 2026-06-11: forecast `solar_during_peak = 5.4 kWh` while the same week of 2025 averaged **40.5 kWh/day** of total production. Result: the addon decided to charge to 95 % in valley unnecessarily, paying for kWh that the panels easily covered later.
+
+New floor mechanism inside `calculate_optimal_soc()`:
+
+1. **`_solar_historical_baseline(today_date)`** queries InfluxDB for the daily max of `solar_today` across the same ±3 days window in the previous year(s). Mean is the expected daily production for "this week of the year, given this PV setup, including orientation / shading / degradation implicitly".
+2. **`_daylight_hours_today()`** reads `sun.sun` `next_rising` / `next_setting` and computes today's daylight window in hours — purely astronomical, no weather involved.
+3. Combine:
+   - `expected_peak_kwh = baseline_daily × peak_solar_share`
+   - If `daylight_hours > 12` (summer): floor at `0.5 × expected_peak_kwh`
+   - If `9 h ≤ daylight ≤ 12 h`: floor at `0.3 × expected_peak_kwh`
+   - If `daylight < 9 h` (winter): no floor — Sungrow forecast is more realistic on short days
+   - Use `max(forecast, floor)` as the value fed to the smart-target calculation.
+
+Logged per cycle when active:
+
+```
+[SOLAR-FLOOR] historical baseline (same week ±3d, 4 samples): 40.54 kWh/day
+[SOLAR-FLOOR] applied: forecast 5.4 kWh < floor 8.5 kWh
+              (baseline 40.5 kWh/day × share 0.42 × ratio 0.5,
+               daylight 14.7 h)
+```
+
+Both baseline and daylight are cached per day (cheap). Inert when InfluxDB isn't configured or sun.sun is unavailable.
+
+`optimal` dict (visible in `/api/status` and decisions.json) now exposes:
+`solar_floor_applied` (bool), `solar_floor_reason` (str), `solar_baseline_daily` (kWh), `daylight_hours` (h).
+
 ### v5.0.16 — Distinguish real charges from floor adjustments in the daily summary
 
 The v5.0.15 narrative tagged every `battery.action == "charge"` event as a "Grid charge → X%", but the motor reuses the same code path for two semantically opposite operations:

@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.16"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.17"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -828,6 +828,111 @@ def _explain(what: str, why: str,
     }
 
 
+# ── Solar floor: same-week historical baseline + daylight cross-check (v5.0.17) ──
+# The Sungrow `solar_tomorrow` forecast tends to under-estimate at 03:00 and
+# revise up by mid-morning — we measured ~70 % underestimation on 2026-06-11
+# vs same-week 2025 mean. Use last-year same-week daily yield as a floor,
+# gated by today's daylight hours from `sun.sun` to avoid applying the floor
+# on genuinely short winter days where the Sungrow forecast is realistic.
+_solar_baseline_cache: tuple | None = None     # (date_str, baseline_kwh_or_None)
+_daylight_hours_cache: tuple | None = None     # (date_str, hours_or_None)
+
+
+def _solar_historical_baseline(today_date, window_days: int = 3,
+                                years_back_range: tuple = (1, 2)) -> float | None:
+    """Mean of daily max(solar_today) across the same-week window in the
+    previous N year(s). Returns None if InfluxDB has no usable history yet."""
+    global _solar_baseline_cache
+    today_key = today_date.isoformat()
+    if _solar_baseline_cache and _solar_baseline_cache[0] == today_key:
+        return _solar_baseline_cache[1]
+
+    url      = cfg("influxdb_url", "").strip()
+    db       = cfg("influxdb_db",  "homeassistant").strip()
+    user     = cfg("influxdb_user", "").strip()
+    password = cfg("influxdb_password", "")
+    sensor_eid = (cfg("sensor_solar_today", "") or
+                  _wiz("solar_fc_today", "sensor_solar_today", "")).strip()
+    if not (url and sensor_eid):
+        _solar_baseline_cache = (today_key, None)
+        return None
+    entity_short = sensor_eid.split(".")[-1] if "." in sensor_eid else sensor_eid
+
+    daily_samples: list[float] = []
+    for years_back in years_back_range:
+        try:
+            target = today_date.replace(year=today_date.year - years_back)
+        except ValueError:
+            continue  # 29-Feb edge case in a non-leap year — skip
+        from datetime import timedelta as _td
+        start = target - _td(days=window_days)
+        end = target + _td(days=window_days)
+        q = (f"SELECT max(value) FROM /.*/ "
+             f"WHERE \"entity_id\" = '{entity_short}' "
+             f"AND time >= '{start.isoformat()}T00:00:00Z' "
+             f"AND time <= '{end.isoformat()}T23:59:59Z' "
+             f"GROUP BY time(1d) fill(none)")
+        resp, err, _ = _influx_query(url, db, q, user, password)
+        if err or not resp:
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            continue
+        for series in data.get("results", [{}])[0].get("series", []):
+            for _ts, val in series.get("values", []):
+                if val is not None and val > 0.5:
+                    daily_samples.append(float(val))
+
+    if not daily_samples:
+        _solar_baseline_cache = (today_key, None)
+        return None
+    baseline = sum(daily_samples) / len(daily_samples)
+    _solar_baseline_cache = (today_key, baseline)
+    log.info(f"  [SOLAR-FLOOR] historical baseline (same week ±{window_days}d, "
+             f"{len(daily_samples)} samples): {baseline:.2f} kWh/day")
+    return baseline
+
+
+def _daylight_hours_today() -> float | None:
+    """Read `sun.sun` next_rising / next_setting attributes and compute the
+    coming daylight window in hours. None if `sun.sun` is unavailable."""
+    global _daylight_hours_cache
+    today_key = datetime.now().date().isoformat()
+    if _daylight_hours_cache and _daylight_hours_cache[0] == today_key:
+        return _daylight_hours_cache[1]
+    s = ha_state("sun.sun")
+    if not s:
+        return None
+    attrs = s.get("attributes", {}) or {}
+    nr_iso = attrs.get("next_rising")
+    ns_iso = attrs.get("next_setting")
+    if not (nr_iso and ns_iso):
+        return None
+    try:
+        nr = datetime.fromisoformat(nr_iso.replace("Z", "+00:00"))
+        ns = datetime.fromisoformat(ns_iso.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    # HA's `next_rising` / `next_setting` always point to upcoming events:
+    #   · Sun above horizon (daytime): next_setting < next_rising
+    #     → night_len = next_rising − next_setting,  daylight = 24h − night_len
+    #   · Sun below horizon (night):  next_rising < next_setting
+    #     → daylight = next_setting − next_rising (this is "today/tomorrow's
+    #       remaining daylight" depending on whether we're pre- or post-midnight,
+    #       but length-wise it's the same astronomical figure)
+    from datetime import timedelta as _td
+    if ns < nr:
+        # Daytime — measure night length, subtract from 24h
+        night_len = (nr - ns).total_seconds() / 3600.0
+        hours = 24.0 - night_len
+    else:
+        # Night — direct
+        hours = (ns - nr).total_seconds() / 3600.0
+    _daylight_hours_cache = (today_key, hours)
+    return hours
+
+
 def calculate_optimal_soc(sensors: dict, tariff: dict | None = None) -> dict:
     """Target SOC for valley charging — store cheap electricity to cover tomorrow's peak demand.
 
@@ -870,6 +975,44 @@ def calculate_optimal_soc(sensors: dict, tariff: dict | None = None) -> dict:
     peak_sun_overlap   = sum(1 for h in peak_hours_cfg if h in SUN_WINDOW)
     peak_solar_share   = peak_sun_overlap / len(SUN_WINDOW)
     solar_during_peak  = round(solar_tm * peak_solar_share, 2)
+
+    # ── Solar floor (v5.0.17): historical baseline × daylight cross-check ────
+    # The Sungrow forecast under-estimates at 03:00 (verified on 2026-06-11:
+    # forecast 5.4 kWh during peak vs same-week 2025 mean 40.5 kWh/day → 17 kWh
+    # actually fell in peak window). Apply a floor based on what the system
+    # actually produced this same week last year, gated by today's daylight
+    # hours so we don't over-correct on a genuinely short winter day.
+    solar_floor_applied   = False
+    solar_floor_reason    = ""
+    solar_baseline_daily  = None
+    daylight_hours_today  = None
+    try:
+        from datetime import date as _date
+        solar_baseline_daily = _solar_historical_baseline(_date.today())
+        daylight_hours_today = _daylight_hours_today()
+        if solar_baseline_daily and daylight_hours_today is not None:
+            expected_peak = solar_baseline_daily * peak_solar_share
+            # Floor ratio depends on day length: long days (>12 h) are reliable,
+            # short days (<9 h) we trust the Sungrow forecast more.
+            if daylight_hours_today > 12.0:
+                floor_ratio = 0.5     # generous floor in summer
+            elif daylight_hours_today >= 9.0:
+                floor_ratio = 0.3     # intermediate
+            else:
+                floor_ratio = 0.0     # winter — don't apply floor
+            floor_kwh = expected_peak * floor_ratio
+            if floor_ratio > 0 and solar_during_peak < floor_kwh:
+                orig = solar_during_peak
+                solar_during_peak = round(floor_kwh, 2)
+                solar_floor_applied = True
+                solar_floor_reason = (
+                    f"forecast {orig:.1f} kWh < floor {floor_kwh:.1f} kWh "
+                    f"(baseline {solar_baseline_daily:.1f} kWh/day × share "
+                    f"{peak_solar_share:.2f} × ratio {floor_ratio:.1f}, "
+                    f"daylight {daylight_hours_today:.1f} h)")
+                log.info(f"  [SOLAR-FLOOR] applied: {solar_floor_reason}")
+    except Exception as _e:
+        log.warning(f"  [SOLAR-FLOOR] error, skipping floor: {_e}")
 
     # ── Base consumption (kW) — night avg is the best proxy for base household load ──
     base_kw = _get_avg_night_consumption_kw()
@@ -921,6 +1064,10 @@ def calculate_optimal_soc(sensors: dict, tariff: dict | None = None) -> dict:
         "solar_tomorrow":     solar_tm,
         "solar_tomorrow_raw": solar_tm_raw,
         "solar_correction":   correction,
+        "solar_floor_applied":  solar_floor_applied,
+        "solar_floor_reason":   solar_floor_reason,
+        "solar_baseline_daily": solar_baseline_daily,
+        "daylight_hours":       daylight_hours_today,
         "base_kw":            base_kw,
         "temp_outdoor":       round(temp, 1),
         "temp_adj_kwh":       temp_adj_kwh,

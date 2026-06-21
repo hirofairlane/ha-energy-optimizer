@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install deps
-        run: pip install scikit-learn pandas joblib requests flask apscheduler pymysql pytest pytest-cov ruff
+        run: pip install scikit-learn pandas joblib requests flask apscheduler pymysql pyyaml pytest pytest-cov ruff
       - name: Ruff (code quality)
         run: ruff check .
       - name: Pytest (regression) with coverage

@@ -36,7 +36,11 @@ HOME_LON = -4.00   # Guadarrama, Madrid — °E (fallback)
 _solar_correction_cache: tuple | None = None   # (factor, datetime)
 
 # ── Persistent data paths ────────────────────────────────────────────────────
-DATA_DIR       = Path("/data")
+# In production the add-on persists to /data. ENERGY_OPT_DATA overrides the
+# location so the module can be imported in tests/CI (where /data is not
+# writable) against a temp dir. Behaviour is unchanged in production where the
+# env var is unset.
+DATA_DIR       = Path(os.environ.get("ENERGY_OPT_DATA", "/data"))
 MODEL_FILE     = DATA_DIR / "model.pkl"
 DECISIONS_FILE = DATA_DIR / "decisions.json"
 SAVINGS_FILE   = DATA_DIR / "savings.json"
@@ -49,7 +53,11 @@ POOL_MANUAL_STATE_FILE = DATA_DIR / "pool_manual_state.json"
 HVAC_DECISION_STATE_FILE = DATA_DIR / "hvac_decision_state.json"
 LOG_SUMMARY_STATE_FILE = DATA_DIR / "log_summary_state.json"
 COMFORT_FEEDBACK_FILE = DATA_DIR / "comfort_feedback.jsonl"
-DATA_DIR.mkdir(exist_ok=True)
+# Skip the import-time mkdir under ENERGY_OPT_TESTING so the module can be
+# imported for unit tests without touching the filesystem. main() still relies
+# on DATA_DIR existing in production (the env var is only set by the tests).
+if not os.environ.get("ENERGY_OPT_TESTING"):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(

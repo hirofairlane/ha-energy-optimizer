@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import Mapping
 
 from eo.planner.iterative import Plan
-
 from eo.policy.antiflap import (
     AntiflapConfig,
     AntiflapState,
@@ -30,7 +29,7 @@ from eo.policy.degraded_mode import (
     apply_degraded_mode,
 )
 from eo.policy.peak_prohibition import apply_peak_prohibition
-from eo.policy.types import PolicyOverride, PolicyPipelineResult
+from eo.policy.types import PolicyOverride
 
 
 @dataclass(frozen=True)

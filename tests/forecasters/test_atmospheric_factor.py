@@ -9,19 +9,16 @@ Splits into:
 
 from __future__ import annotations
 
-import math
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pytest
-
 from eo.forecasters.atmospheric_factor import (
-    AtmosphericFactorFeatures,
-    AtmosphericFactorModel,
-    DEFAULT_QUANTILES,
     FEATURE_NAMES,
     WEATHER_CONDITION_CODES,
+    AtmosphericFactorFeatures,
+    AtmosphericFactorModel,
     make_features_for_hour,
     weather_to_int,
 )

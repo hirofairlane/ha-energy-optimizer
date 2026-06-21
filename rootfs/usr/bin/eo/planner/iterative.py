@@ -22,8 +22,7 @@ engine, or any I/O. It takes deterministic inputs and emits a ``PlannerResult``.
 from __future__ import annotations
 
 import hashlib
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Mapping, Sequence
 
@@ -33,7 +32,6 @@ from eo.planner.decision_matrix import (
     decide_load_for_slot,
 )
 from eo.planner.load_quota import LoadQuotaConfig, LoadQuotaState
-
 
 MAX_PLANNER_ITERATIONS: int = 5
 

@@ -26,9 +26,7 @@ from eo.execution.engine import (
     execute_plan,
 )
 from eo.execution.reconciliation import (
-    HoursOnFn,
     IsOnFn,
-    reconcile_load_debt,
     reconcile_world_state,
 )
 from eo.execution.types import ExecutionResult
@@ -211,7 +209,7 @@ def run_v5_cycle(
     """
     # 1. Reconcile world state from HA.
     world = reconcile_world_state(
-        load_entities=[(l.name, l.entity_id) for l in ctx.loads],
+        load_entities=[(ld.name, ld.entity_id) for ld in ctx.loads],
         is_on=ctx.is_on,
         now=ctx.now,
     )
@@ -273,7 +271,7 @@ def run_v5_cycle(
     policy_summary = run_policy_pipeline(
         raw_plan=planner_result.plan,
         inputs=PolicyPipelineInputs(
-            load_watts={l.name: l.nominal_watts for l in ctx.loads},
+            load_watts={ld.name: ld.nominal_watts for ld in ctx.loads},
             available_w=available_w,
             slot_periods=ctx.slot_periods,
             antiflap_state=antiflap_state,
@@ -291,7 +289,7 @@ def run_v5_cycle(
     # 8. Execute slot 0 to the world.
     exec_plan = build_execution_plan(
         policy_plan=policy_summary.final_plan,
-        load_entities={l.name: (l.entity_id, l.domain) for l in ctx.loads},
+        load_entities={ld.name: (ld.entity_id, ld.domain) for ld in ctx.loads},
         loads_currently_on=set(world.loads_on),
         cycle_ts=ctx.now,
     )

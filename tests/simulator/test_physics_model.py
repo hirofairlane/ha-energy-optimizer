@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from eo.simulator.physics_model import (
     BatteryConfig,
     HouseSystemConfig,

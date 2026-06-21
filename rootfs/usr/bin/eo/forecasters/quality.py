@@ -24,11 +24,9 @@ import math
 import os
 import tempfile
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
-
 
 # Sentinel for "no recorded observations yet" so callers can distinguish
 # from a perfectly-zero MAE on a series with one matching observation.

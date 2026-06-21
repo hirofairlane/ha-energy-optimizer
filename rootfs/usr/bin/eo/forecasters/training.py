@@ -15,7 +15,7 @@ The split makes the training step trivially unit-testable and reusable for:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
@@ -30,7 +30,6 @@ from eo.forecasters.house_forecaster import (
     HouseFeatures,
     HouseForecaster,
 )
-
 
 # Below this many samples we refuse to train — a model fitted on < 50 hours
 # of history is just memorising and will mislead the planner.

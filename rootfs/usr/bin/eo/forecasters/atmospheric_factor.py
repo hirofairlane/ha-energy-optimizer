@@ -33,13 +33,12 @@ them to ``fit()`` / ``predict()``.
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 
 import joblib
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
-
 
 # ── Weather condition encoding ──────────────────────────────────────────────
 # Maps Home Assistant weather state strings (and AEMET equivalents) to a small

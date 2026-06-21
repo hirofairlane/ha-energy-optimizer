@@ -86,7 +86,7 @@ class TestBuildPlan:
 # ── execute_plan ───────────────────────────────────────────────────────────
 class TestExecute:
     def test_acks_recorded_per_command(self):
-        from eo.execution.types import ExecutionPlan, CommandRequest
+        from eo.execution.types import CommandRequest, ExecutionPlan
 
         plan = ExecutionPlan(cycle_ts=_utc(), commands=(
             CommandRequest("a", "on", "switch", "turn_on", "switch.a"),
@@ -104,7 +104,7 @@ class TestExecute:
         assert len(result.results) == 2
 
     def test_failed_callback_recorded_as_not_acknowledged(self):
-        from eo.execution.types import ExecutionPlan, CommandRequest
+        from eo.execution.types import CommandRequest, ExecutionPlan
 
         plan = ExecutionPlan(cycle_ts=_utc(), commands=(
             CommandRequest("a", "on", "switch", "turn_on", "switch.a"),
@@ -118,7 +118,7 @@ class TestExecute:
         assert result.results[0].acknowledged is False
 
     def test_exceptions_in_callback_caught(self):
-        from eo.execution.types import ExecutionPlan, CommandRequest
+        from eo.execution.types import CommandRequest, ExecutionPlan
 
         plan = ExecutionPlan(cycle_ts=_utc(), commands=(
             CommandRequest("a", "on", "switch", "turn_on", "switch.a"),
@@ -133,7 +133,7 @@ class TestExecute:
         assert "RuntimeError" in result.results[0].error
 
     def test_loads_now_on_lists_acked_ons(self):
-        from eo.execution.types import ExecutionPlan, CommandRequest
+        from eo.execution.types import CommandRequest, ExecutionPlan
 
         plan = ExecutionPlan(cycle_ts=_utc(), commands=(
             CommandRequest("a", "on", "switch", "turn_on", "switch.a"),

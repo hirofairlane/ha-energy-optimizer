@@ -13,19 +13,17 @@ a reference library (we don't depend on pvlib). The validation strategy:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
-
 from eo.forecasters.clear_sky import (
     BEAM_ATTENUATION,
-    ClearSkyConfig,
-    ClearSkyModel,
     DIFFUSE_FRACTION,
     SOLAR_CONSTANT_W_M2,
+    ClearSkyConfig,
+    ClearSkyModel,
     solar_position,
 )
-
 
 GUADARRAMA_LAT = 40.65
 GUADARRAMA_LON = -4.0

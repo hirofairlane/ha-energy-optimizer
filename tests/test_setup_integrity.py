@@ -6,9 +6,7 @@ dict, run check(), assert on the report.
 
 from __future__ import annotations
 
-import pytest
-
-from eo.checks.setup_integrity import check, IntegrityReport, Conflict
+from eo.checks.setup_integrity import check
 
 
 def _wizard(**overrides) -> dict:

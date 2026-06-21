@@ -24,7 +24,7 @@ has no side effects beyond what the inner models do.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Sequence
 
@@ -35,7 +35,6 @@ from eo.forecasters.atmospheric_factor import (
     AtmosphericFactorModel,
 )
 from eo.forecasters.clear_sky import ClearSkyModel
-
 
 # Type alias: a function the caller supplies that, given a target hour-start
 # timestamp, returns the feature vector to feed to the AtmosphericFactorModel.

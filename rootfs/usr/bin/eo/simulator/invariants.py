@@ -17,8 +17,6 @@ Categories:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 
 class InvariantViolation(AssertionError):
     """Raised in strict mode when an invariant fails."""

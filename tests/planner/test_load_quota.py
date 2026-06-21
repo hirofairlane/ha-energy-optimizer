@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from eo.planner.load_quota import (
     DebtState,
     LoadQuotaConfig,

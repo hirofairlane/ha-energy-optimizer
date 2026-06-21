@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Static validation: YAML well-formed, entrypoint compiles, versions/arches in sync ──
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Python entrypoint compiles
+        run: python -m py_compile rootfs/usr/bin/energy_optimizer.py
+      - name: YAML + version-sync + arch-coverage checks
+        run: python tests/validate_repo.py
+
+  # ── Regression suite + code-quality gate (the "Sonar-lite" loop) ──
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install scikit-learn pandas joblib requests flask apscheduler pymysql pytest pytest-cov ruff
+      - name: Ruff (code quality)
+        run: ruff check .
+      - name: Pytest (regression) with coverage
+        env:
+          ENERGY_OPT_TESTING: "1"
+        run: pytest tests/ -q --cov=eo --cov=energy_optimizer --cov-report=term-missing
+
+  # ── Official Home Assistant add-on config linter (advisory: this 3rd-party
+  #    linter is opinionated and may flag legit local-build configs; it informs
+  #    but does not gate the build). ──
+  addon-lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Home Assistant add-on linter
+        uses: frenck/action-addon-linter@v2
+        with:
+          path: "."
+
+  # ── Full Docker build (native amd64) — validates the Dockerfile end to end,
+  #    including the pip install of scikit-learn/pandas and the rootfs COPY. ──
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build add-on image (amd64)
+        run: |
+          docker build \
+            --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.19 \
+            -t energy-optimizer:ci .

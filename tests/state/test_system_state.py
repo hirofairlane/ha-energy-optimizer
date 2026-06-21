@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-
 from eo.policy.antiflap import AntiflapState
 from eo.state.system_state import (
     BatteryState,

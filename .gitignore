@@ -11,3 +11,8 @@ data/
 __pycache__/
 *.pyc
 *.pyo
+
+# Test / coverage artifacts
+.coverage
+.pytest_cache/
+htmlcov/

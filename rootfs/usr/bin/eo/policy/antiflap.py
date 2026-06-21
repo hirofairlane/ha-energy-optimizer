@@ -19,14 +19,12 @@ planner so the simulated trajectory stays consistent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from eo.planner.decision_matrix import LoadDecision
 from eo.planner.iterative import Plan, PlanCell
-
 from eo.policy.types import PolicyOverride, PolicyPipelineResult
-
 
 LAYER_NAME = "antiflap"
 

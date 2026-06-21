@@ -9,11 +9,9 @@ The forecaster is a pure composition layer, so the tests focus on:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-import numpy as np
 import pytest
-
 from eo.forecasters.atmospheric_factor import (
     AtmosphericFactorModel,
     make_features_for_hour,
@@ -23,7 +21,6 @@ from eo.forecasters.solar_forecaster import (
     HourForecast,
     SolarForecaster,
 )
-
 
 GUADARRAMA_LAT = 40.65
 GUADARRAMA_LON = -4.0

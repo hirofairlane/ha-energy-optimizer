@@ -1,0 +1,12 @@
+# Code-quality gate for the add-on.
+#
+# The runtime code lives under rootfs/usr/bin/ (this is what the Dockerfile
+# COPYs into the image). The root-level energy_optimizer.py is a stale
+# pre-v5 snapshot kept only for diffing; it is NOT shipped, so it is excluded
+# from linting along with docs.
+target-version = "py312"
+line-length = 100
+extend-exclude = ["energy_optimizer.py", "docs"]
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I"]  # pyflakes + import sorting + critical syntax

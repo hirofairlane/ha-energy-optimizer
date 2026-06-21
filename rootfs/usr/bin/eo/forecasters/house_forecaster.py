@@ -30,14 +30,12 @@ model from a previous schema raises rather than silently misalign features.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
 
 import joblib
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
-
 
 HOUSE_FEATURE_NAMES: tuple[str, ...] = (
     "hour",

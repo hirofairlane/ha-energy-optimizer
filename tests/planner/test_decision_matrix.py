@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
 from eo.planner.decision_matrix import (
-    LoadDecision,
     SlotContext,
     decide_load_for_slot,
 )
@@ -13,7 +10,6 @@ from eo.planner.load_quota import (
     DebtState,
     LoadQuotaConfig,
     LoadQuotaState,
-    compute_debt_state,
 )
 
 

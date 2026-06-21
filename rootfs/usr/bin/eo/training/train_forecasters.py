@@ -22,7 +22,6 @@ import json
 import logging
 import sys
 from collections import defaultdict
-from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,7 +30,6 @@ import joblib
 # Force the monolith's import path so we get its _WIZARD / cfg / ha_* helpers
 sys.path.insert(0, "/usr/bin")
 import energy_optimizer as mono  # noqa: E402
-
 from eo.forecasters.atmospheric_factor import (  # noqa: E402
     AtmosphericFactorFeatures,
     make_features_for_hour,
@@ -146,7 +144,6 @@ def backfill(days: int) -> dict[str, dict]:
     t_outdoor, weather.
     """
     wiz = mono._WIZARD or {}
-    sensors = wiz.get("sensors", {})
 
     def fetch(role: str, legacy: str = "", default: str = "") -> list[dict]:
         entity = mono._wiz(role, legacy, default)

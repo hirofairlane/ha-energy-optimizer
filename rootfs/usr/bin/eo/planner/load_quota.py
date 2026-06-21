@@ -29,8 +29,7 @@ Bug fixes (SPEC §1.10):
 from __future__ import annotations
 
 import enum
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Sequence
 
 

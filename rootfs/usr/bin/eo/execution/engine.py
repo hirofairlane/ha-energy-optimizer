@@ -27,7 +27,6 @@ from eo.execution.types import (
 )
 from eo.planner.iterative import Plan
 
-
 # Type alias for the HA dispatch callback. Returns True on a successful
 # service call (status 2xx, no exception). False means the command failed
 # to dispatch — the engine records ``acknowledged=False`` and moves on.

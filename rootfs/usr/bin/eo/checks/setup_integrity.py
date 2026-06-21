@@ -15,9 +15,8 @@ testable in isolation, with no side effects beyond what the caller wires up.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from typing import Iterable
-
 
 # ── Role taxonomy ────────────────────────────────────────────────────────────
 # "actuable" = the engine writes commands to this entity (turn_on, set_value,

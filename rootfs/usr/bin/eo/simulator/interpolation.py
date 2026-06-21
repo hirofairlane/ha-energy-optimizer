@@ -20,7 +20,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Sequence
 
-
 SLOTS_PER_HOUR: int = 4
 SLOT_MINUTES: int = 60 // SLOTS_PER_HOUR  # 15 min
 

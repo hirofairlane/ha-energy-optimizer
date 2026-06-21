@@ -20,14 +20,12 @@ serialised across slots, not fired in parallel.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Mapping
 
 from eo.planner.decision_matrix import LoadDecision
 from eo.planner.iterative import Plan, PlanCell
-
 from eo.policy.types import PolicyOverride, PolicyPipelineResult
-
 
 LAYER_NAME = "capacity_budget"
 

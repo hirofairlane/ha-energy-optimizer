@@ -27,7 +27,6 @@ from typing import Callable, Iterable
 
 from eo.state.system_state import ExecutionWorldState
 
-
 # Type alias for "is this load currently ON?" lookups. The addon wires this
 # to ha_state(entity_id) checks. Returns True / False.
 IsOnFn = Callable[[str], bool]

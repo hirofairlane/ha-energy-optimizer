@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from eo.simulator.invariants import (
     ENERGY_TOLERANCE_KWH,
     InvariantViolation,

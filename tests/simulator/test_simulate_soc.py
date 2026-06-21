@@ -5,14 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from eo.simulator.invariants import InvariantViolation
 from eo.simulator.physics_model import (
     BatteryConfig,
     HouseSystemConfig,
 )
 from eo.simulator.simulate_soc import (
-    SimulationResult,
     SlotInput,
     simulate_soc,
 )

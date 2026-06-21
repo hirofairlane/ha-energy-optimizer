@@ -9,13 +9,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from eo.planner.decision_matrix import SlotContext
 from eo.planner.iterative import (
     MAX_PLANNER_ITERATIONS,
     ForcedState,
     LoadInputs,
-    PlannerResult,
     SlotMeta,
     iterate,
 )

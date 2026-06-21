@@ -32,9 +32,8 @@ Coordinate conventions used throughout:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-
 
 # Solar constant at top of atmosphere (W/m²).
 SOLAR_CONSTANT_W_M2: float = 1367.0
@@ -211,7 +210,6 @@ class ClearSkyModel:
         sin_elev = math.sin(math.radians(sp.elevation_deg))
         dni_h = dni * sin_elev
         dhi = DIFFUSE_FRACTION * dni_h
-        ghi = dni_h + dhi
 
         # Project onto tilted plane (incidence-angle method).
         tilt_rad = math.radians(self.config.effective_tilt_deg())

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from eo.planner.load_quota import DebtState
 
-
 # Debt component (relative priority).
 DEBT_WEIGHT: dict[DebtState, int] = {
     DebtState.OK: 0,

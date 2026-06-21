@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
-
 from eo.planner.load_quota import DebtState
 from eo.scenario.scenario_builder import (
     QuantileHourForecast,
     RiskTolerance,
-    Scenario,
     build_scenario,
     risk_from_debt_state,
 )

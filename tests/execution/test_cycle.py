@@ -11,7 +11,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from eo.execution.cycle import (
     CycleContext,
     CycleResult,
@@ -109,7 +108,7 @@ class TestBehaviour:
             hours_on_per_day_last_window={"boiler": [5.0]},  # over quota
             send_command=lambda *_a, **_kw: commands.append(_a) or True,
         )
-        result = run_v5_cycle(prior_state=None, ctx=ctx)
+        run_v5_cycle(prior_state=None, ctx=ctx)
         assert commands == []
 
     def test_new_state_persistable(self, tmp_path):

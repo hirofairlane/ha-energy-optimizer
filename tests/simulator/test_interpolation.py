@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
-
 from eo.simulator.interpolation import (
     SLOT_MINUTES,
     SLOTS_PER_HOUR,

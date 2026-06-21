@@ -8,12 +8,10 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pytest
-
 from eo.forecasters.house_forecaster import (
     DEFAULT_HOUSE_QUANTILES,
     HOUSE_FEATURE_NAMES,
     HOUSE_KWH_PER_HOUR_CAP,
-    HouseFeatures,
     HouseForecaster,
     make_house_features_for_hour,
 )

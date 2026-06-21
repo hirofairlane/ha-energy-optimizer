@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from eo.planner.decision_matrix import LoadDecision
 from eo.planner.iterative import Plan, PlanCell
 from eo.policy.antiflap import (

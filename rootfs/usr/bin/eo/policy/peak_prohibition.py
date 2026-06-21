@@ -17,9 +17,7 @@ from typing import Mapping
 
 from eo.planner.decision_matrix import LoadDecision
 from eo.planner.iterative import Plan, PlanCell
-
 from eo.policy.types import PolicyOverride, PolicyPipelineResult
-
 
 LAYER_NAME = "peak_prohibition"
 

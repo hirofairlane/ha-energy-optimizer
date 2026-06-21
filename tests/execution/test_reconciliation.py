@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
-
 from eo.execution.reconciliation import (
     reconcile_load_debt,
     reconcile_world_state,

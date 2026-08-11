@@ -14,14 +14,27 @@ RUN apk add --no-cache \
     openblas-dev \
     gfortran
 
-# numpy and pandas must be installed before scikit-learn: sklearn's pyproject.toml
-# build backend tries to import numpy during metadata preparation, which fails on
-# Alpine (musl/no binary wheels) if numpy isn't already present.
+# numpy/pandas/scipy and the meson-python build backend must be installed before
+# scikit-learn, which must then build with --no-build-isolation: sklearn's
+# pyproject.toml build backend imports numpy during metadata preparation, but pip's
+# isolated build env hides system site-packages, so a pre-installed numpy is invisible
+# unless isolation is disabled — and disabling isolation means the build backend
+# itself (meson-python, Cython, ninja) must also already be present system-wide.
+#
+# numpy must stay below 2.4: musllinux wheels from 2.4 onward are built with an
+# x86-64-v2 baseline (SSE4.2/POPCNT), which crashes with "NumPy was built with
+# baseline optimizations (X86_V2) but your machine doesn't support" on VMs using a
+# generic/older QEMU CPU type (e.g. Proxmox default "kvm64") — a common HA VM setup.
 RUN pip3 install --no-cache-dir --break-system-packages \
-    numpy \
-    pandas
+    "numpy<2.4" \
+    scipy \
+    pandas \
+    meson-python \
+    Cython \
+    ninja \
+    pybind11
 
-RUN pip3 install --no-cache-dir --break-system-packages \
+RUN pip3 install --no-cache-dir --break-system-packages --no-build-isolation \
     scikit-learn \
     requests \
     flask \

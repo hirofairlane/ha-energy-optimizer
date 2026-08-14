@@ -67,7 +67,7 @@ No YAML editing required. All configuration is done through the wizard and the w
 
 The add-on is useful even with **no battery** if you have loads you can shift: it will schedule them to coincide with solar surplus or valley-tariff windows.
 
-> **Vaillant / eBUS heat pumps:** the heat pump role is generic — any integration that exposes a writable `number.*` (setpoint) and optional `climate.*` entity works. If your heat pump talks eBUS (e.g. Vaillant aroTHERM / Genia Air) and isn't exposed to HA yet, install [**genia-air-ha**](https://github.com/hirofairlane/genia-air-ha) first — it bridges eBUS to HA entities this add-on can control.
+> **Vaillant / eBUS heat pumps:** the heat pump role is generic — any integration that exposes a writable `number.*` (setpoint) and optional `climate.*` entity works. If your heat pump talks eBUS (e.g. Vaillant aroTHERM / Genia Air) and isn't exposed to HA yet, install [**ha-genia-air**](https://github.com/onemanfoundry/ha-genia-air) first — it bridges eBUS to HA entities this add-on can control.
 
 ---
 

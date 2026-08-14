@@ -5,7 +5,7 @@ Smart energy management add-on for Home Assistant OS. Its primary goal is to **m
 > 🔒 **100% local — no cloud, no telemetry.** Everything runs inside the Docker container on your own hardware. Your energy data, sensor readings, and ML model never leave your home network. The add-on only communicates with your local Home Assistant instance and, optionally, a local InfluxDB instance.
 <img width="1157" height="1113" alt="image" src="https://github.com/user-attachments/assets/f2235103-6d81-4d58-b8ca-00148d9acd58" />
 
-> **Installation:** Settings → Add-ons → Add-on store → ⋮ → Repositories → add `https://github.com/hirofairlane/ha-energy-optimizer`
+> **Installation:** Settings → Add-ons → Add-on store → ⋮ → Repositories → add `https://github.com/onemanfoundry/ha-energy-optimizer`
 
 ### Python dependencies (bundled in Docker image)
 
@@ -49,7 +49,7 @@ Smart energy management add-on for Home Assistant OS. Its primary goal is to **m
 
 1. In HA go to **Settings → Add-ons → Add-on store → ⋮ menu → Repositories** and add:
    ```
-   https://github.com/hirofairlane/ha-energy-optimizer
+   https://github.com/onemanfoundry/ha-energy-optimizer
    ```
 2. Find **Energy Optimizer** in the store and click **Install**.
 3. Start the add-on and open the web panel — the **Setup Wizard** will guide you through the rest.
@@ -66,6 +66,8 @@ No YAML editing required. All configuration is done through the wizard and the w
 | **Schedulable loads** | At least one (heat pump, pool pump, EV charger, or any `switch.*`) | Multiple loads — each adds a scheduling optimisation layer |
 
 The add-on is useful even with **no battery** if you have loads you can shift: it will schedule them to coincide with solar surplus or valley-tariff windows.
+
+> **Vaillant / eBUS heat pumps:** the heat pump role is generic — any integration that exposes a writable `number.*` (setpoint) and optional `climate.*` entity works. If your heat pump talks eBUS (e.g. Vaillant aroTHERM / Genia Air) and isn't exposed to HA yet, install [**genia-air-ha**](https://github.com/hirofairlane/genia-air-ha) first — it bridges eBUS to HA entities this add-on can control.
 
 ---
 

@@ -30,6 +30,7 @@ import joblib
 # Force the monolith's import path so we get its _WIZARD / cfg / ha_* helpers
 sys.path.insert(0, "/usr/bin")
 import energy_optimizer as mono  # noqa: E402
+
 from eo.forecasters.atmospheric_factor import (  # noqa: E402
     AtmosphericFactorFeatures,
     make_features_for_hour,

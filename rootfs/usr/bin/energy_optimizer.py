@@ -26,7 +26,7 @@ from flask import Flask, jsonify, request
 
 # ── ML feature version — increment when feature engineering changes ───────────
 MODEL_FEATURE_VER = 3   # v3: dynamic features from wizard (temp_outdoor, solar, grid, submeters)
-ADD_ON_VERSION = "5.0.19"  # SOURCE OF TRUTH — bump here AND in config.yaml together
+ADD_ON_VERSION = "5.0.20"  # SOURCE OF TRUTH — bump here AND in config.yaml together
 
 # ── Location (solar elevation formula) ───────────────────────────────────────
 HOME_LAT = 40.67   # Guadarrama, Madrid — °N (fallback; wizard overrides)
@@ -122,6 +122,45 @@ def cfg(key: str, default=None):
     if key in _SETUP:
         return _SETUP[key]
     return OPT.get(key, default)
+
+def _charge_hysteresis_pct() -> float:
+    """Dead-band (SOC points) below the charge target before re-engaging.
+
+    Set to 0 to restore the pre-v5.0.20 bang-bang behaviour.
+    """
+    try:
+        return max(0.0, float(cfg("battery_charge_hysteresis_pct", 5)))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+# Latched between cycles: True while a smart-target grid charge is engaged.
+_BATT_CHARGE_ENGAGED = False
+
+
+def _should_engage_charge(soc: float, target: float) -> bool:
+    """Schmitt trigger around the smart charge target.
+
+    Without a dead-band the engine flaps: it reaches the target, hands the
+    battery back to self-consumption, the house load pulls SOC one or two
+    points below the target, and the very next 15-min cycle re-engages the
+    grid charge. Observed on prod 2026-08-26 between 07:15 and 09:00 —
+    on/off/on/off every single cycle at the 95 % health-mode ceiling.
+
+    Engage when SOC falls a full `battery_charge_hysteresis_pct` below the
+    target; stay engaged (regardless of how close we get) until the target is
+    actually reached; then stay off until we drop below the band again.
+
+    Only the smart-target branches use this. Emergency, low-SOC and storm
+    charges are safety paths and must engage immediately.
+    """
+    global _BATT_CHARGE_ENGAGED
+    if soc >= target:
+        _BATT_CHARGE_ENGAGED = False
+    elif _BATT_CHARGE_ENGAGED or soc <= target - _charge_hysteresis_pct():
+        _BATT_CHARGE_ENGAGED = True
+    return _BATT_CHARGE_ENGAGED
+
 
 def _health_mode_limits() -> tuple:
     """Return (min_soc, max_soc) for charging based on battery_health_mode setting."""
@@ -1912,6 +1951,9 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
 
     if period == "valley":
         if soc >= full_thr:
+            # Clears the charge latch: we are at the ceiling, so the next cycle
+            # must wait out the full hysteresis band before charging again.
+            _should_engage_charge(soc, full_thr)
             return {
                 "action": "self_consumption",
                 "reason": f"Valley, battery full ({soc:.0f}% ≥ health-mode ceiling {full_thr}%)",
@@ -1930,7 +1972,7 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
             }
         optimal = calculate_optimal_soc(sensors, tariff)
         target  = optimal["target_soc"]
-        if soc < target:
+        if _should_engage_charge(soc, target):
             power = base_power_w if (target - soc) > 20 else max(1000, base_power_w // 2)
             return {
                 "action": "charge", "target_soc": target, "power_w": power,
@@ -1960,17 +2002,28 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
                     ],
                 ),
             }
+        hyst = _charge_hysteresis_pct()
+        held = soc < target
         return {
             "action": "self_consumption",
-            "reason": f"Valley, at optimal level ({soc:.0f}% ≥ {target}%)",
+            "reason": (f"Valley, within hysteresis band ({soc:.0f}% ≥ {target}−{hyst:.0f}%)"
+                       if held else
+                       f"Valley, at optimal level ({soc:.0f}% ≥ {target}%)"),
             "explanation": _explain(
                 what="Self-consumption mode (smart target already reached)",
-                why=f"SOC {soc:.0f}% already meets or exceeds the engine's smart target of {target}% for tomorrow's peak.",
+                why=(f"SOC {soc:.0f}% is just under the smart target {target}% but still inside the "
+                     f"{hyst:.0f}-point hysteresis band — re-engaging the grid charge here would flap "
+                     f"the inverter on and off every cycle."
+                     if held else
+                     f"SOC {soc:.0f}% already meets or exceeds the engine's smart target of {target}% for tomorrow's peak."),
                 inputs=base_inputs + [
-                    {"label": "Smart target", "value": f"{target}%"},
+                    {"label": "Smart target",     "value": f"{target}%"},
+                    {"label": "Hysteresis band",  "value": f"{hyst:.0f} points (re-engage below {target - hyst:.0f}%)"},
                 ],
-                formula="if valley and SOC ≥ smart_target → self_consumption",
-                calculation=f"period=valley AND SOC {soc:.0f}% ≥ {target}% → no further charging needed",
+                formula="if valley and SOC > smart_target − hysteresis → self_consumption",
+                calculation=(f"period=valley AND SOC {soc:.0f}% > {target}−{hyst:.0f}% → hold, no re-engage"
+                             if held else
+                             f"period=valley AND SOC {soc:.0f}% ≥ {target}% → no further charging needed"),
                 alternatives_rejected=[
                     {"option": "keep charging", "why": "the target is already met; extra grid energy at valley would not be used in peak"},
                 ],
@@ -2018,7 +2071,7 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
             }
         optimal = calculate_optimal_soc(sensors, tariff)
         target  = optimal["target_soc"]
-        if soc < target:
+        if _should_engage_charge(soc, target):
             return {
                 "action": "charge", "target_soc": target,
                 "power_w": max(1000, base_power_w // 2),
@@ -2040,15 +2093,27 @@ def decide_battery(sensors: dict, tariff: dict, prediction: dict) -> dict:
                     ],
                 ),
             }
+        hyst = _charge_hysteresis_pct()
+        held = soc < target
         return {
             "action": "self_consumption",
-            "reason": f"Mid period, self-consumption (SOC={soc:.0f}% ≥ {target}%)",
+            "reason": (f"Mid period, within hysteresis band (SOC={soc:.0f}% ≥ {target}−{hyst:.0f}%)"
+                       if held else
+                       f"Mid period, self-consumption (SOC={soc:.0f}% ≥ {target}%)"),
             "explanation": _explain(
                 what="Self-consumption mode (mid tariff, target reached)",
-                why=f"SOC {soc:.0f}% already meets the smart target {target}%. No mid-tariff grid charge needed.",
-                inputs=base_inputs + [{"label": "Smart target", "value": f"{target}%"}],
-                formula="if mid and SOC ≥ smart_target → self_consumption",
-                calculation=f"period=mid AND SOC {soc:.0f}% ≥ {target}% → no grid action",
+                why=(f"SOC {soc:.0f}% is just under the smart target {target}% but still inside the "
+                     f"{hyst:.0f}-point hysteresis band — holding avoids on/off flapping every cycle."
+                     if held else
+                     f"SOC {soc:.0f}% already meets the smart target {target}%. No mid-tariff grid charge needed."),
+                inputs=base_inputs + [
+                    {"label": "Smart target",    "value": f"{target}%"},
+                    {"label": "Hysteresis band", "value": f"{hyst:.0f} points (re-engage below {target - hyst:.0f}%)"},
+                ],
+                formula="if mid and SOC > smart_target − hysteresis → self_consumption",
+                calculation=(f"period=mid AND SOC {soc:.0f}% > {target}−{hyst:.0f}% → hold, no re-engage"
+                             if held else
+                             f"period=mid AND SOC {soc:.0f}% ≥ {target}% → no grid action"),
                 alternatives_rejected=[
                     {"option": "top-up to health-mode max", "why": "would buy mid-tariff energy beyond what peak demand needs"},
                 ],
@@ -3272,7 +3337,12 @@ def send_daily_summary():
     if not sent_any:
         log.info("  No notification services configured or all disabled")
 
-    return {"date": today, "cycles": n_cycles, "actions": len(action_details),
+    # `narrative` is the list of causal lines describing what the engine did
+    # today — that is the "actions" count. Until v5.0.20 this read
+    # `len(action_details)`, a name that never existed anywhere in the module,
+    # so every 23:00 run raised NameError *after* both notifications had
+    # already been sent (observed nightly on prod, e.g. 2026-08-25 23:00:01).
+    return {"date": today, "cycles": n_cycles, "actions": len(narrative),
             "solar_kwh": solar_peak, "savings_eur": eur_saved}
 
 # ── Flask web panel ──────────────────────────────────────────────────────────

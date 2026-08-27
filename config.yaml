@@ -1,6 +1,6 @@
 name: "Energy Optimizer"
 description: "Smart energy management: solar battery, heat pump, pool pump, pool cleaner and dishwasher with ML + adaptive tariff rules."
-version: "5.0.19"
+version: "5.0.20"
 slug: "energy_optimizer"
 init: false
 arch:
@@ -43,6 +43,10 @@ options:
   battery_medium_threshold: 50
   battery_storm_threshold: 80
   battery_capacity_kwh: 10.0
+  # Dead-band (SOC points) below the smart charge target before a finished
+  # grid charge re-engages. Without it the engine flaps on/off every cycle
+  # at the health-mode ceiling. Set to 0 for the old bang-bang behaviour.
+  battery_charge_hysteresis_pct: 5
 
   # ── Electrical sensors ─────────────────────────────────────────────────────────────────────────────
   sensor_battery_soc: "sensor.battery_state_of_capacity"
@@ -154,6 +158,7 @@ schema:
   battery_medium_threshold: int(30,80)
   battery_storm_threshold: int(50,100)
   battery_capacity_kwh: float
+  battery_charge_hysteresis_pct: int(0,30)
   sensor_battery_soc: str
   sensor_battery_power: str
   sensor_grid_power: str

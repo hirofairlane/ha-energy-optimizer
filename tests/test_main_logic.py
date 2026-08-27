@@ -210,3 +210,88 @@ def test_optimal_soc_cold_weather_raises_target(mod, monkeypatch):
     )
     assert cold["temp_adj_kwh"] > warm["temp_adj_kwh"]
     assert cold["target_soc"] >= warm["target_soc"]
+
+
+# ── daily summary return value (v5.0.20 NameError regression) ────────────────
+
+def test_send_daily_summary_returns_action_count(mod, monkeypatch, tmp_path):
+    """Until v5.0.20 the 23:00 job raised `NameError: action_details` on the
+    final return — after both notifications had already gone out, so the bug
+    was invisible from the user's inbox and only showed in the add-on log."""
+    monkeypatch.setattr(mod, "_load_savings", lambda: {
+        "total_eur_saved": 1.0, "total_kwh_avoided_peak": 2.0, "since": "2026-01-01"})
+    monkeypatch.setattr(mod, "read_sensors", lambda: {"battery_soc": 50.0})
+    monkeypatch.setattr(mod, "_summarize_day_narrative",
+                        lambda dec, sens: ["⚡ line one.", "🏊 line two."])
+    monkeypatch.setattr(mod, "ha_service", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "DECISIONS_FILE", tmp_path / "no_such_decisions.json")
+
+    def _cfg(key, default=None):
+        return {"notify_email_daily_enabled": False,
+                "notify_telegram_daily_enabled": False}.get(key, default)
+    monkeypatch.setattr(mod, "cfg", _cfg)
+
+    res = mod.send_daily_summary()
+    assert res["actions"] == 2
+    assert res["cycles"] == 0
+
+
+# ── charge hysteresis (v5.0.20 flapping regression) ─────────────────────────
+
+def test_charge_hysteresis_holds_until_band_is_cleared(mod, monkeypatch):
+    """Prod 2026-08-26 07:15-09:00: reach 95 %, hand back to self-consumption,
+    drop to 93 %, re-engage, repeat every 15-min cycle. The Schmitt trigger
+    must keep the charge off until SOC drops a full band below the target."""
+    monkeypatch.setattr(mod, "cfg", lambda k, d=None:
+                        5 if k == "battery_charge_hysteresis_pct" else d)
+    mod._BATT_CHARGE_ENGAGED = False
+
+    assert mod._should_engage_charge(60, 95) is True    # far below -> charge
+    assert mod._should_engage_charge(93, 95) is True    # latched: keep going
+    assert mod._should_engage_charge(95, 95) is False   # target reached -> stop
+    assert mod._should_engage_charge(94, 95) is False   # inside band -> hold
+    assert mod._should_engage_charge(91, 95) is False   # still inside band
+    assert mod._should_engage_charge(90, 95) is True    # band cleared -> re-engage
+
+
+def test_charge_hysteresis_zero_restores_bang_bang(mod, monkeypatch):
+    monkeypatch.setattr(mod, "cfg", lambda k, d=None:
+                        0 if k == "battery_charge_hysteresis_pct" else d)
+    mod._BATT_CHARGE_ENGAGED = False
+
+    assert mod._should_engage_charge(95, 95) is False
+    assert mod._should_engage_charge(94, 95) is True
+
+
+def test_decide_battery_does_not_flap_at_ceiling(mod, monkeypatch):
+    """End-to-end through decide_battery: the exact prod sequence of SOC
+    readings must not produce a charge/self_consumption alternation."""
+    _patch_soc_inputs(mod, monkeypatch, base_kw=2.3)
+
+    def _cfg(key, default=None):
+        return {"battery_capacity_kwh": 10.0,
+                "battery_health_mode": "bill_reducer",
+                "battery_charge_hysteresis_pct": 5,
+                "battery_emergency_threshold": 10,
+                "battery_low_threshold": 30,
+                "battery_storm_threshold": 80}.get(key, default)
+    monkeypatch.setattr(mod, "cfg", _cfg)
+    monkeypatch.setattr(mod, "is_storm_forecast", lambda: False)
+    monkeypatch.setattr(mod, "_battery_charge_power_w", lambda default_w=2000: 2000)
+    mod._BATT_CHARGE_ENGAGED = False
+
+    tariff = {"period": "valley", "prices": {"peak": 0.22, "mid": 0.15, "valley": 0.11},
+              "peak_hours": list(range(8))}
+    sensors = {"solar_tomorrow": 8.2, "temp_outdoor": 20.0}
+
+    # SOC track observed on prod: climbs to the 95 % ceiling, then sags.
+    actions = []
+    for soc in (90, 93, 95, 94, 93, 92, 91, 90):
+        sensors["battery_soc"] = soc
+        actions.append(mod.decide_battery(sensors, tariff, {})["action"])
+
+    # Charge up to the ceiling, then a single clean hand-off, no alternation
+    # until the band is cleared at 90 %.
+    assert actions == ["charge", "charge", "self_consumption", "self_consumption",
+                       "self_consumption", "self_consumption", "self_consumption",
+                       "charge"]

@@ -345,13 +345,28 @@ target_SOC      = clamp(target_SOC, 30%, 95%)
 
 The Dashboard "Smart target" line shows the full breakdown in real time.
 
+**6. Hysteresis around the target** *(v5.0.20)*
+
+The comparison against the target is a Schmitt trigger, not a bare `soc < target`:
+
+```
+engage charge   when  soc ≤ target − battery_charge_hysteresis_pct   (default 5 points)
+stay charging   until soc ≥ target
+then hold off   until soc drops below the band again
+```
+
+Without the dead-band the engine flaps: it reaches the target, hands the battery back to
+self-consumption, the house load pulls SOC a point or two below it, and the next 15-min cycle
+re-engages the grid charge — toggling the inverter's working mode every cycle. Emergency,
+low-SOC and storm charges bypass the dead-band; they are safety paths and engage immediately.
+
 ### Other charging rules
 
 | Situation | Action |
 |---|---|
 | SOC < emergency threshold (default 10%) | Force-charge at any tariff, any time |
 | Storm forecast | Pre-charge to storm threshold (default 80%) |
-| Valley + SOC below smart target | Charge at configured power |
+| Valley + SOC below smart target (by more than the hysteresis band) | Charge at configured power |
 | Peak tariff | No grid charging under any normal circumstance |
 | SOC ≥ 99% (free solar surplus) | Heat pump boost / pool pump starts |
 
@@ -525,6 +540,7 @@ The Test connection button counts samples for every configured sensor over the l
 | `battery_medium_threshold` | 50% | Medium battery level |
 | `battery_storm_threshold` | 80% | Pre-charge target when storm is forecast |
 | `battery_capacity_kwh` | 10.0 | Total usable battery capacity (kWh) |
+| `battery_charge_hysteresis_pct` | 5 | Dead-band (SOC points) below the smart target before a finished grid charge re-engages. `0` = old bang-bang behaviour |
 
 ### Scheduling
 
@@ -580,6 +596,56 @@ All data lives in `/data/` inside the add-on container (persists across restarts
 ---
 
 ## Changelog
+
+### v5.0.20 — Charge hysteresis + daily-summary NameError
+
+Two defects found while auditing a real overnight grid charge on Sergio's install (night of 2026-08-25 → 26).
+
+**1. The grid charge flapped at the ceiling.** Between 07:15 and 09:00 the engine alternated
+charge → self-consumption → charge → … on *every* 15-min cycle, toggling
+`select.battery_working_mode` and `switch.battery_charge_from_grid` eight times in under two hours:
+
+```
+07:15  Valley — smart target 95%     → Valley, battery full (95% ≥ ceiling 95%)
+07:30  Valley, battery full          → Valley — smart target 95% (peak gap 11.9 kWh)
+08:00  Valley — smart target 95%     → Mid period, self-consumption (SOC=95% ≥ 95%)
+08:15  Mid, self-consumption         → Mid — opportunistic top-up to smart target 95%
+…
+```
+
+Cause: the smart-target branches compared `soc < target` with no dead-band. Reaching the target
+hands the battery back to self-consumption, the house load pulls SOC one or two points below it,
+and the next cycle re-engages the charge. Pure bang-bang control on a 15-minute clock.
+
+Fixed with a Schmitt trigger, `_should_engage_charge(soc, target)`: engage when SOC drops a full
+`battery_charge_hysteresis_pct` (default **5** points) below the target, stay engaged until the
+target is actually reached, then hold off until the band is cleared again. The valley
+health-mode-ceiling branch clears the latch explicitly so hitting 95 % can't leave a stale
+"engaged" flag behind. Emergency, low-SOC and storm charges deliberately bypass the dead-band —
+those are safety paths and must engage on the spot.
+
+The self-consumption verdicts now say which of the two situations they are in, so the log
+distinguishes "target met" from "holding inside the band":
+
+```
+Valley, within hysteresis band (93% ≥ 95−5%)
+Mid period, self-consumption (SOC=95% ≥ 95%)
+```
+
+Set `battery_charge_hysteresis_pct: 0` to restore the pre-v5.0.20 behaviour.
+
+**2. `send_daily_summary()` raised `NameError` every night.** The final `return` read
+`len(action_details)` — a name that exists nowhere in the module:
+
+```
+2026-08-25 23:00:01 [ERROR] Job "send_daily_summary" raised an exception
+NameError: name 'action_details' is not defined
+```
+
+Both notifications are sent *before* that line, so the email and the Telegram report always
+arrived and the bug was invisible outside the add-on log — while the scheduled job itself
+terminated in an exception every single night. `actions` is now `len(narrative)`, the count of
+causal lines in the day's summary.
 
 ### v5.0.17 — Solar floor: historical baseline + daylight cross-check
 
